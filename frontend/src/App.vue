@@ -276,7 +276,7 @@ import { useAgentTerminalMode } from "./composables/useAgentTerminalMode";
 import { useAlertTriage } from "./composables/useAlertTriage";
 import { type TransferHistoryEntry } from "./lib/transferHistory";
 import { useTransferHistory } from "./composables/useTransferHistory";
-import { resolveSftpPaneOpen, sanitizeSftpPaneDefaultOpen, resolveDirectoryFollow, sanitizeDirectoryFollowPref, type SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
+import { resolveSftpPaneOpen, sanitizeSftpPaneDefaultOpen, resolveDirectoryFollow, sanitizeDirectoryFollowPref, sanitizeWorkbenchLayoutPrefs, type SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
 import { pickLiveSessionForReattach, pickProtocolSessionForReattach, type SessionSummary } from "./lib/sessionRestore";
 import { toolbarTintStyle } from "./lib/toolbarTint";
 import { createGhostClickGuard } from "./lib/ghostClickGuard";
@@ -556,6 +556,11 @@ const COMMAND_HISTORY_META_KEY = "ssh-command-history-meta";
 // 终端字号/字体族键移入 lib/terminalFont.ts（issue #31 字体单独设置）统一管理。
 // SFTP 面板默认打开偏好：pluginStore 全局持久化（"false" = 新工作台仅终端）。
 const SFTP_PANE_OPEN_KEY = "ssh-sftp-pane-open";
+// 跨重启的布局/视图全局偏好（issue #178）：单键 JSON，记录最近一次的
+// paneOrder / splitRatio / SFTP 面板开合 / 列显隐与列宽 / 显示隐藏文件 / 排序。
+// writeWorkbenchState 写穿（persistState 防抖统一触发），restoreUiState 启动
+// 水合为新工作台初始值；workbenchState 会话恢复字段存在时仍优先覆盖。
+const WORKBENCH_LAYOUT_KEY = "ssh-workbench-layout";
 // 目录跟随全局偏好：pluginStore 持久化（"true" = 新工作台初始即开启；per-tab
 // 的 workbenchState.followDirectory 仍优先，恢复的 tab 不被全局值覆盖）。
 const FOLLOW_DIRECTORY_KEY = "ssh-follow-directory";
@@ -1106,6 +1111,11 @@ const sftpTypeFilter = ref<SftpTypeFilter>("all");
 /** 默认隐藏以 "." 开头的 Unix 隐藏文件、__pycache__ 等系统缓存条目；
  *  用户可通过过滤栏眼睛图标切换。 */
 const sftpShowHidden = ref(false);
+/** 显示/隐藏文件切换进全局布局偏好（issue #178），重启不再回落默认隐藏。 */
+function toggleSftpShowHidden() {
+  sftpShowHidden.value = !sftpShowHidden.value;
+  persistState();
+}
 const selectedUris = ref<string[]>([]);
 // 选中态热点查询走 Set：行 class 绑定与 selectedEntries 每次渲染对全部
 // 可见条目各查一次，数组 includes 是 O(条目×选中数)（万行目录 × 多选
@@ -1653,35 +1663,81 @@ function initialState(): WorkbenchState {
   return value && typeof value === "object" ? (value as WorkbenchState) : {};
 }
 
+/** 水合跨重启的布局/视图全局偏好（issue #178）：作为新工作台的初始值——
+ *  字段缺省保持硬编码默认，随后 workbenchState 的会话恢复字段存在时覆盖。 */
+function applyWorkbenchLayoutPrefs() {
+  let prefs = null;
+  try {
+    prefs = sanitizeWorkbenchLayoutPrefs(JSON.parse(pluginStore.getItem(WORKBENCH_LAYOUT_KEY) ?? "null"));
+  } catch {
+    prefs = null;
+  }
+  if (!prefs) return;
+  if (prefs.paneOrder) paneOrder.value = prefs.paneOrder;
+  if (prefs.splitRatio !== undefined) splitRatio.value = prefs.splitRatio;
+  // 面板开合记的是用户最近一次的手动切换；偏好里没有时维持设置页的
+  // 「默认打开」偏好（sftpPaneOpen ref 的初始值即来自它）。
+  if (prefs.sftpPaneOpen !== undefined) sftpPaneOpen.value = prefs.sftpPaneOpen;
+  if (prefs.visibleColumns) visibleColumns.value = sanitizeVisibleColumns(prefs.visibleColumns);
+  if (prefs.sftpColumnWidths) {
+    const allCols: SftpColumn[] = ["size", "modified", "owner", "group", "permissions"];
+    for (const col of allCols) {
+      const num = prefs.sftpColumnWidths[col];
+      if (typeof num === "number") sftpColumnWidths[col] = Math.max(COLUMN_MIN_WIDTHS[col], Math.min(COLUMN_WIDTH_MAX, num));
+    }
+  }
+  if (prefs.sftpNameWidth !== undefined) sftpNameWidth.value = Math.max(NAME_COLUMN_MIN, Math.min(NAME_COLUMN_MAX, prefs.sftpNameWidth));
+  if (prefs.showHidden !== undefined) sftpShowHidden.value = prefs.showHidden;
+  if (prefs.sort) sort.value = prefs.sort;
+}
+
 function restoreUiState() {
+  applyWorkbenchLayoutPrefs();
   const state = initialState();
   currentPath.value = typeof state.sftpPath === "string" ? normalizeRemotePath(state.sftpPath) : "/";
-  splitRatio.value = typeof state.splitRatio === "number" && state.splitRatio >= 35 && state.splitRatio <= 80 ? state.splitRatio : 58;
-  paneOrder.value = state.paneOrder === "sftp-left" ? "sftp-left" : "terminal-left";
+  splitRatio.value = typeof state.splitRatio === "number" && state.splitRatio >= 35 && state.splitRatio <= 80 ? state.splitRatio : splitRatio.value;
+  paneOrder.value = state.paneOrder === "sftp-left" ? "sftp-left" : state.paneOrder === "terminal-left" ? "terminal-left" : paneOrder.value;
   // Dock panel surface：SFTP 面板默认不开（不自动列目录/不自动建 SFTP 会话，
   // dock 保持轻量）；需要文件面板时用 panel-actions 的开关手动打开（连接建立时
   // loadDirectory 本就会拉列表，打开即有数据）。
-  sftpPaneOpen.value = panelSurface.value ? false : resolveSftpPaneOpen(state, sftpPaneDefaultOpen.value);
-  // Dock panel surface：目录跟随是 SFTP 域能力，面板一律关闭。
+  sftpPaneOpen.value = panelSurface.value ? false : resolveSftpPaneOpen(state, sftpPaneOpen.value);
+  // Dock panel surface：目录跟随是 SFTP 面板能力，面板一律关闭。
   // 恢复的 tab 用 per-workbench 状态；全新工作台回落全局偏好（pluginStore）。
   followDirectory.value = panelSurface.value ? false : resolveDirectoryFollow(state, loadDirectoryFollowPref());
   sudoMode.value = state.sudoMode === true && canWrite.value;
   // 一次性迁移：六列默认上线前的旧偏好重置为全开（之后用户自定义照常持久化）。
   const legacyColumns = state.visibleColumns != null && state.columnsV2 !== true;
-  visibleColumns.value = legacyColumns ? [...DEFAULT_VISIBLE_COLUMNS] : sanitizeVisibleColumns(state.visibleColumns);
-  // 恢复列宽，未知列或越界用默认值兜底
+  if (legacyColumns) visibleColumns.value = [...DEFAULT_VISIBLE_COLUMNS];
+  else if (state.visibleColumns != null) visibleColumns.value = sanitizeVisibleColumns(state.visibleColumns);
+  // 恢复列宽，未知列或越界用默认值兜底；state 无该列宽度时保持当前值
+  // （布局偏好层已写入的值或默认值）。
   const saved = state.sftpColumnWidths || {};
   const allCols: SftpColumn[] = ["size", "modified", "owner", "group", "permissions"];
   for (const col of allCols) {
     const raw = saved[col];
-    const num = typeof raw === "number" ? raw : DEFAULT_COLUMN_WIDTHS[col];
-    sftpColumnWidths[col] = Math.max(COLUMN_MIN_WIDTHS[col], Math.min(COLUMN_WIDTH_MAX, num));
+    if (typeof raw === "number") sftpColumnWidths[col] = Math.max(COLUMN_MIN_WIDTHS[col], Math.min(COLUMN_WIDTH_MAX, raw));
   }
-  sftpNameWidth.value = typeof state.sftpNameWidth === "number" ? Math.max(NAME_COLUMN_MIN, Math.min(NAME_COLUMN_MAX, state.sftpNameWidth)) : null;
+  if (typeof state.sftpNameWidth === "number") sftpNameWidth.value = Math.max(NAME_COLUMN_MIN, Math.min(NAME_COLUMN_MAX, state.sftpNameWidth));
   lastSequence = typeof state.terminalSequence === "number" ? state.terminalSequence : 0;
 }
 
 function writeWorkbenchState() {
+  // 同一载荷写穿跨重启的全局布局偏好（issue #178）：workbenchState 按 sessionId
+  // 键控、重启即孤儿化，这里把最近一次布局/视图状态另存一份作新工作台初始值。
+  try {
+    pluginStore.setItem(WORKBENCH_LAYOUT_KEY, JSON.stringify({
+      paneOrder: paneOrder.value,
+      splitRatio: splitRatio.value,
+      sftpPaneOpen: sftpPaneOpen.value,
+      visibleColumns: visibleColumns.value,
+      sftpColumnWidths: { ...sftpColumnWidths },
+      sftpNameWidth: sftpNameWidth.value,
+      showHidden: sftpShowHidden.value,
+      sort: sort.value,
+    }));
+  } catch {
+    // 存储不可用（沙箱降级链耗尽）：会话恢复态照写，全局偏好退化为本次会话。
+  }
   return window.dbxPlugin.workbenchState?.set({
     sessionId: session.value?.sessionId,
     terminalSequence: lastSequence,
@@ -9115,7 +9171,7 @@ watch(historyScope, () => {
               :class="{ 'is-active': sftpShowHidden }"
               :title="sftpShowHidden ? t('sftpFilter.hideHidden') : t('sftpFilter.showHidden')" :aria-label="sftpShowHidden ? t('sftpFilter.hideHidden') : t('sftpFilter.showHidden')"
               :aria-pressed="sftpShowHidden"
-              @click="sftpShowHidden = !sftpShowHidden"
+              @click="toggleSftpShowHidden"
             >
               <Eye v-if="sftpShowHidden" />
               <EyeOff v-else />

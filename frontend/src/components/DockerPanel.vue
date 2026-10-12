@@ -45,6 +45,11 @@ import { createRowMenuController } from "../lib/dockerRowMenu";
 
 const props = defineProps<{
   t: (key: string, values?: Record<string, string | number>) => string;
+  /** 工作台当前连接的 SSH 会话（App 传入）：多台服务器同时有存活会话时，
+   * “全局最新会话”猜测会把面板绑到别的机器（#168 错乱主因）；绑定一律以
+   * 工作台会话为准，缺省时才回落旧启发式。 */
+  sessionId?: string;
+  connectionId?: string;
 }>();
 
 interface DockerContainer {
@@ -110,11 +115,11 @@ function dockerListPayload(raw: unknown): { available: boolean; needsSudo: boole
   };
 }
 
-/** 「在终端打开」命令：容器内挑一个可用 shell（与 NyaTerm 约定一致）。
+/** 「在终端打开」命令：先检测可用 shell，再 exec；非零退出不触发其他 shell。
  *  CLI 跟随引擎设置（podman 等自定义命令同样可进终端 exec）。 */
 function dockerExecCommand(containerId: string): string {
   const cli = engineSettings.value.cli || "docker";
-  return `${cli} exec -it ${containerId} sh -lc 'bash || zsh || fish || ash || sh'`;
+  return `${cli} exec -it ${containerId} sh -lc 'for shell in bash zsh fish ash; do if command -v "$shell" >/dev/null 2>&1; then exec "$shell"; fi; done; exec sh'`;
 }
 
 /** 状态徽标 class：已知状态着色，未知状态走中性灰。 */
@@ -154,6 +159,16 @@ function applyEngineSettings(): void {
 }
 
 async function resolveMode(): Promise<PanelMode> {
+  // 工作台绑定会话优先（#168）：有 sessionId prop 就严格绑定本工作台的
+  // 连接，绝不按“全局最新会话”抢别人的机器；连接变化时下一次轮询重绑。
+  if (props.sessionId) {
+    if (props.sessionId !== sessionId.value) {
+      sessionId.value = props.sessionId;
+      mode.value = "ssh";
+      adoptConnection(props.connectionId || "");
+    }
+    return "ssh";
+  }
   if (mode.value === "ssh" && sessionId.value) return "ssh";
   try {
     const response = await window.dbxPlugin.invoke<{ sessions: unknown }>("ssh/sessions/list");
@@ -733,11 +748,24 @@ const running = (container: DockerContainer): boolean => container.state === "ru
   min-width: 0;
   /* 列多超出面板宽时横向滚动兜底（面板本身可拖宽，见 App.vue 的 docker divider）。 */
   overflow-x: auto;
+  /* 内容过宽时用户找不到滚动入口——全局 `*::-webkit-scrollbar{display:none}`
+     把 wrap 的滚动条也藏了。这里作为例外显式恢复（同 .file-rows 模式）：
+     横向溢出时滚动条可见可拖。 */
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--foreground) 25%, transparent) transparent;
 }
+
+.docker-table-wrap::-webkit-scrollbar { display: block; height: 10px; width: 10px; }
+.docker-table-wrap::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--foreground) 25%, transparent); border-radius: 5px; }
+.docker-table-wrap::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--foreground) 40%, transparent); }
+.docker-table-wrap::-webkit-scrollbar-track { background: transparent; }
 
 .docker-table {
   width: 100%;
-  border-collapse: collapse;
+  /* 粘性列需要 separate：collapse 下 Firefox 的粘性单元格边框不随滚动绘制。
+     行分隔线本就只画在各 cell 的 border-bottom 上，spacing 0 视觉等价。 */
+  border-collapse: separate;
+  border-spacing: 0;
   font-size: 12px;
 }
 
@@ -764,6 +792,18 @@ const running = (container: DockerContainer): boolean => container.state === "ru
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 粘性首列（容器名）：横向滚动时固定靠左，滚动出的内容从其右缘滑过。
+   实底取浮层同款 --popover（下层内容透出会误读成两列重叠）；右缘 1px
+   分隔让滚动时的层叠关系可见。表头同规则，滚动中表头保持一致。 */
+.docker-table th:first-child,
+.docker-table td.docker-cell-name {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background: var(--popover);
+  box-shadow: 1px 0 0 var(--border, rgba(128, 128, 128, 0.25));
 }
 
 .docker-cell-image {
@@ -799,6 +839,18 @@ const running = (container: DockerContainer): boolean => container.state === "ru
   min-width: 44px;
   white-space: nowrap;
   text-align: right;
+}
+
+/* 粘性末列（操作按钮）：横向滚动时固定靠右，下拉触发器永不被内容推出
+   视口（issue：列内容过大时下拉按钮被遮挡）。实底同浮层底色，左缘 1px
+   分隔；z-index 与首列同级。 */
+.docker-table th.docker-col-actions,
+.docker-table td.docker-col-actions {
+  position: sticky;
+  right: 0;
+  z-index: 2;
+  background: var(--popover);
+  box-shadow: -1px 0 0 var(--border, rgba(128, 128, 128, 0.25));
 }
 
 /* 行操作悬浮下拉：触发器（⌄，终端回填成功短暂显示 ✓）+ hover 菜单。 */

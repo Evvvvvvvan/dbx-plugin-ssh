@@ -43,6 +43,26 @@ export function sanitizeDirectoryFollowPref(raw: string | null): boolean {
   return raw === "true";
 }
 
+/**
+ * Parses the persisted global SFTP auto-connect preference. Default is ON:
+ * only the explicit "false" opts out of prefetching the remote listing on
+ * connect (issue #179 — servers without an SFTP subsystem surface an error
+ * banner on every connect otherwise).
+ */
+export function sanitizeSftpAutoConnectPref(raw: string | null): boolean {
+  return raw !== "false";
+}
+
+/**
+ * Decides whether opening the SFTP pane should fire the session's first
+ * directory load (the lazy connect path when auto-connect is off). A pane
+ * that stayed open, a listing already fetched, or no live session must not
+ * re-trigger it.
+ */
+export function shouldLazyLoadSftpListing(input: { paneOpen: boolean; sessionLive: boolean; listingLoaded: boolean }): boolean {
+  return input.paneOpen && input.sessionLive && !input.listingLoaded;
+}
+
 // —— 跨重启的布局/视图全局偏好（issue #178）——
 // workbenchState 按 sessionId 键控，重启后 SSH 重连是新会话，旧状态读不回，
 // 于是「终端移左 / SFTP 面板开合 / 列显隐与列宽 / 显示隐藏文件 / 排序」全部

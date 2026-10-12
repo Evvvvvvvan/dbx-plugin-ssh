@@ -17,6 +17,7 @@ mod keys;
 mod local_downloads;
 mod local_editors;
 mod local_fs;
+mod local_target;
 mod local_terminal;
 mod mcp;
 mod mcp_safety;
@@ -30,7 +31,7 @@ mod otp_store;
 mod preferences;
 mod progress_throttle;
 mod quick_commands;
-mod rdp_session;
+mod rdp;
 mod serial_session;
 mod serial_xmodem;
 mod session_recording;
@@ -86,7 +87,7 @@ struct Plugin {
     telnet: Arc<telnet_session::TelnetSessionRuntime>,
     serial: Arc<serial_session::SerialSessionRuntime>,
     vnc: Arc<vnc_session::VncSessionRuntime>,
-    rdp: Arc<rdp_session::RdpSessionRuntime>,
+    rdp: Arc<rdp::RdpSessionRuntime>,
     mcp: Arc<mcp::McpState>,
     watcher: Arc<file_watch::WatchRuntime>,
     connection_import: connection_import::ImportStream,
@@ -123,7 +124,7 @@ impl Plugin {
             telnet: Arc::new(telnet_session::TelnetSessionRuntime::new()),
             serial: Arc::new(serial_session::SerialSessionRuntime::new()),
             vnc: Arc::new(vnc_session::VncSessionRuntime::new()),
-            rdp: Arc::new(rdp_session::RdpSessionRuntime::new()),
+            rdp: Arc::new(rdp::RdpSessionRuntime::new()),
             watcher: Arc::new(file_watch::WatchRuntime::new()),
             connection_import: connection_import::ImportStream::default(),
             non_ssh_creds: non_ssh_credentials::NonSshCredentials::new(),
@@ -407,6 +408,22 @@ impl Plugin {
                 }))
             }
             "connection/test" => {
+                // 本地 Shell 连接目标（io.dbx.ssh.local）：无 TCP 语义，可达性
+                // 无从探测；Shell 路径合法性留到任务真正 spawn 时校验（此时
+                // 才做默认 Shell 解析），test 阶段如实放行并回显登记结果。
+                if let Some(target) =
+                    crate::local_target::LocalTarget::from_lifecycle_params(&params)?
+                {
+                    let shell = if target.shell.is_empty() {
+                        "the DBX default shell (resolved when the task runs)".to_string()
+                    } else {
+                        format!("shell {}", target.shell)
+                    };
+                    return Ok(json!({
+                        "success": true,
+                        "message": format!("Local shell target registered ({})", shell),
+                    }));
+                }
                 let endpoint = RuntimeEndpoint::from_lifecycle_params(&params)?;
                 // 串口无 TCP 语义（M32-B）：本地设备的可达性只能真开串口时校验，
                 // 测试阶段直接放行提示；rdp 与 telnet/vnc 同走 TCP probe。
@@ -452,6 +469,15 @@ impl Plugin {
                 )
             }
             "connection/connect" => {
+                // 本地 Shell 连接目标（io.dbx.ssh.local）：无凭据可存，登记
+                // 进 SshRuntime 的 local_targets 注册表（调度任务执行时按
+                // connection id 判定走本地分支的依据）。
+                if let Some(target) =
+                    crate::local_target::LocalTarget::from_lifecycle_params(&params)?
+                {
+                    self.ssh.store_local_target(target)?;
+                    return Ok(json!({ "success": true }));
+                }
                 let endpoint = RuntimeEndpoint::from_lifecycle_params(&params)?;
                 // 非 SSH 会话协议（telnet/vnc/serial/rdp）不走 SSH 连接存储：
                 // 会话生命周期由各自的 * / start 方法族与前端路由驱动。表单
@@ -470,12 +496,35 @@ impl Plugin {
                             .get("password")
                             .and_then(Value::as_str)
                             .unwrap_or_default(),
+                        &endpoint.protocol,
                     );
                     return Ok(json!({ "success": true }));
                 }
                 let connection = StoredConnection::from_lifecycle_params(&params)?;
                 self.ssh.store_connection(connection)?;
                 Ok(json!({ "success": true }))
+            }
+            // webview 路由前查询权威协议：宿主推给 webview 的 connection 上下文
+            // 不含 external_config.protocol（只在 lifecycle connection/connect
+            // 推送里），前端据此把 RDP/telnet/vnc 连接路由到各自的 * /start，
+            // 而不是误拨 SSH。本地 Shell 目标（io.dbx.ssh.local）同理：返回
+            // protocol="local" 与连接表单的 shell（空 = 默认 Shell 解析链），
+            // 前端据此路由到 local/terminal/start 而非 SSH 拨号。未暂存 = 宿主
+            // 尚未推送该连接，返回空串由调用方短暂重试（推送与 webview 创建
+            // 存在固有竞态）。
+            "connection/protocol" => {
+                let connection_id = params
+                    .get("connectionId")
+                    .and_then(Value::as_str)
+                    .ok_or("Missing connectionId")?;
+                let payload = connection_protocol_payload(
+                    self.runtime.block_on(self.ssh.local_target(connection_id)),
+                    self.non_ssh_creds.protocol_of(connection_id),
+                );
+                log_rdp_debug(format!(
+                    "connection/protocol query id={connection_id} -> {payload}"
+                ));
+                Ok(payload)
             }
             "connection/disconnect" => {
                 let connection_id = params
@@ -484,6 +533,9 @@ impl Plugin {
                     .and_then(Value::as_str)
                     .ok_or("Missing connection id")?;
                 self.non_ssh_creds.drop_connection(connection_id);
+                // 本地 Shell 目标的登记随断开清除；SSH/telnet/vnc 连接 id 不在
+                // local_targets 里，此调用为空操作。
+                self.ssh.drop_local_target(connection_id);
                 self.runtime
                     .block_on(self.ssh.disconnect_connection(connection_id))?;
                 self.runtime
@@ -697,11 +749,16 @@ impl Plugin {
             // PR-A4 generic launch-options contract: picker entries for the dock "+".
             // locale = 宿主 UI 语言（宿主侧 options_action 契约；旧宿主不传，回落英文）；
             // 描述展示解析后的默认 Shell（配置的 localShell 优先，否则自动探测链）。
+            // 已显式配置 localShell 时折叠发现分组——只留配置的那一个入口。
             "local/terminal/launch-options" => {
-                let default_shell = local_terminal::resolve_default_shell(&plugin_data_dir());
+                let configured = local_terminal::resolve_configured_shell(&plugin_data_dir());
+                let default_shell = configured
+                    .clone()
+                    .unwrap_or_else(|| local_terminal::resolve_default_shell(&plugin_data_dir()));
                 Ok(self.local.launch_options(
                     params.get("locale").and_then(Value::as_str).unwrap_or(""),
                     &default_shell,
+                    configured.as_deref(),
                 ))
             }
             // Telnet 会话（明文协议，P2-3）：入口在 SSH 工作台工具栏，用户显
@@ -917,7 +974,7 @@ impl Plugin {
             // + 16 MiB 上限；认证类失败不自动重连。
             "rdp/start" => {
                 rdp_start_gate(&plugin_data_dir())?;
-                let mut request: rdp_session::RdpStartRequest = parse(params)?;
+                let mut request: rdp::RdpStartRequest = parse(params)?;
                 // 表单密码/用户名合并：请求已带密码（弹窗路径）时不覆盖；
                 // 用户名只在请求留空时补（连接表单 username 对 telnet/rdp 可见）。
                 if request
@@ -926,14 +983,26 @@ impl Plugin {
                     .map(str::is_empty)
                     .unwrap_or(true)
                 {
+                    let merge_id = request
+                        .connection_id
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_string();
                     if let Some((username, password)) = self
                         .non_ssh_creds
                         .get(request.connection_id.as_deref().unwrap_or_default())
                     {
+                        log_rdp_debug(format!(
+                            "rdp/start merge id={merge_id}: credentials merged (username set)"
+                        ));
                         request.password = Some(password);
                         if request.username.trim().is_empty() && !username.is_empty() {
                             request.username = username;
                         }
+                    } else {
+                        log_rdp_debug(format!(
+                            "rdp/start merge id={merge_id}: no staged credentials (password stays empty)"
+                        ));
                     }
                 }
                 self.runtime
@@ -942,20 +1011,21 @@ impl Plugin {
             // 键盘/指针事件转发（scancode + extended 位，映射同 NyaTerm）；
             // `rdp/write` 为同语义别名。
             "rdp/input" | "rdp/write" => {
-                let request: rdp_session::RdpInputRequest = parse(params)?;
+                let request: rdp::RdpInputRequest = parse(params)?;
                 self.runtime
                     .block_on(self.rdp.input(&request.session_id, request.input))?;
                 Ok(json!({ "success": true }))
             }
-            // 服务端动态分辨率（校验桌面尺寸上界后转发引擎）。
+            // 服务端动态分辨率：resize = 以新尺寸重连（会话内 display control
+            // PDU 真机不生效，见 rdp::resize 文档与交付报告）。
             "rdp/resize" => {
-                let request: rdp_session::RdpResizeRequest = parse(params)?;
+                let request: rdp::RdpResizeRequest = parse(params)?;
                 self.runtime.block_on(self.rdp.resize(
                     &request.session_id,
                     request.width,
                     request.height,
-                ))?;
-                Ok(json!({ "success": true }))
+                    emitter.clone(),
+                ))
             }
             // 本地剪贴板 → 远端（text-only，16 MiB 上限）。
             "rdp/set-clipboard" => {
@@ -2801,6 +2871,33 @@ fn operation_id(params: &Value) -> String {
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
 }
 
+/// `connection/protocol` 的响应组装：本地 Shell 目标（`io.dbx.ssh.local`）
+/// 优先——宿主侧要求每个 connection provider 可打开（声明 workbench 或
+/// filesystem provider），本地目标打开的是 Terminal 工作台，webview 需要据
+/// protocol="local" 路由到 local/terminal/start 而非误拨 SSH；shell 透传连接
+/// 表单值（空 = 前端回落偏好/默认 Shell 解析链），cwd/env 同样透传连接表单
+/// 配置（`env` 为净化后的 name/value 行数组，空数组 = 未配置）。非本地连接
+/// 回落非 SSH 凭据注册表的会话协议（telnet/vnc/rdp/serial），未暂存为空串
+/// （调用方短重试）。
+fn connection_protocol_payload(
+    local_target: Option<crate::local_target::LocalTarget>,
+    stored_protocol: Option<String>,
+) -> Value {
+    match local_target {
+        Some(target) => json!({
+            "protocol": "local",
+            "shell": target.shell,
+            "cwd": target.cwd,
+            "env": target
+                .env
+                .iter()
+                .map(|(name, value)| json!({ "name": name, "value": value }))
+                .collect::<Vec<_>>(),
+        }),
+        None => json!({ "protocol": stored_protocol.unwrap_or_default() }),
+    }
+}
+
 fn required_u32(params: &Value, key: &str) -> Result<u32, String> {
     params
         .get(key)
@@ -3008,6 +3105,26 @@ fn main() -> std::io::Result<()> {
 
 /// Best-effort append to `<data-dir>/sidecar-exit.log`; never fails startup
 /// or shutdown when the data dir is unusable.
+/// 临时排障通道（rdp 路由诊断）：追加到 `<data-dir>/rdp-debug.log`。
+/// 仅记录连接 id/协议/错误分类等非敏感字段，凭据（Zeroizing）永不入文件。
+/// `pub(crate)`：rdp_session 的幂等查重复用命中也走同一排障通道。
+pub(crate) fn log_rdp_debug(message: String) {
+    use std::io::Write;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let path = plugin_data_dir().join("rdp-debug.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{} pid={} {}", timestamp, std::process::id(), message);
+}
+
 fn log_sidecar_exit(stage: String) {
     use std::io::Write;
     let timestamp = std::time::SystemTime::now()
@@ -3080,6 +3197,52 @@ mod tests {
         )
         .expect("enable experimental RDP");
         assert!(rdp_start_gate(data_dir.path()).is_ok());
+    }
+
+    /// `connection/protocol` 响应组装：本地 Shell 目标优先返回
+    /// protocol="local" + 连接表单 shell（空 shell 原样透出）；非本地连接
+    /// 回落非 SSH 凭据注册表协议，未暂存为空串（前端短重试）。
+    #[test]
+    fn connection_protocol_payload_prefers_local_target() {
+        let local = connection_protocol_payload(
+            Some(crate::local_target::LocalTarget {
+                id: "conn-local-1".to_string(),
+                name: Some("Local shell".to_string()),
+                shell: "/bin/bash".to_string(),
+                cwd: "/tmp/demo".to_string(),
+                env: vec![("EDITOR".to_string(), "/usr/bin/vim".to_string())],
+            }),
+            Some("rdp".to_string()),
+        );
+        assert_eq!(
+            local,
+            json!({
+                "protocol": "local",
+                "shell": "/bin/bash",
+                "cwd": "/tmp/demo",
+                "env": [{ "name": "EDITOR", "value": "/usr/bin/vim" }],
+            })
+        );
+        // 连接表单未填 shell：空串透出，前端回落默认 Shell 解析链。
+        let local_default = connection_protocol_payload(
+            Some(crate::local_target::LocalTarget {
+                id: "conn-local-2".to_string(),
+                name: None,
+                shell: String::new(),
+                cwd: String::new(),
+                env: Vec::new(),
+            }),
+            None,
+        );
+        assert_eq!(
+            local_default,
+            json!({ "protocol": "local", "shell": "", "cwd": "", "env": [] })
+        );
+        // 非 SSH 会话连接（telnet/vnc/rdp/serial）与未暂存连接维持原契约。
+        let stored = connection_protocol_payload(None, Some("telnet".to_string()));
+        assert_eq!(stored, json!({ "protocol": "telnet" }));
+        let unstaged = connection_protocol_payload(None, None);
+        assert_eq!(unstaged, json!({ "protocol": "" }));
     }
 
     /// 宿主对 connection/action 响应的契约（与 ssh.rs 摘要臂测试同源）：

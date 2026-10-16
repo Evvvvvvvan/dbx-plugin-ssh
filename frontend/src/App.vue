@@ -908,6 +908,9 @@ const {
   terminal: () => terminal,
   trackPendingInput,
   sendTerminalBytes,
+  // 惰性求值：hideGhostSuggestion 由下方 useGhostSuggest 解构（issue #196，
+  // 快捷指令程序化写入前消除行内 ghost，防残影重锚到底部光标行）。
+  hideGhostSuggestion: () => hideGhostSuggestion(),
 });
 const quickMenuOpen = ref(false);
 // Termius Snippets 式面板状态：搜索过滤 / 卡片展开。

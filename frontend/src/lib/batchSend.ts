@@ -135,7 +135,11 @@ export function applyConnectionNames(targets: BatchSendTarget[], raw: unknown): 
     if (!item || typeof item !== "object") continue;
     const record = item as Record<string, unknown>;
     const id = typeof record.id === "string" ? record.id : "";
-    const name = typeof record.name === "string" ? record.name.trim() : "";
+    // #193b：workbenchTitles 优先于连接名——宿主按「dock 终端条目 → 工作台 tab」
+    // 聚合（dock 在前），用户改的是哪台终端名，批量操作里对应连接的行就跟哪台。
+    const titles = Array.isArray(record.workbenchTitles) ? record.workbenchTitles : [];
+    const title = titles.map((t) => (typeof t === "string" ? t.trim() : "")).find(Boolean);
+    const name = title || (typeof record.name === "string" ? record.name.trim() : "");
     if (id && name) names.set(id, name);
   }
   if (!names.size) return targets;

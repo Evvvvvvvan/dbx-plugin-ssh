@@ -75,6 +75,25 @@ describe("applyConnectionNames", () => {
     ).toEqual([{ ...targets[0], name: "ops-prod" }]);
   });
 
+  it("prefers workbench titles (#193b: renamed dock terminal) over the connection name", () => {
+    const targets = [
+      row({ sessionId: "s-1" }),
+      row({ sessionId: "s-2", connectionId: "conn-2" }),
+      row({ sessionId: "s-3", connectionId: "conn-3" }),
+    ];
+    const named = applyConnectionNames(targets, [
+      // Dock-first aggregation from the host: renamed terminal wins.
+      { id: "conn-1", name: "ops-prod", workbenchTitles: ["prod-db", "ops-prod"] },
+      // Junk/non-string titles fall back to the connection name.
+      { id: "conn-2", name: "app-server", workbenchTitles: [42, null, "   "] },
+      // Missing field keeps the plain-name behavior.
+      { id: "conn-3", name: "backup" },
+    ]);
+    expect(named[0]).toEqual({ ...targets[0], name: "prod-db" });
+    expect(named[1]).toEqual({ ...targets[1], name: "app-server" });
+    expect(named[2]).toEqual({ ...targets[2], name: "backup" });
+  });
+
   it("leaves targets untouched when no usable names exist", () => {
     const targets = [row({}), row({ sessionId: "s-2", connectionId: "", local: true, host: "Local · zsh" })];
     expect(applyConnectionNames(targets, [{ id: "conn-x", name: "   " }])).toEqual(targets);

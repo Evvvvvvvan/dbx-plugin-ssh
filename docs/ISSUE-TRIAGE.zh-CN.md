@@ -181,7 +181,7 @@ python3 scripts/validate_repo.py
 
 用户改的名是 **dock 条目标题**（`PluginBottomDock.vue` 双击改名 → `renamePluginDockEntry`）——纯宿主 UI 态：宿主桥没有任何把 dock/tab 标题暴露给插件的 API 或事件（`host.listConnections` 只回连接表名，workbench context 无 title 字段，无 rename 事件转发），插件在现有宿主契约下**原理上不可见**。
 
-**宿主修复方案**（jinpy666/dbx，二选一）：① `listConnections` 行内附加该连接当前 dock/tab 标题（如 `workbenchTitles: string[]`，按 `pluginTabConnectionId`/dock 条目 context 聚合）；② 新增只读 `host.listWorkbenches`（插件级，返回 workbenchId→title 映射）并在 rename 时经 `forwardEvent` 推送。插件侧拿到任一通道后，在 `refreshBatchTargets` 叠加即可（`batchTargetLabel` 优先级扩展为 标题 → 连接名 → user@host）。
+**宿主修复方案**（jinpy666/dbx，二选一；已落地方案①：宿主分支 `fix/plugin-tab-close-dock-disconnect`——`host.listConnections` 行内附加 `workbenchTitles`，聚合实现 `apps/desktop/src/lib/plugins/pluginConnectionSurfaces.ts`；本仓库消费见 `applyConnectionNames`）：① `listConnections` 行内附加该连接当前 dock/tab 标题（如 `workbenchTitles: string[]`，按 `pluginTabConnectionId`/dock 条目 context 聚合）；② 新增只读 `host.listWorkbenches`（插件级，返回 workbenchId→title 映射）并在 rename 时经 `forwardEvent` 推送。插件侧拿到任一通道后，在 `refreshBatchTargets` 叠加即可（`batchTargetLabel` 优先级扩展为 标题 → 连接名 → user@host）。
 
 ### 7.3 本轮插件侧交付（回归锁，不改变行为）
 

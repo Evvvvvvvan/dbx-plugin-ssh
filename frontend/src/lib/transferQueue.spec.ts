@@ -284,6 +284,7 @@ describe("summarizeBatchUpload / batchUploadPercent (#165)", () => {
     ];
     const summary = summarizeBatchUpload(tasks, "b1", 3, 400);
     expect(summary.filesDone).toBe(1);
+    expect(summary.filesFailed).toBe(0);
     expect(summary.bytesDone).toBe(150);
     expect(summary.currentFile).toBe("b.bin");
     expect(batchUploadPercent(summary)).toBe(38);
@@ -295,14 +296,28 @@ describe("summarizeBatchUpload / batchUploadPercent (#165)", () => {
       row({ taskId: "2", batchId: "b1", size: 10, transferred: 999, status: "cancelled" }),
     ];
     const summary = summarizeBatchUpload(tasks, "b1", 2, 110);
+    // 失败计入完成数（不吞总数），失败后缀只数 failed、不把用户取消算进去。
     expect(summary.filesDone).toBe(2);
+    expect(summary.filesFailed).toBe(1);
     expect(summary.bytesDone).toBe(110);
     expect(summary.currentFile).toBeUndefined();
   });
 
+  it("counts every failed row while leaving cancelled rows out of filesFailed", () => {
+    const tasks = [
+      row({ batchId: "b1", size: 10, transferred: 10, status: "failed" }),
+      row({ taskId: "2", batchId: "b1", size: 10, transferred: 4, status: "failed" }),
+      row({ taskId: "3", batchId: "b1", size: 10, transferred: 6, status: "cancelled" }),
+      row({ taskId: "4", batchId: "b1", size: 10, transferred: 10, status: "completed" }),
+    ];
+    const summary = summarizeBatchUpload(tasks, "b1", 4, 40);
+    expect(summary.filesDone).toBe(4);
+    expect(summary.filesFailed).toBe(2);
+  });
+
   it("percent falls back to file counts before any bytes land", () => {
-    expect(batchUploadPercent({ filesDone: 1, filesTotal: 4, bytesDone: 0, totalBytes: 0 })).toBe(25);
-    expect(batchUploadPercent({ filesDone: 0, filesTotal: 0, bytesDone: 0, totalBytes: 0 })).toBe(0);
-    expect(batchUploadPercent({ filesDone: 0, filesTotal: 2, bytesDone: 0, totalBytes: 100 })).toBe(0);
+    expect(batchUploadPercent({ filesDone: 1, filesTotal: 4, filesFailed: 0, bytesDone: 0, totalBytes: 0 })).toBe(25);
+    expect(batchUploadPercent({ filesDone: 0, filesTotal: 0, filesFailed: 0, bytesDone: 0, totalBytes: 0 })).toBe(0);
+    expect(batchUploadPercent({ filesDone: 0, filesTotal: 2, filesFailed: 0, bytesDone: 0, totalBytes: 100 })).toBe(0);
   });
 });

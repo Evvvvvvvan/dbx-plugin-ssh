@@ -8800,11 +8800,13 @@ watch(historyScope, () => {
               <p v-if="folderUploadProgress.currentFile" class="transfer-path mono" :title="folderUploadProgress.currentFile">{{ folderUploadProgress.currentFile }}</p>
             </article>
             <!-- 普通多文件上传批次聚合（issue #165）：文件 N/M + 总字节；批次
-                 卡整批常驻，填补逐文件卡交接间隙的"传完就没"空窗。 -->
+                 卡整批常驻，填补逐文件卡交接间隙的"传完就没"空窗；批次编排
+                 结束后由 lib/fileBatch 延迟收尾清卡（不清会在 30s 终态清收后
+                 回跳 0/N·0%）。失败后缀只在有失败时出现（失败计入不吞总数）。 -->
             <article v-if="fileBatchProgress" class="transfer-card">
               <div class="transfer-title"><FileUp /><span>{{ t("uploadBatch.title") }}</span><strong>{{ batchUploadPercent(fileBatchProgress) }}%</strong></div>
               <progress :value="batchUploadPercent(fileBatchProgress)" max="100" />
-              <div class="transfer-meta"><span>{{ t("uploadBatch.progress", { files: fileBatchProgress.filesDone, filesTotal: fileBatchProgress.filesTotal }) }}</span><span>{{ formatBytes(fileBatchProgress.bytesDone) }} / {{ formatBytes(fileBatchProgress.totalBytes) }}</span></div>
+              <div class="transfer-meta"><span>{{ t("uploadBatch.progress", { files: fileBatchProgress.filesDone, filesTotal: fileBatchProgress.filesTotal }) }}<template v-if="fileBatchProgress.filesFailed"> · {{ t("uploadBatch.failed", { count: fileBatchProgress.filesFailed }) }}</template></span><span>{{ formatBytes(fileBatchProgress.bytesDone) }} / {{ formatBytes(fileBatchProgress.totalBytes) }}</span></div>
               <p v-if="fileBatchProgress.currentFile" class="transfer-path mono" :title="fileBatchProgress.currentFile">{{ fileBatchProgress.currentFile }}</p>
             </article>
             <article v-for="task in transferList" :key="task.taskId" class="transfer-card">

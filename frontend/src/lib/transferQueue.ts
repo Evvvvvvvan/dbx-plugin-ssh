@@ -42,6 +42,9 @@ export interface TransferTask {
 export interface BatchUploadSummary {
   filesDone: number;
   filesTotal: number;
+  /** 失败收场的文件数（cancelled 是用户主动取消，不计失败；两者都已计入
+   * filesDone——失败计入进度但不吞掉总数）。 */
+  filesFailed: number;
   bytesDone: number;
   totalBytes: number;
   currentFile?: string;
@@ -54,19 +57,21 @@ export function summarizeBatchUpload(
   totalBytes: number,
 ): BatchUploadSummary {
   let filesDone = 0;
+  let filesFailed = 0;
   let bytesDone = 0;
   let currentFile: string | undefined;
   for (const task of tasks) {
     if (task.batchId !== batchId) continue;
     if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") {
       filesDone += 1;
+      if (task.status === "failed") filesFailed += 1;
     }
     bytesDone += Math.min(task.transferred, task.size || task.transferred);
     if (!currentFile && (task.status === "running" || task.status === "queued")) {
       currentFile = task.fileName;
     }
   }
-  return { filesDone, filesTotal, bytesDone, totalBytes, currentFile };
+  return { filesDone, filesTotal, filesFailed, bytesDone, totalBytes, currentFile };
 }
 
 /** 批次聚合卡百分比（issue #165）：字节进度为准；总字节未知（全 0，尚未

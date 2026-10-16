@@ -269,8 +269,10 @@ async function restoreTransfers() {
     }
     const existing = transferTasks[task.taskId];
     // joinedAt 只在首次见到时落一次：后端返回序（HashMap 迭代序）不再影响
-    // 活跃区排序（issue #18）。
-    transferTasks[task.taskId] = { ...task, joinedAt: existing?.joinedAt ?? Date.now() };
+    // 活跃区排序（issue #18）。batchId 同理透传（issue #165）：它是纯前端
+    // 键（后端 list 不带），不透传的话批中关开一次面板，restoreTransfers
+    // 整行覆盖就会把批次卡打回 0/N · 0%。
+    transferTasks[task.taskId] = { ...task, joinedAt: existing?.joinedAt ?? Date.now(), batchId: existing?.batchId ?? task.batchId };
   }
 }
 

@@ -1,4 +1,4 @@
-import { computed, nextTick, onMounted, ref, watch, type Ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Ref } from "vue";
 import { filesFromClipboard } from "../lib/clipboardFiles";
 import { collectDropRootEntries, scanDroppedEntries, type DropRootEntry } from "../lib/dropEntries";
 import { advanceFolderUploadDirectories, buildFolderUploadPlan, createFolderUploadProgress, folderUploadOutcome, settleFolderUploadFile, type FolderUploadProgress } from "../lib/folderUpload";
@@ -7,6 +7,7 @@ import { planHostFileDrop } from "../lib/hostFileDrop";
 import { displayPathToWire } from "../lib/sftpName";
 import { canAcceptTerminalDrop, canAcceptFileDrop, normalizeDropTargetDir, resolveDropTargetDir } from "../lib/terminalInteraction";
 import { runTransfers, summarizeBatchUpload } from "../lib/transferQueue";
+import { createFileBatchCard, type FileBatchCardState } from "../lib/fileBatch";
 import { X } from "@lucide/vue";
 
 // 拖入条目/上传重复弹窗的最小结构（App.vue 的 FolderUploadEntry/
@@ -70,17 +71,14 @@ const folderUploadProgress = ref<FolderUploadProgress>();
 // 传输面板聚成一张「文件 N/M · 字节」进度卡——逐文件卡在并发受限与文件
 // 交接的间隙会整卡消失（完成卡即转入历史），用户感知为"传完就没然后
 // 突然又来几个进度条"；批次卡在整批期间常驻填补空窗。单文件不显示。
-const fileBatch = ref<{ batchId: string; filesTotal: number; totalBytes: number }>();
-function beginFileBatch(files: ReadonlyArray<{ size: number }>): string {
-  const batchId = `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  if (files.length > 1) {
-    fileBatch.value = { batchId, filesTotal: files.length, totalBytes: files.reduce((sum, file) => sum + file.size, 0) };
-  }
-  return batchId;
-}
+// 生命周期（建卡/收尾清空）收口在 lib/fileBatch：end 在批次编排结束后
+// 延迟清卡——不清卡会在任务账本 30s 终态清收后回跳成 0/N · 0%。
+const fileBatchCard = ref<FileBatchCardState>();
+const fileBatch = createFileBatchCard(fileBatchCard);
+onBeforeUnmount(() => fileBatch.dispose());
 /** 批次进度卡数据：文件数随任务账本结算推进，字节按 batchId 聚合。 */
 const fileBatchProgress = computed(() => {
-  const batch = fileBatch.value;
+  const batch = fileBatchCard.value;
   if (!batch) return undefined;
   return summarizeBatchUpload(Object.values(transferTasks), batch.batchId, batch.filesTotal, batch.totalBytes);
 });
@@ -142,30 +140,36 @@ async function chooseUpload() {
 async function uploadHandleFiles(files: Array<{ handleId: string; name: string; size: number }>, targetDir?: string): Promise<number> {
   if (!window.dbxPlugin.fileTransfer || !files.length) return 0;
   uploadDuplicateBatchDecision = undefined;
-  const batchId = beginFileBatch(files);
+  const batchId = fileBatch.begin(files);
   let uploaded = 0;
-  await runTransfers(files, batchTransferLimit(), {
-    id: (file) => file.handleId,
-    run: async (file) => {
-      try {
-        const done = await uploadSource(file.name, file.size, async (offset, length) => {
-          const result = await window.dbxPlugin.fileTransfer!.read(file.handleId, offset, length);
-          return window.dbxPlugin.decodeBase64(result.dataBase64);
-        }, undefined, targetDir, { batchId });
-        if (done) uploaded += 1;
-      } catch (cause) {
-        // 桥接读盘错误转成可理解的提示；uploadSource 已补 upload-read-failed 代码，
-        // 终端拖入路径（同函数）的 showError 也会显示这条友好文案。
-        if (isHostBridgeReadFailure(cause)) {
-          const code = (cause as Error & { code?: unknown }).code;
-          throw Object.assign(new Error(t("uploadBridgeReadFailed", { name: file.name })), { code, cause });
+  try {
+    await runTransfers(files, batchTransferLimit(), {
+      id: (file) => file.handleId,
+      run: async (file) => {
+        try {
+          const done = await uploadSource(file.name, file.size, async (offset, length) => {
+            const result = await window.dbxPlugin.fileTransfer!.read(file.handleId, offset, length);
+            return window.dbxPlugin.decodeBase64(result.dataBase64);
+          }, undefined, targetDir, { batchId });
+          if (done) uploaded += 1;
+        } catch (cause) {
+          // 桥接读盘错误转成可理解的提示；uploadSource 已补 upload-read-failed 代码，
+          // 终端拖入路径（同函数）的 showError 也会显示这条友好文案。
+          if (isHostBridgeReadFailure(cause)) {
+            const code = (cause as Error & { code?: unknown }).code;
+            throw Object.assign(new Error(t("uploadBridgeReadFailed", { name: file.name })), { code, cause });
+          }
+          throw cause;
+        } finally {
+          await window.dbxPlugin.fileTransfer!.cancel(file.handleId).catch(() => undefined);
         }
-        throw cause;
-      } finally {
-        await window.dbxPlugin.fileTransfer!.cancel(file.handleId).catch(() => undefined);
-      }
-    },
-  });
+      },
+    });
+  } finally {
+    // 批次收尾（issue #165）：成功、真实失败中止或重复弹窗放弃都走这里，
+    // 卡片在保留窗口后清掉；批间重叠由 batchId 守卫（end 只收自己这批）。
+    fileBatch.end(batchId);
+  }
   return uploaded;
 }
 
@@ -252,15 +256,20 @@ async function uploadLocalFiles(files: readonly File[], targetDir?: string) {
   uploadDuplicateBatchDecision = undefined;
   // File 对象没有稳定 id：包一层带序号的 key 再交给调度器。
   const entries = files.map((file, index) => ({ file, key: `local-${index}` }));
-  const batchId = beginFileBatch(files);
+  const batchId = fileBatch.begin(files);
   let uploaded = 0;
-  await runTransfers(entries, batchTransferLimit(), {
-    id: (entry) => entry.key,
-    run: async (entry) => {
-      const done = await uploadSource(entry.file.name, entry.file.size, async (offset, length) => new Uint8Array(await entry.file.slice(offset, offset + length).arrayBuffer()), undefined, targetDir, { batchId });
-      if (done) uploaded += 1;
-    },
-  });
+  try {
+    await runTransfers(entries, batchTransferLimit(), {
+      id: (entry) => entry.key,
+      run: async (entry) => {
+        const done = await uploadSource(entry.file.name, entry.file.size, async (offset, length) => new Uint8Array(await entry.file.slice(offset, offset + length).arrayBuffer()), undefined, targetDir, { batchId });
+        if (done) uploaded += 1;
+      },
+    });
+  } finally {
+    // 批次收尾（issue #165）：编排结束即安排卡片清空，失败中止同帧收尾。
+    fileBatch.end(batchId);
+  }
   await loadDirectory();
   if (uploaded) showNotice(t("uploaded", { count: uploaded }));
 }

@@ -193,6 +193,7 @@ function clampStartupDelayInput(raw: string): number {
   return Math.min(value, STARTUP_DELAY_MAX_MS);
 }
 import { COMPLETION_ENGINE_KEY, loadCompletionEngine, pluginStore, sanitizeCompletionEngine, type CompletionEngineSetting } from "../lib/pluginStore";
+import { COMMAND_HISTORY_LIMIT, MAX_COMMAND_HISTORY_LIMIT, MIN_COMMAND_HISTORY_LIMIT, sanitizeCommandHistoryLimit } from "../lib/commandHistory";
 import { clearSuggestionBlocklist, loadSuggestionBlocklist } from "../lib/suggestionBlocklist";
 
 /** 连接级 SFTP 文件名编码覆盖（M16）：同启动命令的自治 RPC 读写
@@ -381,6 +382,31 @@ function setHistoryPanelEnabled(next: boolean) {
   emit("update:historyPanelEnabled", next);
 }
 
+// 历史显示条数（issue #192）：命令环上限（10..1000，默认 100）。与开关同
+// 自治模式——组件内读写 pluginStore，@change 归一化写穿并经
+// update:commandHistoryLimit 上抛；App 侧收紧各桶 + 持久化，即时生效。
+const COMMAND_HISTORY_LIMIT_KEY = "ssh-command-history-limit";
+const commandHistoryLimitDraft = ref(String(loadCommandHistoryLimitValue()));
+
+function loadCommandHistoryLimitValue(): number {
+  try {
+    return sanitizeCommandHistoryLimit(pluginStore.getItem(COMMAND_HISTORY_LIMIT_KEY));
+  } catch {
+    return COMMAND_HISTORY_LIMIT;
+  }
+}
+
+function applyCommandHistoryLimitFromDraft() {
+  const next = sanitizeCommandHistoryLimit(Number.parseInt(commandHistoryLimitDraft.value, 10));
+  commandHistoryLimitDraft.value = String(next);
+  try {
+    pluginStore.setItem(COMMAND_HISTORY_LIMIT_KEY, String(next));
+  } catch {
+    // 存储不可用（沙箱降级链耗尽）：退化为会话内存态，本次仍即时上抛生效。
+  }
+  emit("update:commandHistoryLimit", next);
+}
+
 function loadGhostEnabled(): boolean {
   try {
     return pluginStore.getItem(GHOST_SUGGEST_KEY) !== "0";
@@ -522,6 +548,8 @@ const emit = defineEmits<{
   (e: "update:ghostSuggest", value: boolean): void;
   /** 历史面板功能开关（issue #169，组件自治持久化 pluginStore）。 */
   (e: "update:historyPanelEnabled", value: boolean): void;
+  /** 历史显示条数（issue #192，组件自治持久化 pluginStore，App 收紧各桶）。 */
+  (e: "update:commandHistoryLimit", value: number): void;
   (e: "update:ghostTabAccept", value: boolean): void;
   /** AI 助手设置增量（Warp AI 对齐批）：App 归一化 + pluginStore 持久化。 */
   (e: "update-ai-settings", patch: Partial<AiSettings>): void;
@@ -2421,6 +2449,12 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               <span>{{ t("historyPanelSettings.enabledLabel") }}</span>
             </label>
             <p class="muted settings-note">{{ t("historyPanelSettings.enabledHint") }}</p>
+            <!-- 历史显示条数（issue #192）：命令环上限，收紧即时裁剪生效。 -->
+            <label class="settings-field">
+              <span>{{ t("historyPanelSettings.limitLabel") }}</span>
+              <input v-model="commandHistoryLimitDraft" type="number" :min="MIN_COMMAND_HISTORY_LIMIT" :max="MAX_COMMAND_HISTORY_LIMIT" step="10" @change="applyCommandHistoryLimitFromDraft" />
+            </label>
+            <p class="muted settings-note">{{ t("historyPanelSettings.limitHint", { min: MIN_COMMAND_HISTORY_LIMIT, max: MAX_COMMAND_HISTORY_LIMIT, def: COMMAND_HISTORY_LIMIT }) }}</p>
             <!-- 空提示符快捷键引导条开关：终端空行静置时的 kbd 提示（↑/Ctrl+R/
                  Ctrl+Space/→），用过即散；设置里重开即清消散旗标。 -->
             <label class="settings-field settings-switch-row">

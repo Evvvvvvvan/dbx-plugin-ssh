@@ -132,6 +132,55 @@ fn sanitize_user_env(env: &BTreeMap<String, String>) -> Vec<(String, String)> {
     pairs
 }
 
+/// Locale keys that govern character handling (issue #173): when any of them
+/// already carries a value — from the sidecar's own environment or the
+/// request — the shell already has a locale and injection must stay out.
+const LOCALE_KEYS: [&str; 3] = ["LANG", "LC_ALL", "LC_CTYPE"];
+
+/// Platform LANG defaults for a shell whose environment names no locale at
+/// all. macOS picks `en_US.UTF-8` — present on every macOS install and
+/// synthesized on demand for other UTF-8 locales, so it is the universal
+/// value (a `zh_CN` one would print dates in Chinese for users who never
+/// asked). Linux picks `C.UTF-8` — the one UTF-8 locale glibc always
+/// provides (built-in since 2.35, shipped by every mainstream distro and
+/// musl long before), unlike `en_US.UTF-8` which minimal installs never
+/// generate. Windows returns `None`: console encodings there are code pages
+/// driven by `chcp`/console APIs, which `LANG` cannot reach.
+fn default_utf8_lang(platform: Platform) -> Option<&'static str> {
+    match platform {
+        Platform::MacOS => Some("en_US.UTF-8"),
+        Platform::Linux => Some("C.UTF-8"),
+        Platform::Windows => None,
+    }
+}
+
+/// The LANG value to hand the PTY shell when it would otherwise run in the C
+/// locale, or `None` when a locale is already spoken. DBX launches the
+/// sidecar as a GUI process, and GUI sessions on macOS carry no `LANG` — the
+/// shell inherited that emptiness and fell back to `C`, where CJK input
+/// breaks down per byte (line editing, completion, filename display garble).
+/// `user_env` is the sanitized request pairs (what will actually be applied);
+/// `inherited` reports the sidecar's own environment. The gap is filled only
+/// when neither names one of [`LOCALE_KEYS`] with a non-empty value — a
+/// user-configured locale always wins, and `None` means the shell keeps what
+/// it already has.
+fn fallback_lang(
+    user_env: &[(String, String)],
+    platform: Platform,
+    inherited: &dyn Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
+    let user_speaks = user_env
+        .iter()
+        .any(|(key, _)| LOCALE_KEYS.contains(&key.as_str()));
+    let inherited_speaks = LOCALE_KEYS
+        .iter()
+        .any(|key| inherited(key).is_some_and(|value| !value.is_empty()));
+    if user_speaks || inherited_speaks {
+        return None;
+    }
+    default_utf8_lang(platform)
+}
+
 enum LocalTerminalCommand {
     Input(Vec<u8>),
     Resize { cols: u32, rows: u32 },
@@ -222,10 +271,20 @@ impl LocalTerminalRuntime {
         // same), plus a detectable marker akin to TERM_PROGRAM=vscode.
         command.env("COLORTERM", "truecolor");
         command.env("TERM_PROGRAM", "dbx");
+        // UTF-8 locale fallback for a shell that inherited none (issue #173):
+        // a GUI-launched sidecar carries no LANG, so the shell line-edited in
+        // the C locale and CJK garbled. Applied beneath the user env below —
+        // an explicitly configured LANG/LC_* always wins.
+        let user_env_pairs = sanitize_user_env(&request.env);
+        if let Some(lang) = fallback_lang(&user_env_pairs, current_platform(), &|key| {
+            std::env::var(key).ok()
+        }) {
+            command.env("LANG", lang);
+        }
         // User env sits beneath integration env: injection owns its mechanics
         // (ZDOTDIR…) and the managed keys above are filtered out entirely, so
         // the shell's rendering contract holds no matter what was sent.
-        for (key, value) in sanitize_user_env(&request.env) {
+        for (key, value) in user_env_pairs {
             command.env(key, value);
         }
         for (key, value) in &integration.env {
@@ -1570,6 +1629,68 @@ mod tests {
         assert_eq!(pairs.len(), USER_ENV_MAX_PAIRS);
         assert_eq!(pairs[0].0, "K000");
         assert_eq!(pairs[USER_ENV_MAX_PAIRS - 1].0, "K031");
+    }
+
+    /// The sanitized-pairs shape `start` feeds [`fallback_lang`].
+    fn sanitized(map: &[(&str, &str)]) -> Vec<(String, String)> {
+        map.iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn nothing_set(_key: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn fallback_lang_fills_the_gap_when_no_locale_is_spoken() {
+        let no_env: Vec<(String, String)> = Vec::new();
+        assert_eq!(
+            fallback_lang(&no_env, Platform::MacOS, &nothing_set),
+            Some("en_US.UTF-8")
+        );
+        assert_eq!(
+            fallback_lang(&no_env, Platform::Linux, &nothing_set),
+            Some("C.UTF-8")
+        );
+    }
+
+    #[test]
+    fn fallback_lang_stays_out_when_the_user_configured_a_locale() {
+        for key in ["LANG", "LC_ALL", "LC_CTYPE"] {
+            let pairs = sanitized(&[(key, "zh_CN.UTF-8")]);
+            assert_eq!(fallback_lang(&pairs, Platform::MacOS, &nothing_set), None);
+        }
+        // An unrelated LC_* key does not decide the character locale: the
+        // fallback still applies beneath it.
+        let pairs = sanitized(&[("LC_MESSAGES", "zh_CN.UTF-8")]);
+        assert_eq!(
+            fallback_lang(&pairs, Platform::MacOS, &nothing_set),
+            Some("en_US.UTF-8")
+        );
+    }
+
+    #[test]
+    fn fallback_lang_stays_out_when_the_sidecar_environment_has_one() {
+        let inherited = |key: &str| (key == "LC_CTYPE").then(|| "en_US.UTF-8".to_string());
+        let no_env: Vec<(String, String)> = Vec::new();
+        assert_eq!(fallback_lang(&no_env, Platform::MacOS, &inherited), None);
+        // An inherited EMPTY value speaks no locale (an exported-but-empty
+        // LANG must not veto the fallback): the gap still gets filled.
+        let empty = |key: &str| (key == "LANG").then(String::new);
+        assert_eq!(
+            fallback_lang(&no_env, Platform::MacOS, &empty),
+            Some("en_US.UTF-8")
+        );
+    }
+
+    #[test]
+    fn fallback_lang_skips_windows_where_lang_cannot_reach_the_console() {
+        let no_env: Vec<(String, String)> = Vec::new();
+        assert_eq!(
+            fallback_lang(&no_env, Platform::Windows, &nothing_set),
+            None
+        );
     }
 
     #[test]

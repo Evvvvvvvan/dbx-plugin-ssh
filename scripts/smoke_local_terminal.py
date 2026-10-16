@@ -211,6 +211,69 @@ def main() -> int:
             else:
                 print("SKIP env/cwd case: no /bin/sh on this host")
 
+            # UTF-8 locale 兜底（#173）：sidecar 环境无 LANG/LC_*（GUI 宿主
+            # 启动的常态）时，子 shell 不得留在 C locale。探测用 $((..)) 算术
+            # 展开构造只出现在展开输出里的标记（终端回显行先到，done 不能被
+            # 命令回显提前触发）：LOCALE_2_LANG=<展开后的 LANG 值>。
+            if shutil.which("/bin/sh"):
+                scrubbed = SidecarClient.start(
+                    binary=args.binary, data_dir=data_dir, strip_locale_env=True
+                )
+                try:
+                    scrubbed.initialize()
+                    fallback = scrubbed.request("local/terminal/start", {
+                        "workbenchId": "smoke-wb",
+                        "cols": 100,
+                        "rows": 30,
+                        "shell": "/bin/sh",
+                    })
+                    fb_session = fallback["sessionId"]
+                    fb_marker = b"LOCALE_2_LANG="
+                    fb_text = collect_until(
+                        scrubbed,
+                        f"local/terminal/out/{fb_session}",
+                        f"local/terminal/in/{fb_session}",
+                        ready=lambda chunk: b"$ " in chunk,
+                        done=lambda chunk: fb_marker in chunk,
+                        probe=b'echo LOCALE_$((1+1))_LANG=$LANG LC_CTYPE=$LC_CTYPE\r',
+                    )
+                    assert fb_marker in fb_text, f"probe output missing; tail={fb_text[-200:]!r}"
+                    fb_value = (
+                        fb_text.split(fb_marker, 1)[1].split(b"\r", 1)[0].split(b" ", 1)[0].strip()
+                    )
+                    assert fb_value.endswith(b"UTF-8"), f"shell stayed in non-UTF-8 locale: {fb_value!r}"
+                    print(f"locale fallback injected: {fb_value.decode(errors='replace')}")
+                    scrubbed.request("local/session/close", {"sessionId": fb_session})
+                    scrubbed.wait_event("local/session/state", timeout=10)
+
+                    # 同一无 locale 的 sidecar：用户显式传 LANG（偏好/连接表单
+                    # 合并后的形态）必须原样生效，注入不得覆盖。
+                    user_wins = scrubbed.request("local/terminal/start", {
+                        "workbenchId": "smoke-wb",
+                        "cols": 100,
+                        "rows": 30,
+                        "shell": "/bin/sh",
+                        "env": {"LANG": "zh_CN.UTF-8"},
+                    })
+                    uw_session = user_wins["sessionId"]
+                    uw_marker = b"UW_4_LANG=zh_CN.UTF-8"
+                    uw_text = collect_until(
+                        scrubbed,
+                        f"local/terminal/out/{uw_session}",
+                        f"local/terminal/in/{uw_session}",
+                        ready=lambda chunk: b"$ " in chunk,
+                        done=lambda chunk: uw_marker in chunk,
+                        probe=b'echo UW_$((2+2))_LANG=$LANG\r',
+                    )
+                    assert uw_marker in uw_text, f"user LANG overridden or missing; tail={uw_text[-200:]!r}"
+                    print("user LANG preserved over injection")
+                    scrubbed.request("local/session/close", {"sessionId": uw_session})
+                    scrubbed.wait_event("local/session/state", timeout=10)
+                finally:
+                    scrubbed.close()
+            else:
+                print("SKIP locale case: no /bin/sh on this host")
+
             print("LOCAL TERMINAL SMOKE PASS")
             return 0
         finally:

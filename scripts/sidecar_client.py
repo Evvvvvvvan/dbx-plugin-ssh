@@ -95,13 +95,24 @@ class SidecarClient:
         return chunk
 
     @classmethod
-    def start(cls, binary: str | None = None, data_dir: str | None = None, timeout: float = 20.0) -> "SidecarClient":
+    def start(
+        cls,
+        binary: str | None = None,
+        data_dir: str | None = None,
+        timeout: float = 20.0,
+        strip_locale_env: bool = False,
+    ) -> "SidecarClient":
         binary = binary or default_binary()
         if not os.path.exists(binary):
             raise SidecarError(f"sidecar binary not found: {binary} (set DBX_PLUGIN_SIDECAR)")
         env = dict(os.environ)
         if data_dir:
             env["DBX_PLUGIN_DATA_DIR"] = data_dir
+        if strip_locale_env:
+            # Simulate the DBX desktop host launching the sidecar as a GUI
+            # process: GUI sessions carry no LANG/LC_* (issue #173 fallback).
+            for key in [k for k in env if k == "LANG" or k == "LC_ALL" or k.startswith("LC_")]:
+                del env[key]
         process = subprocess.Popen(
             [binary],
             stdin=subprocess.PIPE,

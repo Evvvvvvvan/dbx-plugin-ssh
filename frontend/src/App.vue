@@ -831,6 +831,15 @@ const dragActive = ref(false);
 // Terminal-local drag overlay: true only while files are dragged over the
 // terminal pane and the drop can actually be accepted (writable session).
 const terminalDragActive = ref(false);
+// 窗口级兜底（issue #197）：拖拽离开 webview 窗口或被 Esc 取消时，最后一次
+// dragleave 的 relatedTarget 为空——无论高亮来自哪条链路（面板 DOM 事件或宿主
+// 桥 onDragState）都复位，SFTP 面板不再停留在「上传」悬浮层。子元素间移动的
+// leave relatedTarget 非空，不会误触发。
+function resetDragHighlightOnWindowLeave(event: DragEvent) {
+  if (event.relatedTarget) return;
+  dragActive.value = false;
+  terminalDragActive.value = false;
+}
 // 右键菜单由 reka ContextMenu 承载（定位/碰撞/Esc/外点关闭均交给 reka）；
 // 这里只保留受控 open 状态与负载数据，坐标由 trigger 从原生事件捕获。
 const terminalMenuOpen = ref(false);
@@ -6726,7 +6735,9 @@ const {
   handleHostFileDrop,
   onDrop,
   onSftpDragEnter,
+  onSftpDragLeave,
   onTerminalDragEnter,
+  onTerminalDragLeave,
   onTerminalDrop,
   chooseUpload,
   confirmDropUpload,
@@ -8186,6 +8197,7 @@ onMounted(() => {
   document.addEventListener("pointerdown", hideTooltip, true);
   document.addEventListener("wheel", hideTooltip, true);
   window.addEventListener("dbx:docker-open-in-terminal", handleDockerOpenInTerminal);
+  window.addEventListener("dragleave", resetDragHighlightOnWindowLeave);
   hostFontObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["style"] });
   void hydrateQuickCommands();
   void hydrateHighlightRules();
@@ -8200,6 +8212,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   disposed = true;
   window.removeEventListener("dbx:docker-open-in-terminal", handleDockerOpenInTerminal);
+  window.removeEventListener("dragleave", resetDragHighlightOnWindowLeave);
   document.removeEventListener("mouseover", onTooltipOver);
   document.removeEventListener("mouseout", onTooltipOut);
   document.removeEventListener("focusin", onTooltipFocusIn);
@@ -8887,7 +8900,7 @@ watch(historyScope, () => {
     <section ref="paneContainer" :class="orderedPaneClass">
       <ContextMenu :open="terminalMenuOpen" @update:open="(open) => { if (!open) terminalMenuOpen = false; }">
         <ContextMenuTrigger as-child>
-      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed, 'gutter-visible': gutterPaneVisible, 'wallpaper-active': wallpaperActive }" :style="[terminalBasis, gutterPaneStyle]" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
+      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed, 'gutter-visible': gutterPaneVisible, 'wallpaper-active': wallpaperActive }" :style="[terminalBasis, gutterPaneStyle]" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave="onTerminalDragLeave" @drop.prevent="onTerminalDrop($event)">
         <!-- P2-9 背景图层：pointer-events:none 垫底（DOM 序先于 terminal-host），
              透明度 0.1-0.9 由设置页滑杆控制；开启期间强制 DOM 渲染器透出本层。 -->
         <div v-if="wallpaperActive" class="terminal-wallpaper" :style="{ backgroundImage: `url(${wallpaperDataUrl})`, opacity: wallpaperOpacity / 100 }" aria-hidden="true" />
@@ -9567,7 +9580,7 @@ watch(historyScope, () => {
         @keydown="onDividerKeydown($event, nudgeSplitDivider)"
       />
 
-      <section v-if="sftpPaneOpen && !isRdpConnection && !localUiMode" ref="sftpPane" class="sftp-pane" tabindex="-1" :class="{ 'drag-active': dragActive }" @pointerdown="focusSftpPaneOnPointerDown" @paste.capture="onSftpClipboardPaste" @dragenter.prevent="onSftpDragEnter" @dragover.prevent @dragleave.self="dragActive = false" @drop.prevent="onDrop">
+      <section v-if="sftpPaneOpen && !isRdpConnection && !localUiMode" ref="sftpPane" class="sftp-pane" tabindex="-1" :class="{ 'drag-active': dragActive }" @pointerdown="focusSftpPaneOnPointerDown" @paste.capture="onSftpClipboardPaste" @dragenter.prevent="onSftpDragEnter" @dragover.prevent @dragleave="onSftpDragLeave" @drop.prevent="onDrop">
         <div class="path-toolbar">
           <button class="icon-button" :title="t('parentFolder')" :aria-label="t('parentFolder')" :disabled="currentPath === '/'" @click="goParent"><ArrowUp /></button>
           <button class="icon-button icon-amber" :title="t('home')" :aria-label="t('home')" :disabled="!connected" @click="loadHome"><Home /></button>

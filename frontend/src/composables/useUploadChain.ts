@@ -5,7 +5,7 @@ import { advanceFolderUploadDirectories, buildFolderUploadPlan, createFolderUplo
 import { createTarChunkSource, shouldFolderArchive } from "../lib/folderArchive";
 import { planHostFileDrop } from "../lib/hostFileDrop";
 import { displayPathToWire } from "../lib/sftpName";
-import { canAcceptTerminalDrop, canAcceptFileDrop, normalizeDropTargetDir, resolveDropTargetDir } from "../lib/terminalInteraction";
+import { canAcceptTerminalDrop, canAcceptFileDrop, dragLeftPane, normalizeDropTargetDir, resolveDropTargetDir } from "../lib/terminalInteraction";
 import { runTransfers, summarizeBatchUpload } from "../lib/transferQueue";
 import { X } from "@lucide/vue";
 
@@ -561,10 +561,27 @@ function onSftpDragEnter(event: DragEvent) {
   dragActive.value = true;
 }
 
+function onSftpDragLeave(event: DragEvent) {
+  // 拖拽真正离开面板子树才熄灭「上传」高亮（issue #197）：dragleave 在面板内
+  // 子元素间移动时也冒泡触发，旧 `.self` 绑定把「经子元素拖出面板/拖出窗口/
+  // Esc 取消」的那次 leave 一并吞掉，面板就永久停在上传悬浮层。
+  const pane = event.currentTarget;
+  if (pane instanceof Node && !dragLeftPane(event, pane)) return;
+  dragActive.value = false;
+}
+
 function onTerminalDragEnter(event: DragEvent) {
   if (!event.dataTransfer?.types.includes("Files")) return;
   if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value, sftpPaneOpen: sftpPaneOpen.value })) return;
   terminalDragActive.value = true;
+}
+
+function onTerminalDragLeave(event: DragEvent) {
+  // 同面板侧（issue #197）：按 relatedTarget 判定去向，子元素间路过不闪烁，
+  // 拖走/取消即恢复拖入前状态。
+  const pane = event.currentTarget;
+  if (pane instanceof Node && !dragLeftPane(event, pane)) return;
+  terminalDragActive.value = false;
 }
 
 function onTerminalDrop(event: DragEvent) {
@@ -680,7 +697,9 @@ function resolveDropUpload(choice: "cancel" | "cwd" | { dir: string }) {
     handleHostFileDrop,
     onDrop,
     onSftpDragEnter,
+    onSftpDragLeave,
     onTerminalDragEnter,
+    onTerminalDragLeave,
     onTerminalDrop,
     chooseUpload,
     confirmDropUpload,

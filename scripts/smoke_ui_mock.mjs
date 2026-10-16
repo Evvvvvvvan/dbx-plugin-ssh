@@ -895,6 +895,31 @@ try {
   console.log("  screenshot: docs/screenshots-ui-mock/08d-tall-history-placement.png");
   await tallPage.close();
 
+  // --- issue #197: file drag without drop must not strand the SFTP pane on the upload overlay ---
+  console.log("==> issue #197 drag cancel restores the SFTP pane");
+  // 面板此刻仍关闭（前文未开过）：先打开，再在真实 DOM 上重放拖拽生命周期。
+  // 关键回归点是「经子元素拖走、未放下」的那次 dragleave（target 落在面板内
+  // 子元素上、relatedTarget 指向面板外）：旧 `@dragleave.self` 绑定把它吞掉，
+  // 面板永久停在「上传」悬浮层；修后按 relatedTarget 判定去向并复位。
+  await page.locator('button[title="Open SFTP panel"], button[data-tooltip="Open SFTP panel"]').first().click();
+  await expect(page, ".sftp-pane", "sftp pane opens for drag walkthrough");
+  await page.evaluate(() => {
+    const pane = document.querySelector(".sftp-pane");
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(["x"], "drag.txt"));
+    pane.dispatchEvent(new DragEvent("dragenter", { bubbles: true, dataTransfer: transfer }));
+  });
+  await expect(page, ".sftp-pane .drop-overlay", "file dragenter lights the upload overlay");
+  await page.evaluate(() => {
+    const pane = document.querySelector(".sftp-pane");
+    const child = pane.querySelector(".path-toolbar") || pane.firstElementChild;
+    const outside = document.querySelector(".terminal-pane");
+    child.dispatchEvent(new DragEvent("dragleave", { bubbles: true, relatedTarget: outside }));
+  });
+  const overlayCountAfterLeave = await page.locator(".sftp-pane .drop-overlay").count();
+  check("#197 dragleave without drop clears the upload overlay", overlayCountAfterLeave === 0, `overlay count=${overlayCountAfterLeave}`);
+  await page.locator('button[title="Collapse SFTP panel"], button[data-tooltip="Collapse SFTP panel"]').first().click();
+
   if (pageError.length) {
     failures.push(`page errors: ${pageError.slice(0, 3).join(" | ")}`);
   }

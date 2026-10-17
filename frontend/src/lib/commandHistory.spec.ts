@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { commandInputAction, mergeShellHistory, parseShellHistoryText, persistableCommandHistoryBuckets, pushCommandHistory, sanitizeCommandHistoryBuckets } from "./commandHistory";
+import { commandInputAction, mergeShellHistory, parseShellHistoryText, persistableCommandHistoryBuckets, pushCommandHistory, sanitizeCommandHistoryBuckets, sanitizeCommandHistoryLimit, trimCommandHistoryBuckets } from "./commandHistory";
 
 describe("command input keyboard behavior", () => {
   const base = {
@@ -115,5 +115,59 @@ describe("persistableCommandHistoryBuckets", () => {
       "conn-2": [secret],
     };
     expect(persistableCommandHistoryBuckets(buckets)).toEqual({ "conn-1": ["keep-me"] });
+  });
+});
+
+// —— 历史条数可配置（issue #192）：环上限归一化 + 收紧时逐桶裁剪 + 环/合并
+// 按上限截断。默认保持 100（COMMAND_HISTORY_LIMIT）不变。
+describe("sanitizeCommandHistoryLimit (issue #192)", () => {
+  it("defaults to 100 on garbage input", () => {
+    expect(sanitizeCommandHistoryLimit(undefined)).toBe(100);
+    expect(sanitizeCommandHistoryLimit(null)).toBe(100);
+    expect(sanitizeCommandHistoryLimit("abc")).toBe(100);
+    expect(sanitizeCommandHistoryLimit(Number.NaN)).toBe(100);
+  });
+
+  it("accepts numeric strings and clamps to the configured bounds", () => {
+    expect(sanitizeCommandHistoryLimit("250")).toBe(250);
+    expect(sanitizeCommandHistoryLimit(500)).toBe(500);
+    expect(sanitizeCommandHistoryLimit(3)).toBe(10);
+    expect(sanitizeCommandHistoryLimit("0")).toBe(10);
+    expect(sanitizeCommandHistoryLimit(99999)).toBe(1000);
+    expect(sanitizeCommandHistoryLimit(12.9)).toBe(12);
+  });
+});
+
+describe("trimCommandHistoryBuckets (issue #192)", () => {
+  it("trims each bucket to the new limit from the oldest tail and drops emptied buckets", () => {
+    const buckets = {
+      "conn-1": ["newest", "mid", "oldest"],
+      "conn-2": ["only"],
+    };
+    expect(trimCommandHistoryBuckets(buckets, 2)).toEqual({ "conn-1": ["newest", "mid"], "conn-2": ["only"] });
+    expect(trimCommandHistoryBuckets(buckets, 0)).toEqual({});
+  });
+
+  it("leaves buckets untouched when the limit grows", () => {
+    const buckets = { "conn-1": ["a", "b"] };
+    expect(trimCommandHistoryBuckets(buckets, 100)).toEqual(buckets);
+  });
+});
+
+describe("configurable limit threading (issue #192)", () => {
+  it("pushCommandHistory truncates to the configured limit", () => {
+    const history = pushCommandHistory(["b", "a"], "c", 2);
+    expect(history).toEqual(["c", "b"]);
+  });
+
+  it("sanitizeCommandHistoryBuckets truncates hydrated buckets to the configured limit", () => {
+    const raw = { "conn-1": ["a", "b", "c"] };
+    expect(sanitizeCommandHistoryBuckets(raw, { legacyScope: "local" }, 2)).toEqual({ "conn-1": ["a", "b"] });
+  });
+
+  it("mergeShellHistory truncates the merged ring to the configured limit", () => {
+    // shellLines 旧→新；合并后新命令靠前（["z", "c", "b", "a"]），截断丢最旧的 "a"。
+    const merged = mergeShellHistory(["z"], ["a", "b", "c"], 3);
+    expect(merged).toEqual(["z", "c", "b"]);
   });
 });

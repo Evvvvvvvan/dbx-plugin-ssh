@@ -157,8 +157,8 @@ import {
   sanitizeTransferCompressThresholdMib,
   type SftpCompressMode,
 } from "./lib/preferencesMirror";
-import { mergeShellHistory, parseShellHistoryText, persistableCommandHistoryBuckets, pushCommandHistory, sanitizeCommandHistoryBuckets } from "./lib/commandHistory";
-import { canCaptureEnterLine, echoConfirmsLine, extractEchoedCommand } from "./lib/terminalEnterCapture";
+import { COMMAND_HISTORY_LIMIT, mergeShellHistory, parseShellHistoryText, persistableCommandHistoryBuckets, pushCommandHistory, sanitizeCommandHistoryBuckets, sanitizeCommandHistoryLimit, trimCommandHistoryBuckets } from "./lib/commandHistory";
+import { EnterLineTracker, acceptCommandWithContinuation, canCaptureEnterLine, echoConfirmsLine, extractDesyncedCommand, extractEchoedCommand } from "./lib/terminalEnterCapture";
 import { applyLineEditControlChar } from "./lib/terminalLineModel";
 import { loadGhostTabAccept, matchesGhostFullAccept, matchesGhostWordAccept, saveGhostTabAccept } from "./lib/ghostAcceptKey";
 import { isPasswordPromptLine, loadPromptHintsDismissed, loadPromptHintsEnabled, savePromptHintsDismissed, savePromptHintsEnabled, shouldShowPromptHints } from "./lib/terminalPromptHints";
@@ -856,6 +856,27 @@ const historyScope = computed(
 const EMPTY_HISTORY_RING: string[] = [];
 const EMPTY_HISTORY_TIMES: Record<string, number> = {};
 const EMPTY_HISTORY_META: Record<string, import("./lib/historyPanel").HistoryMetaRow> = {};
+// 历史显示条数（issue #192）：命令环上限，设置弹窗可配（10..1000，默认 100）。
+// 权威态在此（采集口 pushCommandHistory / 水合 sanitize / shell 历史合并
+// mergeShellHistory 三处穿参）；SettingsDialog 数字行自治读写 pluginStore
+// 后经 update:command-history-limit 上抛，收紧时各桶立即裁剪并落盘。
+const COMMAND_HISTORY_LIMIT_STORE_KEY = "ssh-command-history-limit";
+function loadCommandHistoryLimitFromStore(): number {
+  try {
+    return sanitizeCommandHistoryLimit(pluginStore.getItem(COMMAND_HISTORY_LIMIT_STORE_KEY));
+  } catch {
+    return COMMAND_HISTORY_LIMIT;
+  }
+}
+const commandHistoryLimit = ref(loadCommandHistoryLimitFromStore());
+function applyCommandHistoryLimit(next: number) {
+  const limit = sanitizeCommandHistoryLimit(next);
+  commandHistoryLimit.value = limit;
+  // 收紧立即生效：各桶裁到新上限（最新在前，裁最旧），times/meta 以命令环
+  // 为准的修剪在随后 persist 中自然跟进。
+  historyBuckets.value = trimCommandHistoryBuckets(historyBuckets.value, limit);
+  persistCommandHistory();
+}
 const historyBuckets = ref<Record<string, string[]>>(loadCommandHistoryBuckets());
 const historyTimeBuckets = ref<Record<string, Record<string, number>>>(loadCommandHistoryTimesBuckets());
 const historyMetaBuckets = ref<Record<string, Record<string, import("./lib/historyPanel").HistoryMetaRow>>>(loadCommandHistoryMetaBuckets());
@@ -3041,8 +3062,23 @@ function runTerminalSearch(query: string, options: { caseSensitive: boolean; reg
   else searchAddon.findNext(query, searchOptions);
 }
 
+// —— 行改写追踪（issue #192 失真回退采集）：键入模型在 Tab 补全 / ↑ 召回 /
+// 光标移动等 shell 改写行的事件后与真实行失真（事件本身不进模型），主路径
+// 的「模型行 ⊂ 屏幕行」对照从此永远失配 → 漏采。状态机在 EnterLineTracker
+// （lib/terminalEnterCapture.ts）：改写前缀 = 首个改写事件时的模型行（提取
+// 锚），改写后键入 = 回显活性证据（关回显的凭据输入永不上屏 → 拒采）。
+const enterLineTracker = new EnterLineTracker();
+// 反斜杠续行草稿（多行命令）：暂存去续行反斜杠的前段，下一行回车拼接。
+let pendingContinuation = "";
+
 function trackPendingInput(data: string) {
-  if (data.includes("\u001b")) return;
+  if (data.includes("\u001b")) {
+    // ESC 序列块（↑ 召回 / Home / End / 方向键）：readline 会改写整行，键入
+    // 模型自此失真——整块跳过模型记账（原行为不变），但改写事件必须记账，
+    // 否则回退采集失去全部证据（issue #192：↑ 召回改参后回车不入史）。
+    enterLineTracker.noteRewrite(pendingTerminalInput);
+    return;
+  }
   for (const character of data) {
     if (character === "\r" || character === "\n" || character === "\u0003") {
       // 回车执行点（Ctrl+C 是清行不是执行）：远端未装 shell integration 的
@@ -3050,15 +3086,32 @@ function trackPendingInput(data: string) {
       // （↑ history 面板的数据源）。门过滤 + 回显对照见 lib/terminalEnterCapture.ts。
       if (character !== "\u0003") captureEnterLine(pendingTerminalInput);
       pendingTerminalInput = "";
+      enterLineTracker.reset();
+      // Ctrl+C 放弃当前（可能未完成的续行）命令：续行草稿一并作废。
+      if (character === "\u0003") pendingContinuation = "";
     }
-    else if (character === "\u007f") pendingTerminalInput = pendingTerminalInput.slice(0, -1);
+    else if (character === "\u007f") {
+      pendingTerminalInput = pendingTerminalInput.slice(0, -1);
+      // 退格与远端行编辑同步（该字符模型与屏幕都不再有），证据尾巴同步削。
+      enterLineTracker.noteBackspace();
+    }
+    else if (character === "\t") {
+      // Tab 补全：shell 改写行且补全插入段不进模型（#169 只覆盖「补全后立
+      // 即回车」——前缀仍是子串；继续键入即失真）。记改写事件走回退采集。
+      enterLineTracker.noteRewrite(pendingTerminalInput);
+    }
     else {
       // readline 行编辑控制字节（Ctrl+U 清行 / Ctrl+W 删词）：回显不可见但
       // 真实行已变，模型必须跟上，否则建议/补全对着死字符检索（#138 review
-      // P0-B）。未认领的字节按原逻辑放行（可打印追加，其余忽略）。
+      // P0-B）。未认领的字节按原逻辑放行（可打印追加，其余忽略）——忽略的
+      // 控制字节（Ctrl+A/E/L/R 等）同样是 shell 行改写，记改写事件。
       const edited = applyLineEditControlChar(pendingTerminalInput, character);
       if (edited !== null) pendingTerminalInput = edited;
-      else if (character >= " ") pendingTerminalInput += character;
+      else if (character >= " ") {
+        pendingTerminalInput += character;
+        enterLineTracker.notePrintable(character);
+      }
+      else enterLineTracker.noteRewrite(pendingTerminalInput);
     }
   }
   // 行缓冲变更点（FIG wave-1 锚点）：revision 前进作废在途结果 + 防抖调度
@@ -3072,7 +3125,12 @@ function trackPendingInput(data: string) {
 
 /** 回车行兜底采集：门过滤 + 回显对照后写入 commandHistory；与 E 帧/命令
  *  弹窗采集共用 pushTerminalCommandHistory，重复命令由环去重置顶，时间戳
- *  覆盖更新（回车先采、E 帧后到，最终值一致）。 */
+ *  覆盖更新（回车先采、E 帧后到，最终值一致）。
+ *  issue #192 两段增强：① 模型失真回退——Tab 补全后继续键入 / ↑ 召回后编
+ *  辑的行，模型与屏幕对照必然失配，改以行改写状态（改写前缀锚 + 键入尾巴
+ *  回显证据）从屏幕直接提取（extractDesyncedCommand），凭据/选择提示形态
+ *  命中即拒；② 反斜杠续行合并——尾奇数反斜杠的行暂存，与下一行拼接成一条
+ *  入史（与远端历史文件导入 parseShellHistoryText 同语义），Ctrl+C 作废草稿。 */
 function captureEnterLine(line: string) {
   if (
     !canCaptureEnterLine(line, {
@@ -3084,11 +3142,18 @@ function captureEnterLine(line: string) {
     return;
   }
   const echo = readEchoTextBeforeCursor();
-  if (!echoConfirmsLine(echo, line)) return;
   // 以屏幕回显提取的命令入史（issue #169）：模型行只含键入前缀，Tab 补全/
   // 历史展开后的真实命令（`cd blen` → `cd blender/`）只在回显里；提取失败
-  // （屏幕不可测）回落模型行，不劣于旧行为。
-  pushTerminalCommandHistory(extractEchoedCommand(echo, line) ?? line);
+  // （屏幕不可测）回落模型行，不劣于旧行为。模型失配时走失真回退提取
+  // （issue #192），两级都拒采则放弃（宁可漏采，不错采）。
+  const extracted =
+    echoConfirmsLine(echo, line)
+      ? extractEchoedCommand(echo, line) ?? line
+      : extractDesyncedCommand(echo, enterLineTracker.snapshot());
+  if (!extracted) return;
+  const { entry, pending } = acceptCommandWithContinuation(pendingContinuation, extracted);
+  pendingContinuation = pending;
+  if (entry) pushTerminalCommandHistory(entry);
 }
 
 /**
@@ -6960,7 +7025,7 @@ function chooseZmodem() {
 // （旧版全局档一次性迁入 local 桶），写档逐桶过滤/修剪后整表落盘。——
 function loadCommandHistoryBuckets(): Record<string, string[]> {
   try {
-    return sanitizeCommandHistoryBuckets(JSON.parse(pluginStore.getItem(COMMAND_HISTORY_KEY) || "null"), { legacyScope: HISTORY_SCOPE_LOCAL });
+    return sanitizeCommandHistoryBuckets(JSON.parse(pluginStore.getItem(COMMAND_HISTORY_KEY) || "null"), { legacyScope: HISTORY_SCOPE_LOCAL }, commandHistoryLimit.value);
   } catch {
     return {};
   }
@@ -7037,7 +7102,7 @@ function persistCommandHistoryMeta() {
  * runCommand / 批量发送 / 建议自动执行）共用，保证环与时间映射不漂移。
  */
 function pushTerminalCommandHistory(command: string) {
-  commandHistory.value = pushCommandHistory(commandHistory.value, command);
+  commandHistory.value = pushCommandHistory(commandHistory.value, command, commandHistoryLimit.value);
   commandHistoryTimes.value = recordHistoryTime(commandHistoryTimes.value, command, Date.now());
   persistCommandHistory();
   persistCommandHistoryTimes();
@@ -7073,7 +7138,7 @@ async function loadRemoteShellHistory(sessionId: string) {
       remoteHistoryLoadedSessions.delete(sessionId);
       return;
     }
-    commandHistory.value = mergeShellHistory(commandHistory.value, shellLines);
+    commandHistory.value = mergeShellHistory(commandHistory.value, shellLines, commandHistoryLimit.value);
     persistCommandHistory();
   } catch {
     // 通道不可用/超时:静默降级;移出集合允许面板下次打开时重试。
@@ -10254,6 +10319,7 @@ watch(historyScope, () => {
       @update:ctx-search-engines="updateCtxSearchEngines"
       @update:ghost-suggest="setGhostEnabled"
       @update:history-panel-enabled="setHistoryPanelEnabled"
+      @update:command-history-limit="applyCommandHistoryLimit"
       :ghost-tab-accept="ghostTabAccept"
       @update:ghost-tab-accept="setGhostTabAccept"
       :ai-settings="aiSettingsState"

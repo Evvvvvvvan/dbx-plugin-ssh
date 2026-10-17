@@ -5,6 +5,17 @@
 export const COMMAND_HISTORY_LIMIT = 100;
 // 持久化单条命令的最大长度：超长命令多半是一次性脚本片段，重放价值低。
 export const PERSISTED_COMMAND_MAX_LENGTH = 200;
+// 历史条数可配置（issue #192）：上下界钳制——下限保证面板翻页价值，上限
+// 防止宿主 storage 单值膨胀（环是纯内存数组，条目本身另有 200 字符截断）。
+export const MIN_COMMAND_HISTORY_LIMIT = 10;
+export const MAX_COMMAND_HISTORY_LIMIT = 1000;
+
+/** 归一化用户配置的历史条数：非法/越界回钳到界内，不可解析回默认值。 */
+export function sanitizeCommandHistoryLimit(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return COMMAND_HISTORY_LIMIT;
+  return Math.min(MAX_COMMAND_HISTORY_LIMIT, Math.max(MIN_COMMAND_HISTORY_LIMIT, Math.trunc(parsed)));
+}
 // 疑似内嵌凭据的命令不落 localStorage（内存历史仍保留，便于当前会话重放）。
 const SECRET_LIKE_PATTERN = /(?:password|passwd|passphrase|token|secret|api[-_]?key|access[-_]?key)\s*[:=]/i;
 
@@ -174,6 +185,17 @@ export function persistableCommandHistoryBuckets(buckets: Readonly<CommandHistor
   for (const [scope, bucket] of Object.entries(buckets)) {
     if (!scope.trim()) continue;
     const rows = bucket.filter((command) => isPersistableCommand(command));
+    if (rows.length) out[scope] = rows;
+  }
+  return out;
+}
+
+/** 条数收紧时逐桶裁到新上限（最新在前，裁掉的是最旧的尾部），空桶丢弃。 */
+export function trimCommandHistoryBuckets(buckets: Readonly<CommandHistoryBuckets>, limit: number): CommandHistoryBuckets {
+  const out: CommandHistoryBuckets = {};
+  for (const [scope, bucket] of Object.entries(buckets)) {
+    if (!scope.trim()) continue;
+    const rows = bucket.slice(0, limit);
     if (rows.length) out[scope] = rows;
   }
   return out;

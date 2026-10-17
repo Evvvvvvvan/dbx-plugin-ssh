@@ -73,6 +73,10 @@ export const PLUGIN_STORE_KEYS: readonly string[] = [
   // 历史面板功能开关（issue #169）：关 = 面板整体不可唤起（↑ 与 Ctrl+R 归还
   // 远端 shell 原生历史/反向搜索）。SettingsDialog 开关行自治读写，默认开。
   "ssh-history-panel-enabled",
+  // 历史显示条数（issue #192）：命令环上限（10..1000 钳制，默认 100）。App
+  // 权威态（采集口/水合/合并穿参），SettingsDialog 数字行自治读写 + 上抛。
+  // 漏登记 = 水合不拉，改完条数重启静默回 100。
+  "ssh-command-history-limit",
   // 空提示符快捷键引导条（terminalPromptHints.ts 自治读写）：设置开关 +
   // 用过即散的一次性旗标。此前漏登记白名单——真机写入落盘但水合不拉，
   // 重启永远读不回（issue #178），补登记后恢复持久化。

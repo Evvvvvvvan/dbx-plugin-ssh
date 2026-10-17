@@ -154,3 +154,37 @@ python3 scripts/validate_repo.py
 ```
 
 本次分诊未安装或重启任何 DBX 环境，未使用真实凭据，未改动 `manifest.json`，未关闭任何 issue。
+
+---
+
+## 七、2026-10-16 追加：#193 分诊（关闭终端 tab 连坐重连 + 批量操作改名不同步）
+
+**类别：需人工（上游宿主，两半都是）＋ 本轮已交付插件侧回归锁**
+
+用户报告（2026-10-15）：「关闭上面的 tab 时，下面所有的终端都会强制重连。另外下面终端改名了，批量操作里的名字没有跟着改。」「下面的终端」即底部 dock 的终端条目（`pluginBottomDock.ts` dockEntries，VS Code 终端面板语义）。
+
+### 7.1 子问题 a：关 tab → dock 终端连坐重连
+
+**插件侧无缺陷（三层取证）**：
+
+1. 桥层：宿主 `requestWorkbenchClose` 按桥实例投递（`apps/desktop/src/lib/plugins/pluginHostBridge.ts:456`），只达被关闭的 workbench iframe；
+2. 插件层：`App.vue` workbench/close 处理器只枚举**本工作台**六个会话域的 sessionId 逐条 notify（本轮抽为 `frontend/src/lib/workbenchCloseSessions.ts` 纯函数并加回归锁）；
+3. sidecar 层：`backend/src/ssh.rs` `close_workbench` 按 `workbench_id` 精确过滤，`close_session` 按 sessionId 释放（共享 transport 有引用计数 lease，最后一份才释放跳板链）。
+
+**根因在宿主**：`apps/desktop/src/stores/queryStore.ts:4685` `releasePluginConnectionsAfterClose`——tab 关闭后若 `tabs.value` 里已无引用该 connectionId 的 plugin tab，就调用 `connectionStore.disconnect(connectionId)`，向 sidecar 发 `connection/disconnect`（语义=拆掉该连接**全部**会话，PROTOCOL「生命周期与状态隔离」）。但该存活检查只数 `tabs.value` 里的 plugin-workbench/plugin-filesystem **tab**；dock 条目与浮动窗口是独立注册表（`pluginBottomDock.ts` / `PluginFloatingWindow`），不在 `tabs.value` 里——**盲区**。于是：同连接最后一个 tab 关闭而 dock 终端还活着时，宿主误判「连接已无人用」→ disconnect → dock 终端全部收到 `ssh/session/state disconnected` → 各自进重连梯子（attempt 1 经 `host.reopenConnection` 重放连接后重拨，能自愈但现场丢失）＝「强制重连」。
+
+**宿主修复方案**（jinpy666/dbx）：`releasePluginConnectionsAfterClose` 的存活检查除 `tabs.value` 外，同步并入 `dockEntries`（`pluginBottomDock.ts` 导出注册表，可用 `entry.context.connectionId` 判定）与浮动窗口登记；任一 surface 仍引用该 connectionId 即跳过释放。宿主 `connect_db` 注释（`src-tauri/src/commands/connection.rs:1919`）已明确认知「disconnect 会把同连接其他 tab 的活跃终端一起杀死」，本条即同一认知在 tab 关闭路径上的补漏。
+
+### 7.2 子问题 b：终端改名后批量操作面板名字不跟随
+
+批量目标行标签数据源（`frontend/src/composables/useBatchSend.ts` `refreshBatchTargets`）：`ssh/sessions/list`（sidecar 连接时的 user@host 快照）→ `applyConnectionNames` 叠加 `host.listConnections`（宿主连接表实时名，issue #10232 修复）。**不存在过期快照或响应式丢失**：`batchTargets` 是 ref，弹层打开/手动刷新/连接建立都会重刷，`batchSend.spec.ts` 已锁改名覆盖语义。
+
+用户改的名是 **dock 条目标题**（`PluginBottomDock.vue` 双击改名 → `renamePluginDockEntry`）——纯宿主 UI 态：宿主桥没有任何把 dock/tab 标题暴露给插件的 API 或事件（`host.listConnections` 只回连接表名，workbench context 无 title 字段，无 rename 事件转发），插件在现有宿主契约下**原理上不可见**。
+
+**宿主修复方案**（jinpy666/dbx，二选一；已落地方案①：宿主分支 `fix/plugin-tab-close-dock-disconnect`——`host.listConnections` 行内附加 `workbenchTitles`，聚合实现 `apps/desktop/src/lib/plugins/pluginConnectionSurfaces.ts`；本仓库消费见 `applyConnectionNames`）：① `listConnections` 行内附加该连接当前 dock/tab 标题（如 `workbenchTitles: string[]`，按 `pluginTabConnectionId`/dock 条目 context 聚合）；② 新增只读 `host.listWorkbenches`（插件级，返回 workbenchId→title 映射）并在 rename 时经 `forwardEvent` 推送。插件侧拿到任一通道后，在 `refreshBatchTargets` 叠加即可（`batchTargetLabel` 优先级扩展为 标题 → 连接名 → user@host）。
+
+### 7.3 本轮插件侧交付（回归锁，不改变行为）
+
+- `frontend/src/lib/workbenchCloseSessions.ts` + spec：workbench/close 回收目标枚举契约（只拆自己、空槽丢弃、每域至多一条）；
+- `frontend/src/composables/usePluginEvents.spec.ts`：会话生命周期事件按 sessionId 严格隔离——兄弟会话的 disconnected/terminal-error 绝不触发本工作台重连；
+- `App.vue` workbench/close 处理器改用上述纯函数（行为等价重构，注释指明 #193a 契约）。

@@ -113,6 +113,7 @@ import { describeReconnectRestoredNotice, isConnectionInactiveError, isSessionGo
 import { classifyConnectError, connectErrorKey } from "./lib/connectError";
 import { decideConnectRetry, isDuplicatedTransportUnavailableError } from "./lib/connectRetry";
 import { reopenHostConnection } from "./lib/hostReopen";
+import { workbenchCloseTargets } from "./lib/workbenchCloseSessions";
 import {
   createSessionTransportReuseState,
   fallbackToFreshTransport,
@@ -4651,14 +4652,17 @@ function cancelSerialUpload() {
 if (window.dbxPlugin.workbench?.onClose) {
   window.dbxPlugin.workbench.onClose(async () => {
     disposed = true;
-    const ownedSessions = [
+    // 只枚举本工作台自有会话（workbenchCloseTargets 契约）：同连接其他 tab、
+    // 底部 dock 终端等兄弟工作台的会话不在列表里，关闭本 tab 绝不波及它们。
+    // 连接级清场（connection/disconnect）是宿主生命周期语义，插件不代劳。
+    const ownedSessions = workbenchCloseTargets([
       ["local/session/close", localSession.value?.sessionId],
       ["ssh/session/close", session.value?.sessionId],
       ["telnet/close", telnetSession.value?.sessionId],
       ["serial/close", serialSession.value?.sessionId],
       ["vnc/close", vncSession.value?.sessionId],
       ["rdp/close", rdpSession.value?.sessionId],
-    ].filter((pair): pair is [string, string] => typeof pair[1] === "string" && !!pair[1]);
+    ]);
     await Promise.allSettled(ownedSessions.map(([method, sessionId]) => window.dbxPlugin.notify(method, { sessionId })));
     localSession.value = null;
     session.value = undefined;

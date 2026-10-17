@@ -145,7 +145,9 @@ const LOCALE_KEYS: [&str; 3] = ["LANG", "LC_ALL", "LC_CTYPE"];
 /// provides (built-in since 2.35, shipped by every mainstream distro and
 /// musl long before), unlike `en_US.UTF-8` which minimal installs never
 /// generate. Windows returns `None`: console encodings there are code pages
-/// driven by `chcp`/console APIs, which `LANG` cannot reach.
+/// driven by `chcp`/console APIs, which `LANG` cannot reach — the UTF-8
+/// switch happens in the spawn argv instead
+/// ([`apply_windows_utf8_console`]).
 fn default_utf8_lang(platform: Platform) -> Option<&'static str> {
     match platform {
         Platform::MacOS => Some("en_US.UTF-8"),
@@ -179,6 +181,82 @@ fn fallback_lang(
         return None;
     }
     default_utf8_lang(platform)
+}
+
+/// Switches a Windows ConPTY child's console to the UTF-8 code page by
+/// rewriting the spawn argv (issue #173 Windows side). A Chinese/GBK Windows
+/// boots the child console at code page 936, where conhost's byte-level
+/// console conversions (`ReadConsoleA`/`WriteFile`) and every program that
+/// trusts the console code page (`cmd type`, git, node, …) speak GBK while
+/// the terminal speaks UTF-8 — CJK output garbles the same way the C-locale
+/// shell did on Unix, and this is the same fix in Windows terms.
+///
+/// `chcp 65001` is the one lever that moves the console at once: it flips
+/// the input and output code page, which conhost's byte conversions follow
+/// and which the CRT picks up as its console default. PowerShell needs a
+/// second preset on top: its ConsoleHost pipes native-command output through
+/// its own decode layer keyed to `[Console]::OutputEncoding`, an encoding
+/// .NET Framework caches at process start — a later `chcp` moves the console
+/// but not that cache, so `cmd /c type` of a UTF-8 file kept garbling under a
+/// 65001 console until the .NET layer was pointed at UTF-8 as well (measured:
+/// `cmd /c chcp` reported 65001 while `type` still garbled, and presetting
+/// both layers made the bytes exact). The alternatives were evaluated and
+/// rejected: env injection is a no-op (the console code page is session
+/// state, no environment variable reaches it — `LANG` is unreadable by
+/// cmd/PowerShell), and either preset alone covers only one of the two
+/// layers. The rewrite is argv-only, so the user env merge semantics are
+/// untouched, and `chcp`'s own output is suppressed so the startup output
+/// window (the ConPTY handshake and the resize gate keyed to it) sees the
+/// same traffic as before. WSL manages its own UTF-8 world and arbitrary
+/// shells have no safe argv seam, so both stay untouched; the cmd wrapper
+/// ends with `title %COMSPEC%` because the `/k` command line would otherwise
+/// become the console title for the whole session.
+/// The PowerShell-side UTF-8 prelude: the console code page via `chcp`
+/// (conhost byte conversions + CRT) plus the .NET decode layer that
+/// PowerShell's ConsoleHost caches at process start. See
+/// [`apply_windows_utf8_console`] for why one without the other is not enough.
+const POWERSHELL_UTF8_PRELUDE: &str =
+    "chcp 65001 >$null; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8";
+
+fn apply_windows_utf8_console(
+    platform: Platform,
+    kind: ShellKind,
+    mut args: Vec<String>,
+) -> Vec<String> {
+    if platform != Platform::Windows {
+        return args;
+    }
+    match kind {
+        ShellKind::Cmd => {
+            let mut bootstrapped = vec![
+                "/k".to_string(),
+                "chcp 65001>nul&title %COMSPEC%".to_string(),
+            ];
+            bootstrapped.append(&mut args);
+            bootstrapped
+        }
+        ShellKind::PowerShell => {
+            // Fold into the integration -Command when injection produced one;
+            // a bare shell (integration off or the script write failed) still
+            // needs the switch and must stay open, hence -NoExit. The space
+            // before `>` is load-bearing: PowerShell lexes `65001>$null` as
+            // one literal argument (chcp then fails on `65001>`), cmd's
+            // `65001>nul` below has no such tokenizer rule.
+            if let Some(index) = args.iter().position(|arg| arg == "-Command") {
+                if let Some(payload) = args.get(index + 1) {
+                    args[index + 1] = format!("{POWERSHELL_UTF8_PRELUDE}; {payload}");
+                    return args;
+                }
+            }
+            args.extend([
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                POWERSHELL_UTF8_PRELUDE.to_string(),
+            ]);
+            args
+        }
+        _ => args,
+    }
 }
 
 enum LocalTerminalCommand {
@@ -264,8 +342,10 @@ impl LocalTerminalRuntime {
         let mut command = CommandBuilder::new(&spec.program);
         // Integration args replace the base login args wholesale (the bash
         // wrapper reproduces the login chain itself — bash cannot combine
-        // `-l` with `--rcfile`).
-        command.args(&integration.args);
+        // `-l` with `--rcfile`). On Windows the UTF-8 console switch folds
+        // into the same argv afterwards (issue #173 Windows side).
+        let argv = apply_windows_utf8_console(current_platform(), spec.kind, integration.args);
+        command.args(&argv);
         command.env("TERM", "xterm-256color");
         // 24-bit color for programs that probe COLORTERM (VS Code sets the
         // same), plus a detectable marker akin to TERM_PROGRAM=vscode.
@@ -1690,6 +1770,85 @@ mod tests {
         assert_eq!(
             fallback_lang(&no_env, Platform::Windows, &nothing_set),
             None
+        );
+    }
+
+    #[test]
+    fn windows_utf8_console_folds_into_the_integration_command() {
+        // Injection on: the switch joins the existing -Command payload —
+        // argv stays one command, no extra window of shell startup args.
+        let args = apply_windows_utf8_console(
+            Platform::Windows,
+            ShellKind::PowerShell,
+            vec![
+                "-NoExit".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-Command".to_string(),
+                "& 'C:\\temp\\si\\integration.ps1'".to_string(),
+            ],
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-NoExit",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "chcp 65001 >$null; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & 'C:\\temp\\si\\integration.ps1'"
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_utf8_console_switches_a_bare_powershell_and_keeps_it_open() {
+        // Injection off (toggle or script-write failure): the shell still
+        // gets the switch, and -NoExit keeps it interactive as before.
+        assert_eq!(
+            apply_windows_utf8_console(Platform::Windows, ShellKind::PowerShell, Vec::new()),
+            vec![
+                "-NoExit",
+                "-Command",
+                "chcp 65001 >$null; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8"
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_utf8_console_wraps_cmd_and_restores_its_title() {
+        // cmd has no injection seam: /k runs the switch, the title reset
+        // keeps the console title on the cmd path (what a plain cmd shows)
+        // instead of leaking the chcp command line into the tab.
+        assert_eq!(
+            apply_windows_utf8_console(Platform::Windows, ShellKind::Cmd, Vec::new()),
+            vec!["/k", "chcp 65001>nul&title %COMSPEC%"]
+        );
+    }
+
+    #[test]
+    fn windows_utf8_console_leaves_other_shells_and_unix_untouched() {
+        // WSL (arrives as ShellKind::Other) manages its own UTF-8 world and
+        // arbitrary shells have no safe argv seam.
+        assert_eq!(
+            apply_windows_utf8_console(
+                Platform::Windows,
+                ShellKind::Other,
+                vec!["--flag".to_string()]
+            ),
+            vec!["--flag"]
+        );
+        // Unix keeps its locale injection path; the argv rewrite never runs.
+        assert_eq!(
+            apply_windows_utf8_console(Platform::MacOS, ShellKind::Cmd, Vec::new()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            apply_windows_utf8_console(
+                Platform::Linux,
+                ShellKind::PowerShell,
+                vec!["-Command".to_string(), "exit".to_string()]
+            ),
+            vec!["-Command", "exit"]
         );
     }
 

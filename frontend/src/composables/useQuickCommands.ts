@@ -25,8 +25,11 @@ export function useQuickCommands(options: {
   terminal: () => Terminal | undefined;
   trackPendingInput: (data: string) => void;
   sendTerminalBytes: (data: Uint8Array) => void;
+  /** 程序化写入前消除 ghost 行内建议（issue #196）：写入不经 onData 路由，
+   * 残留灰字会在回显 settle 后被重锚到底部光标行且不自动消失。 */
+  hideGhostSuggestion: () => void;
 }) {
-  const { t, showNotice, session, commandRunning, terminalTransferBusy, terminal: terminalGet, trackPendingInput, sendTerminalBytes } = options;
+  const { t, showNotice, session, commandRunning, terminalTransferBusy, terminal: terminalGet, trackPendingInput, sendTerminalBytes, hideGhostSuggestion } = options;
 
 // 快速命令：用户自定义片段（≤20 条）。
 const quickCommands = ref<QuickCommand[]>([]);
@@ -66,6 +69,11 @@ function writeQuickCommand(item: QuickCommand, execute: boolean) {
   if (!session.value || terminalTransferBusy() || commandRunning.value) return;
   const text = quickCommandText(item.command);
   if (!text) return;
+  // 写入不经过 onData（用户键入路由），ghost 门状态机不会推进——已 show 的
+  // ghost 若不在此消除，回显 settle 后 syncGhostAnchorOnSettle 会把它重锚到
+  // 新光标行（终端底部），灰字盖住光标行且不自消（issue #196）。与粘贴路径
+  // interceptTerminalPaste 的 hideGhostSuggestion 同语义。
+  hideGhostSuggestion();
   const payload = execute ? `${text}\r` : text;
   if (execute) trackPendingInput(payload);
   sendTerminalBytes(new TextEncoder().encode(payload));
@@ -82,6 +90,8 @@ function pasteQuickCommand(item: QuickCommand) {
 // 立即刷新远端 sudo 凭据缓存；输出回显在终端，密码提示由用户/Quick Sudo 应答。
 function sendSudoRefresh() {
   if (!session.value || terminalTransferBusy()) return;
+  // 同 writeQuickCommand：程序化写入前消除 ghost（issue #196）。
+  hideGhostSuggestion();
   trackPendingInput("sudo -v\r");
   sendTerminalBytes(new TextEncoder().encode("sudo -v\r"));
   terminalGet()?.focus();

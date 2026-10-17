@@ -162,6 +162,21 @@ export function canAcceptTerminalDrop(options: { connected: boolean; canWrite: b
 }
 
 /**
+ * Whether a dragleave means the drag truly left the container subtree
+ * (issue #197). dragleave also bubbles while the pointer moves between
+ * children inside the container, so the old `@dragleave.self` binding
+ * swallowed the leave fired when the file was dragged out through a child
+ * (drag away without dropping, Esc cancel, leave the window) and the SFTP
+ * pane stayed stuck on its "upload" drop overlay. Decide by relatedTarget:
+ * still pointing inside the pane → not left (covers child-to-child moves);
+ * null (left the window / drag cancelled) or outside the pane → left.
+ */
+export function dragLeftPane(event: { relatedTarget: EventTarget | null }, pane: Node): boolean {
+  const related = event.relatedTarget;
+  return !(related instanceof Node && pane.contains(related));
+}
+
+/**
  * Target directory typed into the terminal drop prompt: whitespace is
  * trimmed, trailing slashes collapse (the bare root "/" stays intact), and
  * an empty result means the input is unusable so the caller can keep the

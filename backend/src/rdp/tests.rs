@@ -1178,7 +1178,7 @@ fn vendored_sspi_marks_ntlmv1_and_lm_as_unsupported() {
 
 #[test]
 fn client_build_encodes_the_package_version() {
-    assert_eq!(client_build(), 700); // 0.7.7-beta.2：(0*100+7)*100+0——beta 后缀令 patch 段按 0 计，0.7.7 正式版转正后为 707
+    assert_eq!(client_build(), 707); // 0.7.7 正式版：(0*100+7)*100+7，patch 段按版本号原值编码
 }
 
 #[test]

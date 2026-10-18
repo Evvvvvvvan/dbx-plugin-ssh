@@ -590,10 +590,13 @@ const emit = defineEmits<{
   (e: "toggle-highlight-rule", item: HighlightRuleView): void;
   /** 显示方式增量（全局偏好）：同样只转发 section 的意图，落 pluginStore 在 App。 */
   (e: "update:highlightDisplayMode", mode: HighlightDisplayMode): void;
-  /** 快速命令增量（M32-A3）：同上，import 由 App 循环逐条 save。 */
-  (e: "save-quick-command", command: { id?: string; name: string; command: string }): void;
+  /** 快速命令增量（M32-A3；issue #201 分组字段随命令透传）：import 由 App 循环逐条 save。 */
+  (e: "save-quick-command", command: { id?: string; name: string; command: string; groupId?: string; groupName?: string }): void;
   (e: "delete-quick-command", id: string): void;
   (e: "import-quick-commands", items: Array<{ name: string; command: string }>): void;
+  /** 分组改名 / 删除分组（删除 = 组内命令移回未分组）：数据面在 App。 */
+  (e: "rename-quick-command-group", payload: { groupId: string; name: string }): void;
+  (e: "dissolve-quick-command-group", groupId: string): void;
 }>();
 
 const t = props.t;
@@ -2543,6 +2546,8 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               @save="(command) => emit('save-quick-command', command)"
               @delete="(id) => emit('delete-quick-command', id)"
               @import="(items) => emit('import-quick-commands', items)"
+              @rename-group="(payload) => emit('rename-quick-command-group', payload)"
+              @dissolve-group="(groupId) => emit('dissolve-quick-command-group', groupId)"
               @error="(cause) => emit('error', cause)"
             />
             </div>

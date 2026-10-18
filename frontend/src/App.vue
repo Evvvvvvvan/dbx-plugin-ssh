@@ -191,7 +191,7 @@ import type { CompletionItem } from "./lib/completion/core/types";
 import { sanitizeNameEncoding, type SftpNameEncoding } from "./lib/sftpName";
 import { batchUploadPercent, clampTransferConcurrency, clampTransferDownloadLimit, clampTransferMaxActive, runTransfers, sanitizeTransferDuplicatePolicy, type TransferDuplicatePolicy, type TransferTask,
 } from "./lib/transferQueue";
-import { filterQuickCommands, QUICK_COMMANDS_LIMIT } from "./lib/quickCommands";
+import { filterQuickCommands, groupQuickCommands, quickCommandGroupCount, type QuickCommandGroupView, QUICK_COMMANDS_LIMIT } from "./lib/quickCommands";
 import { flippedOverlayBottom, overlayBelowTop, type SuggestionAnchor } from "./lib/overlayPlacement";
 import { choosePromptHintsPlacement, PROMPT_HINTS_FALLBACK_BAR_HEIGHT } from "./lib/terminalPromptHints";
 import { registerWatch } from "./lib/watchEdits";
@@ -933,6 +933,8 @@ const {
   pasteQuickCommand,
   sendSudoRefresh,
   saveQuickCommand,
+  renameQuickCommandGroupById,
+  dissolveQuickCommandGroupById,
   importQuickCommands,
 } = useQuickCommands({
   t: (key, values) => t(key, values),
@@ -953,6 +955,20 @@ const quickMenuOpen = ref(false);
 const quickSearch = ref("");
 const quickExpandedId = ref<string | null>(null);
 const filteredQuickCommands = computed(() => filterQuickCommands(quickCommands.value, quickSearch.value));
+// 分组视图（issue #201）：派生组 + 折叠态（会话内 UI 态，不持久化）。仅一条
+// 未分组时不渲染组头（等同旧扁平视图，避免噪声）；有真实分组才分组展示。
+const groupedQuickCommands = computed<QuickCommandGroupView[]>(() => groupQuickCommands(filteredQuickCommands.value));
+const quickHasRealGroups = computed(() => quickCommandGroupCount(quickCommands.value) > 0);
+const quickCollapsedGroups = ref<string[]>([]);
+function toggleQuickGroupCollapse(groupId: string) {
+  const index = quickCollapsedGroups.value.indexOf(groupId);
+  if (index >= 0) quickCollapsedGroups.value.splice(index, 1);
+  else quickCollapsedGroups.value.push(groupId);
+}
+function quickGroupName(group: QuickCommandGroupView): string {
+  return group.id ? group.name : t("quickCommandsUngrouped");
+}
+const quickCommandGroupSummary = computed(() => t("quickCommandsGroupSummary", { groups: quickCommandGroupCount(quickCommands.value), count: quickCommands.value.length }));
 // 命令建议 + 结构化补全（FIG wave-1）：浮层/引擎/调度中枢收口在
 // composables/useCommandSuggestions。
 const {
@@ -8782,7 +8798,33 @@ watch(historyScope, () => {
             </div>
             <div v-if="!quickCommands.length" class="empty compact">{{ t("quickCommandsEmpty") }}</div>
             <div v-else-if="!filteredQuickCommands.length" class="empty compact">{{ t("quickCommandsNoMatch") }}</div>
-            <div v-for="item in filteredQuickCommands" :key="item.id" class="quick-command-row quick-card" :class="{ expanded: quickExpandedId === item.id }">
+            <template v-else-if="quickHasRealGroups">
+              <section v-for="group in groupedQuickCommands" :key="group.id || '__ungrouped__'" class="quick-group">
+                <button class="quick-group-head" :aria-expanded="!quickCollapsedGroups.includes(group.id)" @click="toggleQuickGroupCollapse(group.id)">
+                  <ChevronDown v-if="!quickCollapsedGroups.includes(group.id)" class="quick-group-chevron" />
+                  <ChevronRight v-else class="quick-group-chevron" />
+                  <span class="quick-group-name">{{ quickGroupName(group) }}</span>
+                  <span class="quick-group-count">{{ group.commands.length }}</span>
+                </button>
+                <template v-if="!quickCollapsedGroups.includes(group.id)">
+                  <div v-for="item in group.commands" :key="item.id" class="quick-command-row quick-card" :class="{ expanded: quickExpandedId === item.id }">
+                    <button class="quick-card-main" :title="item.command" :aria-label="item.command" @click="toggleQuickExpand(item.id)">
+                      <Braces class="quick-card-icon" />
+                      <span class="quick-card-text">
+                        <strong>{{ item.name }}</strong>
+                        <span class="mono">{{ item.command }}</span>
+                      </span>
+                    </button>
+                    <div class="quick-card-actions">
+                      <button class="quick-action" :disabled="!connected" @click="sendQuickCommand(item)">{{ t("quickCommandRun") }}</button>
+                      <button class="quick-action" :disabled="!connected" @click="pasteQuickCommand(item)">{{ t("quickCommandPaste") }}</button>
+                    </div>
+                    <div v-if="quickExpandedId === item.id" class="quick-card-full mono">{{ item.command }}</div>
+                  </div>
+                </template>
+              </section>
+            </template>
+            <div v-for="item in filteredQuickCommands" v-else :key="item.id" class="quick-command-row quick-card" :class="{ expanded: quickExpandedId === item.id }">
               <button class="quick-card-main" :title="item.command" :aria-label="item.command" @click="toggleQuickExpand(item.id)">
                 <Braces class="quick-card-icon" />
                 <span class="quick-card-text">
@@ -8797,7 +8839,7 @@ watch(historyScope, () => {
               <div v-if="quickExpandedId === item.id" class="quick-card-full mono">{{ item.command }}</div>
             </div>
             <footer class="quick-command-footer quick-command-footer--readonly">
-              <span class="quick-command-limit">{{ t("quickCommandsLimit", { count: quickCommands.length, limit: 20 }) }}</span>
+              <span class="quick-command-limit">{{ quickCommandGroupSummary }}</span>
               <span class="quick-command-manage-hint">{{ t("quickCommands.manageHint") }}</span>
             </footer>
             </PopoverContent>
@@ -10372,6 +10414,8 @@ watch(historyScope, () => {
       @save-quick-command="saveQuickCommand"
       @delete-quick-command="deleteQuickCommand"
       @import-quick-commands="importQuickCommands"
+      @rename-quick-command-group="renameQuickCommandGroupById"
+      @dissolve-quick-command-group="dissolveQuickCommandGroupById"
       @browse-download-dir="folderPickerTarget = 'settings'"
       @update:webgl="setWebglEnabled"
       @update-behavior="updateTerminalBehavior"
@@ -10829,6 +10873,13 @@ watch(historyScope, () => {
 .quick-action { height: 22px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 10px; cursor: pointer; }
 .quick-action:hover:not(:disabled) { background: var(--accent); }
 .quick-card-full { flex: 1 1 100%; margin: 2px 4px 4px 27px; color: var(--foreground); font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* 分组头（issue #201）：可折叠 + 组名 + 条数徽标；未分组同样式。 */
+.quick-group { display: flex; flex-direction: column; }
+.quick-group-head { display: flex; align-items: center; gap: 5px; border: 0; padding: 3px 4px; background: transparent; color: var(--muted-foreground); text-align: left; cursor: pointer; }
+.quick-group-head:hover { color: var(--foreground); }
+.quick-group-chevron { width: 13px; height: 13px; flex: 0 0 13px; }
+.quick-group-name { min-width: 0; flex: 1; overflow: hidden; font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.quick-group-count { flex: 0 0 auto; border-radius: 8px; padding: 0 6px; background: var(--muted); color: var(--muted-foreground); font-size: 9px; line-height: 15px; }
 /* 只读 footer：限额 + "管理入口在设置" 指引，不再有编辑动作。 */
 .quick-command-footer { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--border); margin-top: 4px; padding-top: 8px; }
 .quick-command-footer--readonly { justify-content: space-between; }

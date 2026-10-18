@@ -16,7 +16,7 @@ import { describeWorkbenchSessionStatus, isUsableSshSession, normalizeSshSession
 import { sanitizeCommandOutput, stripCommandEcho, stripHiddenCommandEchoes, stripTerminalControlSequences } from "./terminalOutputText";
 import { browseCommandHistory, isPersistableCommand, pushCommandHistory, sanitizeCommandHistory } from "./commandHistory";
 import { formatAuthMethodLabel, formatLatency } from "./connectionInfo";
-import { normalizeQuickCommands, removeQuickCommand, upsertQuickCommand, type QuickCommand } from "./quickCommands";
+import { normalizeQuickCommands, removeQuickCommand, upsertQuickCommand, QUICK_COMMANDS_LIMIT, type QuickCommand } from "./quickCommands";
 import { resolveWorkbenchLocale, workbenchMessage, workbenchMessageTable, type WorkbenchLocale } from "./i18n";
 
 describe("SSH workbench protocol helpers", () => {
@@ -736,13 +736,13 @@ describe("quick commands CRUD (toolbar dropdown)", () => {
       { id: "", command: "echo no-id" }, // invalid id dropped
       { id: "c", name: "No command" }, // empty command dropped
       "not an object",
-      ...Array.from({ length: 25 }, (_, i) => qc(`fill-${i}`, `n${i}`, `cmd ${i}`)),
+      ...Array.from({ length: 205 }, (_, i) => qc(`fill-${i}`, `n${i}`, `cmd ${i}`)),
     ];
     const list = normalizeQuickCommands(raw);
-    expect(list).toHaveLength(20);
+    expect(list).toHaveLength(QUICK_COMMANDS_LIMIT);
     expect(list[0]).toEqual({ id: "a", name: "Disk", command: "df -h" });
     expect(list[1]).toEqual({ id: "b", name: "uptime", command: "uptime" });
-    expect(list.map((item) => item.id)).not.toContain("fill-19");
+    expect(list.map((item) => item.id)).not.toContain("fill-199");
     expect(normalizeQuickCommands(null)).toEqual([]);
   });
 
@@ -755,9 +755,9 @@ describe("quick commands CRUD (toolbar dropdown)", () => {
     // Blank command is a no-op.
     expect(upsertQuickCommand(list, qc("d", "D", "   "))).toEqual(list);
     // Over the limit the oldest (front) entry is evicted.
-    const full = Array.from({ length: 20 }, (_, i) => qc(`k${i}`, `n${i}`, `cmd ${i}`));
+    const full = Array.from({ length: QUICK_COMMANDS_LIMIT }, (_, i) => qc(`k${i}`, `n${i}`, `cmd ${i}`));
     const next = upsertQuickCommand(full, qc("new", "New", "cmd new"));
-    expect(next).toHaveLength(20);
+    expect(next).toHaveLength(QUICK_COMMANDS_LIMIT);
     expect(next[0].id).toBe("k1");
     expect(next.at(-1)!.id).toBe("new");
     // The input list is never mutated.

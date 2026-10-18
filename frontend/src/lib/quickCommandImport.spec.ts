@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mergeQuickCommandImport, parseQuickCommandImport } from "./quickCommandImport";
+import { QUICK_COMMANDS_LIMIT } from "./quickCommands";
 import type { QuickCommand } from "./quickCommands";
 
 const EXISTING: QuickCommand[] = [
@@ -62,9 +63,9 @@ describe("parseQuickCommandImport", () => {
   });
 
   it("truncates names/commands and stops at the global cap", () => {
-    const many = Array.from({ length: 25 }, (_, index) => ({ name: `p${index}`, command: "echo hi" }));
+    const many = Array.from({ length: QUICK_COMMANDS_LIMIT + 5 }, (_, index) => ({ name: `p${index}`, command: "echo hi" }));
     const plan = parseQuickCommandImport(JSON.stringify(many));
-    expect(plan.items).toHaveLength(20);
+    expect(plan.items).toHaveLength(QUICK_COMMANDS_LIMIT);
     const long = parseQuickCommandImport(JSON.stringify([{ name: "n".repeat(80), command: "c".repeat(600) }]));
     expect(long.items[0]?.name).toHaveLength(60);
     expect(long.items[0]?.command).toHaveLength(500);
@@ -84,19 +85,19 @@ describe("mergeQuickCommandImport", () => {
   });
 
   it("keeps only the first N items that fit the remaining slots (overflow counted)", () => {
-    // 解析阶段已按全局上限截断（见上条用例），所以合并最多看到 20 条：
-    // 剩余 18 个槽位全填满，其余 2 条计入 overflow（导入前 N 条策略）。
+    // 解析阶段已按全局上限截断（见上条用例），所以合并最多看到 200 条（issue #201）：
+    // 剩余 198 个槽位全填满，其余 2 条计入 overflow（导入前 N 条策略）。
     const plan = parseQuickCommandImport(JSON.stringify(
-      Array.from({ length: 25 }, (_, index) => ({ name: `p${index}`, command: "echo hi" })),
+      Array.from({ length: QUICK_COMMANDS_LIMIT + 5 }, (_, index) => ({ name: `p${index}`, command: "echo hi" })),
     ));
     const merge = mergeQuickCommandImport(EXISTING, plan);
-    expect(merge.accepted).toHaveLength(18);
+    expect(merge.accepted).toHaveLength(QUICK_COMMANDS_LIMIT - 2);
     expect(merge.overflow).toBe(2);
     expect(merge.skippedExisting).toBe(0);
   });
 
   it("returns nothing when the list is already full", () => {
-    const full: QuickCommand[] = Array.from({ length: 20 }, (_, index) => ({ id: `x${index}`, name: `n${index}`, command: "echo" }));
+    const full: QuickCommand[] = Array.from({ length: QUICK_COMMANDS_LIMIT }, (_, index) => ({ id: `x${index}`, name: `n${index}`, command: "echo" }));
     const plan = parseQuickCommandImport(JSON.stringify([{ name: "new", command: "ls" }]));
     const merge = mergeQuickCommandImport(full, plan);
     expect(merge.accepted).toEqual([]);

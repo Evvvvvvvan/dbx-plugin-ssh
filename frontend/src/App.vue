@@ -4141,16 +4141,18 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
       return;
     }
     const attemptMs = Date.now() - attemptStarted;
-    // "Connection is not active"：sidecar 连接注册表还没有该连接。boot 恢复
-    // 场景先等待宿主重放 connect 生命周期；非 boot 路径先主动请求宿主重放，
-    // 成功后在有界窗口内轮询。宿主请求失败则立即呈现错误。认证 /
-    // host-key 拒绝是秒级永久错误，重试不可能自愈——跳过重试直接进 error 态，
-    // 呈现 friendly 文案 + Reconnect 出口（P1-1）。决策细节见 connectRetry.ts。
+    // "Connection is not active"：sidecar 连接注册表还没有该连接。web 刷新后
+    // 宿主进程不重启、不会重放 connection/connect（#202），boot 恢复与手动
+    // 场景等价——首败都主动请求宿主按最新配置重开一次（幂等；webview 拿不到
+    // 凭据，boot 态调用安全），成功后在有界窗口内轮询。宿主请求失败则立即
+    // 呈现错误。认证 / host-key 拒绝是秒级永久错误，重试不可能自愈——跳过
+    // 重试直接进 error 态，呈现 friendly 文案 + Reconnect 出口（P1-1）。
+    // 决策细节见 connectRetry.ts。
     const inactive = isConnectionInactiveError(cause);
     // A live workbench can outlast its sidecar connection registration. Ask
     // the host to replay the vault-backed lifecycle once before polling for
     // the new registration. The webview never receives the credentials.
-    if (inactive && !bootRestore && openRetryAttempt === 0 && !hostReopenAttempted) {
+    if (inactive && openRetryAttempt === 0 && !hostReopenAttempted) {
       await requestHostReopenConnection();
     }
     // 预拨号面板的引导竞态：宿主在创建条目时已开始 connect，openSession 只

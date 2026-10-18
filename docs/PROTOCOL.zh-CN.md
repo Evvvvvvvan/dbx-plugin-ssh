@@ -78,7 +78,7 @@ WezTerm 的 ssh domain 支持 `spawn` 语义：在已认证 transport 上另开 
 | `ssh/recording/search` | 录制搜索：`{query}` → `{recordings: [行]}`，无持久索引对现存 `.cast` 即时扫描（名称命中或内容命中），见下文「会话录制」节 |
 | `ssh/host-key/check` | 连接维度主机密钥预检（探针三态：已知 / 变更 / 未知，不发认证） |
 | `ssh/settings/get`、`ssh/settings/set` | 读取/运行时更新 Quick Sudo 编排设置 |
-| `mcp/tools`、`mcp/call` | MCP 工具发现与执行（供 DBX MCP 桥 `dbx_call_plugin_tool` 调用；连接凭据以标准 lifecycle payload 转发，按 `connectionId` 池化，payload 新增 `name` 字段携带连接名）。连接类工具新增可选 `connectionName`（与 `connectionId` 二选一，注册表按名匹配，重名报错并列出候选）；stdio 独立模式对未注册 `connectionId` 的调用自动经宿主桥 `POST /list-plugin-connections` 转发到运行中的 DBX 应用执行——请求 `{"plugin_id":"io.dbx.ssh"}`、响应 `{"connections":[{id,name,host,port,username,authentication,readOnly}]}`（仅元数据，密钥只出布尔标志位），桥不可用回落内联凭据；新增 `ssh_list_connections` 工具即消费该路由，降级时仅回本会话注册表并附 `note`。`mcp/tools` 与 stdio `tools/list` 返回的每个工具附 `annotations`（`title` + `readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`，与内部门禁分类同源，见 docs/MCP.zh-CN.md「工具 annotations」） |
+| `mcp/tools`、`mcp/call` | MCP 工具发现与执行（供 DBX MCP 桥 `dbx_call_plugin_tool` 调用；连接凭据以标准 lifecycle payload 转发，按 `connectionId` 池化，payload 新增 `name` 字段携带连接名）。连接类工具新增可选 `connectionName`（与 `connectionId` 二选一，注册表按名匹配，重名报错并列出候选）；stdio 独立模式对未注册 `connectionId` 的调用自动经宿主桥 `POST /list-plugin-connections` 转发到运行中的 DBX 应用执行——请求 `{"plugin_id":"io.dbx.ssh"}`、响应 `{"connections":[{id,name,host,port,username,authentication,readOnly}]}`（仅元数据，密钥只出布尔标志位），桥不可用回落内联凭据；新增 `ssh_list_connections` 工具即消费该路由，降级时仅回本会话注册表并附 `note`。`mcp/tools` 与 stdio `tools/list` 返回的每个工具附 `annotations`（`title` + `readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`，与内部门禁分类同源，见 docs/MCP.zh-CN.md「工具 annotations」与下文「MCP 工具面」节） |
 | `mcp/settings/get`、`mcp/settings/set` | MCP SFTP 尺寸限制策略（maxRead/maxUpload/maxDownload，持久化，`--mcp` 同源生效）；`localTransferRoot` 配置 `sftp_upload`/`sftp_download` 本地传输根（绝对路径或空串回落默认根=临时目录+插件数据目录；敏感路径黑名单任何模式叠加生效）。**消费模式注**（存储迁移批 1）：`set` 为部分更新（未指定字段含 `localTransferRoot` 保留）；工作台把可同步子集（maxRead/maxUpload/maxDownload + persisted 权限档）镜像进宿主 `host.storage` 作云同步载荷，sidecar 文件仍是 serve 时即时权威（见 `IMPL_PLAN_STORAGE_SYNC.zh-CN.md`） |
 | `sftp/chmod` | 修改远端路径权限位（八进制）；`sftp_name_encoding` 为 `latin-1` 时路径整条按 wire 还原走裸包 SETSTAT（M17） |
 | `sftp/diskUsage` | 路径所在挂载的磁盘用量 |
@@ -140,6 +140,17 @@ WezTerm 的 ssh domain 支持 `spawn` 语义：在已认证 transport 上另开 
 | `vnc/start`、`vnc/input`（`vnc/write` 同义别名）、`vnc/resize`、`vnc/set-clipboard`、`vnc/reconnect`、`vnc/close` | VNC 远程桌面会话（RFB；帧补丁与端点分工见「VNC 帧补丁」节）：`start {workbenchId, host, port?(5900), connectionId?, runtimeHost?, runtimePort?, password?, scaleMode?("fit"\|"stretch"\|"actual"), reconnectAttempts?(缺省 3，上限 10)}` → `{sessionId, host, port, scaleMode, reconnectAttempts}`——密码走 classic VNC-Auth 限 8 字节、`Zeroizing` 持有不落日志，缺省/空为 None 认证（明文协议，仅建议可信网络）；请求未带密码且 `connectionId` 命中连接表单暂存密码时由 sidecar 合并（见 telnet/start 行与「非 SSH 连接凭据暂存」）；`input {sessionId, kind: "key"{keysym,pressed}\|"pointer"{x,y,buttonMask}\|"release-all"}` → `{success: true}`（keysym 由前端映射）；`resize {sessionId}` → `{success: true}`——仅确认会话存活的前端缩放提示，不改远端分辨率；`set-clipboard {sessionId, text}` → `{success: true}`——仅 Latin-1 文本、≤1 MiB 越界整包拒绝；`reconnect {sessionId}` → `{sessionId, success: true}`——generation 计数防串话、保留帧缓冲整幅重绘；`close {sessionId}` → `{success: true}` |
 | `rdp/start`、`rdp/write`（=`rdp/input` 别名）、`rdp/resize`、`rdp/set-clipboard`、`rdp/reconnect`、`rdp/close`、`rdp/certificate/resolve` | RDP 远程桌面会话（参数表、返回形状、重连门控与安全红线见「RDP 远程桌面会话」节）：`start` 前有独立实验门（`rdp_experimental_enabled` 偏好关闭时 RPC 直接拒绝，绕不过 UI）；`write` 键鼠/unicode 注入（unicode ≤4096 字符整包拒绝）；`resize` 尺寸门限同 start；`set-clipboard` 仅文本、16 MiB 上限；`reconnect`/`close` 递增 generation 防串话、close 连带丢弃凭据/拒绝待定证书/清空剪贴板暂存；`certificate/resolve` accept 缺省 false fail-closed、`remember` 记入 rdp-known-certs.json（上限 1024 条），确认窗 120s 超时即拒 |
 | `workbench/close` | 工作台标签关闭的统一回收入口：`{workbenchId}` → `{success: true}`——级联关闭该工作台全部 SSH 会话（含复制会话）与本地终端、Telnet、VNC、RDP、串口会话（各家族 `close_workbench` 幂等清理）；webview 重载**不会**触发本方法，存活会话因此保持可回附（`*/list` + `*/replay`），见「本地终端」节 |
+
+## MCP 工具面（尺寸预算，#203）
+
+`tools/list`（stdio）与 `mcp/tools`（embedded 桥共用 `tool_definitions()`）返回同一份工具目录，当前 **16 个工具**（#203 两轮瘦身：33→16，移除冗余/可推导/命令可实现的工具面，前端工作台 RPC 全部保留，仅收缩 agent 面）。
+
+**尺寸实测与预算口径**（单测 `mcp::tests::tool_definitions_stay_under_budget` 固定）：
+
+- **raw 口径**：单测量的是 sidecar `tools/list` 的 raw JSON 序列化（serde `Value::to_string`）。#203 描述瘦身二轮后实测 **43,842 字符**（43,866 字节）。
+- **桥文本口径**：桥模式下宿主 `dbx_plugin_tools` 把工具目录重新拼装成自己的文本返回，与 raw 不是同一序列化结果，经验比 ≈0.9（#203 前单轮实测 99,909 raw → 90,114 桥文本，比率 0.902）。按此换算当前桥文本 ≈39.5k。
+- **客户端落盘线**：Claude Code 在 >≈50,000 字符落盘（persistenceThresholdCeiling，实测客户端中最严），Qoder CLI ≈75,000。预算断言 **raw ≤50_000** 对应桥文本 ≤≈45k，即断言内保证 Claude Code 不落盘；#172 时代的 100k 预算只是防回归，不是客户端无落盘判据（当时 90k 桥文本在两个实测客户端都落盘）。
+- **预算纪律**：新增工具前先看预算——能并进既有工具或用 `ssh_exec` 实现的不再单列；超预算先砍最长 description（自明参数可整条去 description），不删属性名、不删行为语义与安全警告。
 
 ## 会话导入：流式预览与脱敏规范化导出
 

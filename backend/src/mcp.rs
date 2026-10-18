@@ -4171,10 +4171,10 @@ fn parse_jump_hosts(arguments: &Value) -> Result<Vec<JumpHost>, String> {
 /// Quick Sudo profile tool (schema round 6: every advertised parameter must
 /// carry an accurate description; defined once here, referenced by both
 /// schema sites so the wording can never drift apart).
-const AUTHENTICATION_DESCRIPTION: &str = "Authentication for inline dials: password (default), private-key, private-key-password, or agent; omitted is inferred from privateKey*/password presence";
+const AUTHENTICATION_DESCRIPTION: &str = "Auth for inline dials: password (default), private-key, private-key-password, or agent; omitted infers from privateKey*/password";
 const CONNECT_TIMEOUT_DESCRIPTION: &str =
-    "TCP connect timeout in seconds for inline dials (default 30, minimum 1)";
-const AUTH_FLOW_MODE_DESCRIPTION: &str = "Two-factor sudo flow: password_only (no OTP), password_plus_otp (combined prompt), password_then_otp (separate later prompt; default); unknown values fall back to the default, explicit args win";
+    "TCP connect timeout in seconds for inline dials (default 30, min 1)";
+const AUTH_FLOW_MODE_DESCRIPTION: &str = "2FA sudo flow: password_only (no OTP), password_plus_otp (combined prompt), password_then_otp (separate; default); unknown values fall back to the default";
 
 /// Tool-specific parameters layered on the shared connection properties.
 /// Each entry is `(key, json type, description)`; the type is part of the
@@ -4187,32 +4187,32 @@ fn connection_properties(extra: &[(&str, &str, &str)]) -> Value {
         // resolution, and an undeclared argument is dropped by schema
         // validation before the sidecar ever sees the call.
         //
-        // 描述文本按 #172 预算刻意精简（属性名/类型/枚举齐全，语义保留）：
-        // 33 个工具 × 21 参数逐字重复，description 文本是 tools/list 尺寸的
+        // 描述文本按 #172/#203 预算刻意精简（属性名/类型/枚举齐全，语义保留）：
+        // 16 个工具 × 21 参数逐字重复，description 文本是 tools/list 尺寸的
         // 绝对大头；自明参数（host/port/username/路径类）整条去掉
         // description，改写时只删铺垫，不删模型正确调用所需的行为语义与
         // 安全警告。超预算先砍最长描述（见 tool_definitions_stay_under 测试）。
-        "connectionId": { "type": "string", "description": "Saved DBX connection id (via ssh_list_connections). runInTerminal: true forwards a stdio call to that connection's workbench terminal; unknown stdio ids forward to the DBX app, so no inline credentials are needed" },
-        "connectionName": { "type": "string", "description": "Saved connection name (may replace connectionId); ambiguous matches are refused with candidate ids" },
+        "connectionId": { "type": "string", "description": "Saved DBX connection id (via ssh_list_connections)" },
+        "connectionName": { "type": "string", "description": "Saved connection name (may replace connectionId); ambiguous matches are refused with candidates" },
         "host": { "type": "string" },
         "port": { "type": "integer" },
         "username": { "type": "string" },
         "password": { "type": "string", "description": "Login password (password auth, or sudo fallback)" },
         "privateKeyPath": { "type": "string" },
-        "privateKeyContent": { "type": "string", "description": "Private key contents (OpenSSH/PEM/PPK); takes precedence over privateKeyPath" },
+        "privateKeyContent": { "type": "string", "description": "Private key contents (OpenSSH/PEM/PPK); overrides privateKeyPath" },
         "privateKeyPassphrase": { "type": "string" },
         "agentSocket": { "type": "string" },
         "authentication": { "type": "string", "enum": ["password", "private-key", "private-key-password", "agent"], "description": AUTHENTICATION_DESCRIPTION },
         "connectTimeoutSecs": { "type": "integer", "description": CONNECT_TIMEOUT_DESCRIPTION },
         "sudoPassword": { "type": "string", "description": "Sudo password override (defaults to password)" },
-        "totpSecret": { "type": "string", "description": "TOTP secret (otpauth:// URI, base32, or static code) for 2FA auto-answer; newline/semicolon separated secrets rotate automatically" },
+        "totpSecret": { "type": "string", "description": "TOTP secret (otpauth:// URI, base32, or static code) for 2FA auto-answer; newline/semicolon separated secrets auto-rotate" },
         "authFlowMode": { "type": "string", "enum": ["password_only", "password_plus_otp", "password_then_otp"], "description": AUTH_FLOW_MODE_DESCRIPTION },
         "passwordPromptHint": { "type": "string" },
         "totpPromptHint": { "type": "string" },
-        "jumpHosts": { "type": "array", "description": "ProxyJump chain (up to 3), snake_case: [{\"host\":\"bastion\",\"port\":22,\"username\":\"ops\",\"password\":\"…\"}]; replaces direct dialing" },
-        "triggers": { "type": "string", "description": "Expect-style triggers, JSON or tssh text (https://github.com/trzsz/trzsz-ssh), e.g. {\"stages\":[{\"pattern\":\"(?i)code\",\"sendText\":\"654321\\\\r\"}]}; each stage replies when its regex matches PTY output; invalid rules fail the dial. A malicious server can fake prompts to harvest replies" },
-        "passwordCommand": { "type": "string", "description": "Local command; stdout (minus trailing newline) is the login password when none is set. Placeholders: %h %u %p %%; explicit credentials win" },
-        "passphraseCommand": { "type": "string", "description": "Local command; stdout is the key passphrase when the key needs one. Same placeholders as passwordCommand" },
+        "jumpHosts": { "type": "array", "description": "ProxyJump chain (up to 3): [{\"host\":\"bastion\",\"port\":22,\"username\":\"ops\",\"password\":\"…\"}]; replaces direct dialing" },
+        "triggers": { "type": "string", "description": "Expect-style triggers, JSON or tssh text, e.g. {\"stages\":[{\"pattern\":\"(?i)code\",\"sendText\":\"654321\\\\r\"}]}; each stage replies when its regex matches PTY output; invalid rules fail the dial. A malicious server can fake prompts to harvest replies" },
+        "passwordCommand": { "type": "string", "description": "Local command; stdout (minus newline) is the login password. Placeholders: %h %u %p %%; explicit args win" },
+        "passphraseCommand": { "type": "string", "description": "Local command; stdout is the key passphrase. Same placeholders as passwordCommand" },
     });
     if let Some(map) = properties.as_object_mut() {
         for (key, kind, description) in extra {
@@ -4315,14 +4315,14 @@ pub fn tool_definitions() -> Value {
     let mut tools = json!([
         {
             "name": "ssh_exec",
-            "description": "Run a non-interactive remote shell command over SSH. Quick Sudo orchestration is NOT applied; use ssh_exec_sudo for privileged commands. Commands matching catastrophic patterns (disk formatting, recursive system deletes, shutdown, raw device writes, SQL DROP) require confirmDestructive: true; on read-only connections only whitelisted inspection commands (ls, cat, df, ps, systemctl status, journalctl, docker ps, ...) are allowed. Hosts commonly give up waiting after ~15s regardless of timeoutSecs while the command keeps running remotely (and further calls to this server stall until it finishes) - for anything that may exceed ~10s use ssh_run_bg + ssh_task_status instead. After a timeout the command may STILL be running: verify before rerunning.",
+            "description": "Run a non-interactive remote shell command over SSH. Quick Sudo is NOT applied; use ssh_exec_sudo for privileged commands. Catastrophic patterns (disk formatting, recursive system deletes, shutdown, raw device writes, SQL DROP) require confirmDestructive: true; read-only connections only accept whitelisted inspection commands (ls, cat, df, ps, systemctl status, journalctl, docker ps, ...). Hosts may abandon the wait after ~15s while the command keeps running remotely; for anything slow use ssh_run_bg + ssh_task_status. After a timeout the command may STILL be running: verify before rerunning.",
             "inputSchema": {
                 "type": "object",
                 "properties": connection_properties(&[
                     ("command", "string", "Shell command to execute"),
-                    ("timeoutSecs", "integer", "Plugin-side wait cap in seconds (5-300, default 60). The MCP host may abandon the wait earlier (~15s); the command keeps running remotely either way"),
-                    ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
-                    ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible. Through the DBX embedded bridge it routes to the open workbench terminal; in stdio mode it is forwarded to the DBX app bridge (requires a saved connectionId that exists in the DBX app). This is yours to decide as the agent: set true when the task needs visibility, human oversight, or interactivity. Elevated commands run only after the user approves them in the terminal; the connection-level terminal MCP mode (toggled in the DBX terminal toolbar, persisted across restarts) decides when the flag is omitted: modes other than off route every exec through the visible terminal, off keeps the silent hidden channel"),
+                    ("timeoutSecs", "integer", "Plugin-side wait cap in seconds (5-300, default 60); the host may abandon the wait earlier (~15s) while the command keeps running"),
+                    ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive after human review"),
+                    ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible (requires a saved connectionId). Set true when the task needs visibility, human oversight, or interactivity; elevated commands run only after the user approves them in the terminal. The connection-level terminal MCP mode (toggled in the DBX terminal toolbar) decides the default when this flag is omitted; off keeps the silent hidden channel"),
                 ]),
                 "required": ["command"],
                 "anyOf": connection_selector_requirements(),
@@ -4330,15 +4330,15 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "ssh_exec_sudo",
-            "description": "Run a remote shell command with sudo. The sudo password is piped over stdin and 2FA/TOTP prompts are answered automatically when a TOTP secret is available (inline arguments, or a shared global Quick Sudo profile referenced by quickSudoProfile; explicit arguments win). Commands matching catastrophic patterns require confirmDestructive: true; refused outright on read-only connections. Same wait-cap caveat as ssh_exec: hosts may stop waiting after ~15s; prefer short commands and keep long privileged jobs under ssh_run_bg.",
+            "description": "Run a remote shell command with sudo. The sudo password is piped over stdin and 2FA/TOTP prompts are answered automatically when a TOTP secret is available (inline arguments, or a shared Quick Sudo profile referenced by quickSudoProfile; explicit arguments win). Catastrophic patterns require confirmDestructive: true; refused outright on read-only connections. Same wait-cap caveat as ssh_exec: keep long privileged jobs under ssh_run_bg.",
             "inputSchema": {
                 "type": "object",
                 "properties": connection_properties(&[
                     ("command", "string", "Shell command to execute with sudo"),
-                    ("timeoutSecs", "integer", "Plugin-side wait cap in seconds (5-300, default 90). The MCP host may abandon the wait earlier (~15s); the command keeps running remotely either way"),
+                    ("timeoutSecs", "integer", "Plugin-side wait cap in seconds (5-300, default 90); the host may abandon the wait earlier (~15s) while the command keeps running"),
                     ("quickSudoProfile", "string", "Global Quick Sudo profile id or exact name supplying sudo password/TOTP/prompt defaults"),
-                    ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
-                    ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible. Through the DBX embedded bridge it routes to the open workbench terminal; in stdio mode it is forwarded to the DBX app bridge (requires a saved connectionId that exists in the DBX app). This is yours to decide as the agent: set true when the task needs visibility, human oversight, or interactivity. Elevated commands run only after the user approves them in the terminal; the connection-level terminal MCP mode (toggled in the DBX terminal toolbar, persisted across restarts) decides when the flag is omitted: modes other than off route every exec through the visible terminal, off keeps the silent hidden channel"),
+                    ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive after human review"),
+                    ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible (requires a saved connectionId). Set true when the task needs visibility, human oversight, or interactivity; elevated commands run only after the user approves them in the terminal. The connection-level terminal MCP mode (toggled in the DBX terminal toolbar) decides the default when this flag is omitted; off keeps the silent hidden channel"),
                 ]),
                 "required": ["command"],
                 "anyOf": connection_selector_requirements(),
@@ -4346,7 +4346,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "ssh_multi_exec",
-            "description": "Run one command on several saved connections and collect per-target results (aggregate execution on the hidden channel; never routed through a visible terminal). targets: 1-10 connection references (connectionId or connectionName), deduplicated in order. mode: parallel (default) or sequential; stopOnError (sequential only) stops at the first failure. confirmDestructive: true covers catastrophic commands on every target; sudo is NOT available here - use single-target ssh_exec_sudo for escalation. Gates are evaluated per target: read-only connections only accept whitelisted inspection commands, and the MCP host may abandon the wait after ~15s while commands keep running - for anything slow use ssh_run_bg per target instead.",
+            "description": "Run one command on several saved connections and collect per-target results (hidden channel; never a visible terminal). targets: 1-10 connection references (connectionId or connectionName), deduplicated in order. mode: parallel (default) or sequential; stopOnError (sequential only) stops at the first failure. confirmDestructive: true covers catastrophic commands on every target; sudo is NOT available here - use single-target ssh_exec_sudo for escalation. Per target: read-only connections only accept whitelisted inspection commands; the host may abandon the wait after ~15s while commands keep running - for anything slow use ssh_run_bg.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4364,13 +4364,13 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "ssh_terminal_input",
-            "description": "Inject raw input (interactive answers, Ctrl+C, escape sequences) into the connection's LIVE DBX terminal so the human can watch it happen; the terminal must already be open. Newlines (\\n, \\r\\n) fold to Enter (\\r), NUL is stripped, and the input is capped at 8 KiB. appendNewline (default false) appends one Enter - set it to run a typed command, leave it off for prompt answers or control keys. Output is NOT collected (the terminal itself shows it); for captured output use ssh_exec with runInTerminal: true. Gates: read-only connections only accept control-only input; catastrophic lines require confirmDestructive: true; sudo lines must match the connection's sudo whitelist when one is configured.",
+            "description": "Inject raw input (interactive answers, Ctrl+C, escape sequences) into the connection's LIVE DBX terminal so the human can watch it happen; the terminal must already be open. Newlines fold to Enter (\\r), NUL is stripped, input capped at 8 KiB. appendNewline (default false) appends one Enter - set it to run a typed command, leave it off for prompt answers or control keys. Output is NOT collected; for captured output use ssh_exec with runInTerminal: true. Gates: read-only connections only accept control-only input; catastrophic lines require confirmDestructive: true; sudo lines must match the connection's sudo whitelist when one is configured.",
             "inputSchema": {
                 "type": "object",
                 "properties": connection_properties(&[
                     ("input", "string", "Raw terminal input to inject; newlines fold to Enter (\\r)"),
                     ("appendNewline", "boolean", "Append one Enter after the input (default false; interactive answers usually carry their own \\r)"),
-                    ("confirmDestructive", "boolean", "Set true to allow a line recognized as a catastrophic pattern (disk formatting, recursive deletes, shutdown, ...)"),
+                    ("confirmDestructive", "boolean", "Set true to allow a line recognized as a catastrophic pattern"),
                 ]),
                 "required": ["input"],
                 "anyOf": connection_selector_requirements(),
@@ -4378,12 +4378,12 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "ssh_run_bg",
-            "description": "Start a long-running command detached on the remote host (nohup; output appended to ~/.dbx-ssh-tasks/<taskId>.log) and return immediately with taskId/pid/logPath. Survives disconnects, MCP-host wait caps, and session restarts because the output lives on the server. Poll progress with ssh_task_status(logPath). Same safety gates as ssh_exec: destructive patterns need confirmDestructive: true, read-only connections refuse it.",
+            "description": "Start a long-running command detached on the remote host (nohup; output appended to ~/.dbx-ssh-tasks/<taskId>.log) and return immediately with taskId/pid/logPath. Survives disconnects, host wait caps, and session restarts because the output lives on the server. Poll with ssh_task_status(logPath). Same safety gates as ssh_exec: destructive patterns need confirmDestructive: true, read-only connections refuse it.",
             "inputSchema": {
                 "type": "object",
                 "properties": connection_properties(&[
                     ("command", "string", "Shell command to run detached"),
-                    ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
+                    ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive after human review"),
                 ]),
                 "required": ["command"],
                 "anyOf": connection_selector_requirements(),
@@ -4391,7 +4391,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "ssh_task_status",
-            "description": "Poll a background task started with ssh_run_bg: returns state (running/done/missing), exit code once finished, pid liveness, and the trailing bytes of output from the server-side log file. Reconnects transparently, so it works after disconnects or from a later session.",
+            "description": "Poll a background task started with ssh_run_bg: returns state (running/done/missing), exit code once finished, pid liveness, and the trailing bytes of the server-side log file. Reconnects transparently, so it works after disconnects or from a later session.",
             "inputSchema": {
                 "type": "object",
                 "properties": connection_properties(&[
@@ -4418,7 +4418,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "ssh_list_connections",
-            "description": "List the DBX app's saved SSH connections for this plugin (id, name, host, port, username, authentication method, read-only flag) merged with connections registered in this MCP session. Metadata only: credentials are never included. Use an entry's id as connectionId, its name as connectionName, or its host+port+username as an endpoint reference on the connection-bound tools; a unique endpoint match reuses the saved connection without inline credentials.",
+            "description": "List the DBX app's saved SSH connections for this plugin (id, name, host, port, username, authentication method, read-only flag) merged with connections registered in this MCP session. Metadata only: credentials are never included. Use an entry's id as connectionId, its name as connectionName, or its host+port+username as an endpoint reference; a unique endpoint match reuses the saved connection without inline credentials.",
             "inputSchema": { "type": "object", "properties": {} },
         },
         {
@@ -4435,7 +4435,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "sftp_list_dir",
-            "description": "List a remote directory over SFTP. Names follow the connection's file-name encoding preference: on latin-1 connections entries are decoded from raw server bytes to display form, and a returned path passed back to the other SFTP tools addresses the same server bytes.",
+            "description": "List a remote directory over SFTP. Names follow the connection's file-name encoding: on latin-1 connections entries are decoded from raw server bytes to display form, and a returned path passed back to other SFTP tools addresses the same server bytes.",
             "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote directory path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
         },
         {
@@ -4445,7 +4445,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "sftp_upload",
-            "description": "Upload a local file to the remote server over SFTP (single file, no directory recursion). The local file must be readable by the MCP server process; size is capped by the configured maxUploadBytes.",
+            "description": "Upload a local file to the remote server over SFTP (single file, no recursion). The local file must be readable by the MCP server process; size is capped by maxUploadBytes.",
             "inputSchema": { "type": "object", "properties": connection_properties(&[
                 ("localPath", "string", "Local file path to upload"),
                 ("remotePath", "string", "Remote file path to create"),
@@ -4454,7 +4454,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "sftp_download",
-            "description": "Download a remote file to a local path over SFTP (single file). Remote size is capped by the configured maxDownloadBytes; missing local parent directories are created. Shell/cron/systemd bootstrap paths are refused as local targets, and on read-only connections credential paths are refused as remote sources.",
+            "description": "Download a remote file to a local path over SFTP (single file). Remote size is capped by maxDownloadBytes; missing local parent directories are created. Shell/cron/systemd bootstrap paths are refused as local targets; on read-only connections credential paths are refused as remote sources.",
             "inputSchema": { "type": "object", "properties": connection_properties(&[
                 ("remotePath", "string", "Remote file path to download"),
                 ("localPath", "string", "Local target file path"),
@@ -4463,17 +4463,17 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "sftp_read_file",
-            "description": "Read a remote file (text by default, or base64). Truncates at maxBytes; default and ceiling come from the plugin's MCP size settings. Pass offset to continue reading from a byte position (empty result at/after EOF).",
+            "description": "Read a remote file (text by default, or base64). Truncates at maxBytes; default and ceiling come from the plugin's MCP size settings. Pass offset to resume from a byte position (empty result at/after EOF).",
             "inputSchema": { "type": "object", "properties": connection_properties(&[
                 ("path", "string", "Remote file path"),
-                ("maxBytes", "integer", "Maximum bytes to read; clamped to the configured maxDownloadBytes (base64 field ignored)"),
+                ("maxBytes", "integer", "Maximum bytes to read; clamped to maxDownloadBytes (base64 field ignored)"),
                 ("offset", "integer", "Byte offset to start reading from (default 0)"),
                 ("base64", "boolean", "Set true to return base64 instead of UTF-8 text"),
             ]), "required": ["path"], "anyOf": connection_selector_requirements() },
         },
         {
             "name": "sftp_write_file",
-            "description": "Write a remote file with UTF-8 content. Existing files require overwrite=true; content is capped at the configured maxUploadBytes.",
+            "description": "Write a remote file with UTF-8 content. Existing files require overwrite=true; content is capped by maxUploadBytes.",
             "inputSchema": { "type": "object", "properties": connection_properties(&[
                 ("path", "string", "Remote file path"),
                 ("content", "string", "File content (UTF-8 text)"),
@@ -4516,14 +4516,16 @@ mod tests {
     /// **量的是什么**：本测试量的是 sidecar `tools/list` 的 raw JSON 序列化
     /// （serde `Value::to_string`），不是 MCP 客户端实际收到的那份文本。桥模式
     /// 下宿主 `dbx_plugin_tools`（dbx-mcp，宿主仓 crates/dbx-mcp/src/server.rs）
-    /// 把工具目录重新拼装成自己的文本再返回，两次序列化不是同一结果（0.7.7
-    /// 实测桥文本 ≈ raw × 0.9：99,909 → 90,114；#203 瘦身后 49,492 → ≈44.5k）。
+    /// 把工具目录重新拼装成自己的文本再返回，两次序列化不是同一结果（实测
+    /// 桥文本 ≈ raw × 0.9：#203 前单轮实测 99,909 → 90,114，桥比率 0.902）。
     ///
-    /// **预算 55_000 的含义**：对照实测客户端落盘线的防回归上限。#203 实测
-    /// Claude Code 在 >50,000 字符落盘（persistenceThresholdCeiling，最严）、
-    /// Qoder CLI ≈75,000；raw ≤55k 对应桥文本 ≤≈49.5k，即 **Claude Code 线内
-    /// 不落盘**。#172 时代的 100k 预算只是防回归，不是客户端无落盘判据——
-    /// 当时 33 个工具实测 90k 桥文本在两个实测客户端都落盘。
+    /// **实测值与断言口径**：#203 描述瘦身二轮后实测 raw JSON = 43,842 字符
+    /// （43,866 字节），估算桥文本 ≈ 39.5k。断言 50_000 = raw 上限，对应
+    /// 桥文本 ≤ ≈45k，仍低于 **Claude Code ≈50,000 字符落盘线**
+    /// （persistenceThresholdCeiling，实测客户端中最严；Qoder CLI ≈75,000）——
+    /// 即断言内即可保证 Claude Code 不落盘。#172 时代的 100k 预算只是防回归，
+    /// 不是客户端无落盘判据——当时 33 个工具实测 90k 桥文本在两个实测客户端
+    /// 都落盘。
     ///
     /// **工具面怎么到 16 个的**：#203 两轮瘦身，移除冗余/可推导/命令可实现
     /// 的工具（sftp_exists、sftp_pwd、ssh_test_connection、ssh_alert_triage、
@@ -4540,11 +4542,13 @@ mod tests {
         let serialized = tool_definitions().to_string();
         let chars = serialized.chars().count();
         assert!(
-            chars <= 55_000,
-            "tools/list raw JSON is {chars} chars (budget 55_000 = Claude Code's \
-             ~50k persistence line with headroom at the ~0.9 bridge ratio); \
-             trim the fattest descriptions in connection_properties/tool_definitions \
-             or reconsider whether the new tool belongs in the MCP face (#203)"
+            chars <= 50_000,
+            "tools/list raw JSON is {chars} chars (budget 50_000; measured 43_842 after \
+             the #203 description slim-down); at the ~0.9 bridge ratio that keeps the \
+             host dbx_plugin_tools text under ~45k, inside Claude Code's ~50k \
+             persistence line. Trim the fattest descriptions in \
+             connection_properties/tool_definitions or reconsider whether the new \
+             tool belongs in the MCP face (#203)"
         );
     }
 

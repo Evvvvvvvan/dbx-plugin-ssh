@@ -1414,7 +1414,6 @@ struct SessionEntry {
     connection_id: String,
     workbench_id: RwLock<String>,
     read_only: bool,
-    keepalive_interval_secs: u64,
     connected: AtomicBool,
     /// Unix seconds when the session was opened (for `ssh/sessions/list`).
     created_at_secs: u64,
@@ -1738,9 +1737,22 @@ pub(crate) fn upload_cancel_error(reason: Option<&str>) -> String {
 /// Background `sudo -nv` refresh loop keeping a connection's sudo timestamp
 /// alive, ported from tiny-rdm's sudoExecService keepalive.
 struct SudoKeepalive {
-    #[allow(dead_code)]
-    handle: Arc<Handle<SshClient>>,
+    /// Session whose transport the timestamp validation rides. The entry is
+    /// replaced when a different (fresh) session registers and swept when the
+    /// bound session is gone, so a re-registered connection — e.g. the host
+    /// replaying `connection/connect` after a web refresh (#202) — can never
+    /// inherit a keepalive pinned to a dead transport.
+    session_id: String,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// What `register_sudo_keepalive` should do with the connection's existing
+/// entry (see `SudoKeepalive::keepalive_registration_plan`).
+#[derive(Debug, PartialEq, Eq)]
+enum KeepaliveRegistration {
+    ReuseExisting,
+    ReplaceStale,
+    InsertFresh,
 }
 
 /// Last collected metrics snapshot for one session, timestamped with the
@@ -2053,7 +2065,66 @@ impl SshRuntime {
                 Self::sync_auto_sudo(&entry, &current);
             }
         }
+        // #202: a replayed `connection/connect` (web 刷新后宿主重新下发凭据、
+        // 连接表单保存后 reopen 等) must land the runtime in the exact state a
+        // fresh registration would have: auxiliary state that only
+        // `close_session` / `disconnect_connection` would otherwise clean is
+        // swept here, so a stale entry can never degrade or wedge the next
+        // connect.
+        self.sweep_reconnect_residue(&connection_id);
         Ok(())
+    }
+
+    /// Best-effort sweep of stale per-connection / per-session auxiliary
+    /// state after `connection/connect` re-registered `connection_id`
+    /// (issue #202). Best-effort on purpose: a contended session registry
+    /// must never fail the lifecycle push, and every swept entry has a
+    /// normal owner (`close_session` / `disconnect_connection`) that would
+    /// clean it anyway on the ordinary path.
+    fn sweep_reconnect_residue(&self, connection_id: &str) {
+        let Ok(sessions) = self.sessions.try_read() else {
+            return;
+        };
+        let live_session_ids: std::collections::HashSet<String> =
+            sessions.keys().cloned().collect();
+        let connection_has_live_session = sessions
+            .values()
+            .any(|entry| entry.connection_id == connection_id);
+        drop(sessions);
+        // Sudo keepalive pinned to a session that no longer exists: the
+        // stale loop keeps validating against a dead transport, and the old
+        // `contains_key` early-return would mute the next session's own
+        // keepalive until the stale one died off on its own.
+        if let Ok(mut keepalive) = self.sudo_keepalive.lock() {
+            let stale = match keepalive.get(connection_id) {
+                Some(entry) => !live_session_ids.contains(&entry.session_id),
+                None => false,
+            };
+            if stale {
+                if let Some(entry) = keepalive.remove(connection_id) {
+                    entry.task.abort();
+                }
+            }
+        }
+        // Per-connection forwarded-tcpip table without a live session can
+        // never match again (same rule as close_session's backstop).
+        if !connection_has_live_session {
+            if let Ok(mut tables) = self.remote_tables.lock() {
+                tables.remove(connection_id);
+            }
+        }
+        // Per-session caches whose session id is no longer registered —
+        // refresh-orphaned entries whose removal raced the transport death.
+        // Keyed globally by session id, so prune against the full live set.
+        if let Ok(mut cache) = self.metrics_cache.lock() {
+            cache.retain(|session_id, _| live_session_ids.contains(session_id));
+        }
+        if let Ok(mut hinted) = self.compat_hinted.lock() {
+            hinted.retain(|session_id| live_session_ids.contains(session_id));
+        }
+        if let Ok(mut probe) = self.compress_tool_probe.lock() {
+            probe.retain(|session_id, _| live_session_ids.contains(session_id));
+        }
     }
 
     pub async fn disconnect_connection(&self, connection_id: &str) -> Result<(), String> {
@@ -2302,7 +2373,6 @@ impl SshRuntime {
             connection_id: connection.id.clone(),
             workbench_id: RwLock::new(workbench_id.to_string()),
             read_only: connection.read_only,
-            keepalive_interval_secs: connection.keepalive_interval_secs,
             connected: AtomicBool::new(true),
             created_at_secs: unix_now_secs(),
             created_seq: self.session_seq.fetch_add(1, Ordering::Relaxed),
@@ -4303,7 +4373,7 @@ impl SshRuntime {
             .clone();
         let keepalive_handle = session.handle.clone();
         let connection_id = session.connection_id.clone();
-        let keepalive_interval = session.keepalive_interval_secs;
+        let keepalive_session_id = session_id.to_string();
         let handle = session.handle.clone();
         let command = command.to_string();
 
@@ -4372,7 +4442,7 @@ impl SshRuntime {
             None => run.await?,
         };
         if sudo {
-            self.register_sudo_keepalive(&connection_id, keepalive_handle, keepalive_interval);
+            self.register_sudo_keepalive(&connection_id, &keepalive_session_id, keepalive_handle);
         }
         Ok(self.exec_response(&outcome))
     }
@@ -4937,18 +5007,44 @@ impl SshRuntime {
     /// and is aborted deterministically on disconnect / session cleanup via
     /// [`Self::stop_sudo_keepalive`]. Per connection single-instance: a
     /// repeat registration while one is live is a no-op.
+    /// Registration decision for `register_sudo_keepalive` (pure for tests):
+    /// an entry bound to the same live session is reused as-is; an entry bound
+    /// to another (typically dead) session is replaced — the old early-return
+    /// on any existing entry would silently drop the new session's keepalive
+    /// after a reconnect (#202).
+    fn keepalive_registration_plan(
+        existing_session: Option<&str>,
+        incoming_session: &str,
+    ) -> KeepaliveRegistration {
+        match existing_session {
+            Some(existing) if existing == incoming_session => KeepaliveRegistration::ReuseExisting,
+            Some(_) => KeepaliveRegistration::ReplaceStale,
+            None => KeepaliveRegistration::InsertFresh,
+        }
+    }
+
     fn register_sudo_keepalive(
         &self,
         connection_id: &str,
+        session_id: &str,
         handle: Arc<Handle<SshClient>>,
-        _keepalive_interval_secs: u64,
     ) {
         let mut keepalive = match self.sudo_keepalive.lock() {
             Ok(keepalive) => keepalive,
             Err(_) => return,
         };
-        if keepalive.contains_key(connection_id) {
+        let existing_session = keepalive
+            .get(connection_id)
+            .map(|entry| entry.session_id.as_str());
+        if matches!(
+            Self::keepalive_registration_plan(existing_session, session_id),
+            KeepaliveRegistration::ReuseExisting
+        ) {
             return;
+        }
+        // Drop the stale entry and stop its loop before arming the new one.
+        if let Some(existing) = keepalive.remove(connection_id) {
+            existing.task.abort();
         }
         let interval = exec::SUDO_KEEPALIVE_INTERVAL;
         let registry = self.sudo_keepalive.clone();
@@ -4984,7 +5080,13 @@ impl SshRuntime {
                 }
             }
         });
-        keepalive.insert(connection_id.to_string(), SudoKeepalive { handle, task });
+        keepalive.insert(
+            connection_id.to_string(),
+            SudoKeepalive {
+                session_id: session_id.to_string(),
+                task,
+            },
+        );
     }
 
     async fn stop_sudo_keepalive(&self, connection_id: &str) {
@@ -14392,6 +14494,261 @@ matrix-ed25519";
             SshRuntime::pick_attach_target(&sessions, "conn-3", "wb-new"),
             None
         );
+    }
+
+    // ===== issue #202：web 刷新后「从零 connect」路径的契约锁定 =====
+    //
+    // 背景：刷新后宿主（web 模式）不一定立即重推 connection/connect，恢复的
+    // 工作台会先打到 sidecar 的空连接注册表。前端按**确定的错误字符串**分类
+    // （isConnectionInactiveError / isSessionGoneError），这些字符串就是协议
+    // 的一部分——hang、静默或措辞漂移都会把工作台卡死在重试梯子上，因此逐
+    // 字锁定。重推 connect（store_connection）必须幂等并清扫旧注册的残留。
+
+    fn structured_error_emitter() -> PluginEmitter {
+        let output: Arc<Mutex<Box<dyn std::io::Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(Vec::<u8>::new())));
+        PluginEmitter::for_tests(output, dbx_plugin_sdk::PluginTransport::JsonLines)
+    }
+
+    #[tokio::test]
+    async fn session_ops_fail_structured_when_connection_registry_is_empty() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(SshRuntime::new(data_dir.path().to_path_buf()));
+        assert!(!runtime.has_connection("conn-1"));
+
+        let request: SessionOpenRequest =
+            serde_json::from_value(json!({ "connectionId": "conn-1", "workbenchId": "wb-1" }))
+                .expect("parse open request");
+        let error = runtime
+            .open_session(&request, "op-1", structured_error_emitter())
+            .await
+            .expect_err("open without a registered connection must fail");
+        assert_eq!(error, "Connection is not active; reopen it from DBX");
+
+        let error = runtime
+            .attach_session("conn-1", "wb-1", 0, &structured_error_emitter())
+            .await
+            .expect_err("attach without a live session must fail");
+        assert_eq!(error, "No live SSH session is attached to this workbench");
+
+        let error = runtime
+            .close_session("s-missing")
+            .await
+            .expect_err("close of an unknown session must fail");
+        assert_eq!(error, "SSH session was not found");
+    }
+
+    #[test]
+    fn write_terminal_unknown_session_fails_structured() {
+        // write_terminal 在宿主 dispatch 线程上同步执行（blocking_read），
+        // 这里同样在 runtime 之外调用以锁死同一语义。
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let runtime = SshRuntime::new(data_dir.path().to_path_buf());
+        let error = runtime
+            .write_terminal("s-missing", b"ls\r".to_vec())
+            .expect_err("write to an unknown session must fail");
+        assert_eq!(error, "SSH session was not found or expired");
+    }
+
+    #[test]
+    fn sudo_keepalive_registration_plan_replaces_stale_entries() {
+        assert_eq!(
+            SshRuntime::keepalive_registration_plan(Some("s-live"), "s-live"),
+            KeepaliveRegistration::ReuseExisting
+        );
+        assert_eq!(
+            SshRuntime::keepalive_registration_plan(Some("s-dead"), "s-live"),
+            KeepaliveRegistration::ReplaceStale
+        );
+        assert_eq!(
+            SshRuntime::keepalive_registration_plan(None, "s-live"),
+            KeepaliveRegistration::InsertFresh
+        );
+    }
+
+    #[tokio::test]
+    async fn store_connection_is_idempotent_and_sweeps_stale_residue() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let runtime = SshRuntime::new(data_dir.path().to_path_buf());
+        let lifecycle = |name: &str| {
+            json!({
+                "connection": {
+                    "id": "conn-1",
+                    "name": name,
+                    "host": "127.0.0.1",
+                    "port": 22,
+                    "username": "user",
+                    "authentication": "password",
+                    "password": "test-only-not-a-real-secret",
+                }
+            })
+        };
+
+        runtime
+            .store_connection(
+                crate::model::StoredConnection::from_lifecycle_params(&lifecycle("first"))
+                    .expect("parse connection"),
+            )
+            .expect("first connect registers");
+        assert!(runtime.has_connection("conn-1"));
+
+        // 残留：绑定到已死会话的 sudo 保活、孤儿会话缓存、无会话的连接级
+        // remote-forward 表——普通路径由 close/disconnect 清理，重推 connect
+        // 时由 sweep 兜底。
+        runtime
+            .sudo_keepalive
+            .lock()
+            .expect("keepalive registry")
+            .insert(
+                "conn-1".to_string(),
+                SudoKeepalive {
+                    session_id: "dead-s".to_string(),
+                    task: tokio::spawn(async {}),
+                },
+            );
+        runtime.metrics_cache.lock().expect("metrics cache").insert(
+            "dead-s".to_string(),
+            CachedMetrics {
+                value: json!({}),
+                collected_at: 0,
+            },
+        );
+        runtime
+            .compat_hinted
+            .lock()
+            .expect("compat hints")
+            .insert("dead-s".to_string());
+        runtime
+            .compress_tool_probe
+            .lock()
+            .expect("probe cache")
+            .insert("dead-s".to_string(), false);
+        runtime.remote_tables.lock().expect("remote tables").insert(
+            "conn-1".to_string(),
+            Arc::new(RemoteForwardTable::default()),
+        );
+
+        // 同 connectionId 重复 connect：幂等替换（刷新后宿主重推凭据的路径）。
+        runtime
+            .store_connection(
+                crate::model::StoredConnection::from_lifecycle_params(&lifecycle("second"))
+                    .expect("parse connection"),
+            )
+            .expect("replayed connect is idempotent");
+        assert!(runtime.has_connection("conn-1"), "registry must stay live");
+
+        assert!(
+            !runtime
+                .sudo_keepalive
+                .lock()
+                .expect("keepalive registry")
+                .contains_key("conn-1"),
+            "keepalive bound to a dead session must be swept"
+        );
+        assert!(
+            !runtime
+                .metrics_cache
+                .lock()
+                .expect("metrics cache")
+                .contains_key("dead-s"),
+            "orphan metrics snapshot must be swept"
+        );
+        assert!(
+            !runtime
+                .compat_hinted
+                .lock()
+                .expect("compat hints")
+                .contains("dead-s"),
+            "orphan compat hint must be swept"
+        );
+        assert!(
+            !runtime
+                .compress_tool_probe
+                .lock()
+                .expect("probe cache")
+                .contains_key("dead-s"),
+            "orphan probe result must be swept"
+        );
+        assert!(
+            !runtime
+                .remote_tables
+                .lock()
+                .expect("remote tables")
+                .contains_key("conn-1"),
+            "connection-scoped remote-forward table without a live session must be swept"
+        );
+    }
+
+    // ===== issue #108：堡垒机 MFA（keyboard-interactive）行为锁定 =====
+    //
+    // 登录期 keyboard-interactive 由 `authenticate_keyboard_interactive` 驱动：
+    // 最多 KEYBOARD_INTERACTIVE_MAX_ROUNDS 轮，每轮逐 prompt 分类应答（密码 /
+    // OTP / 组合，见 exec.rs `keyboard_interactive_answers` 的既有测试）；分类
+    // 不出的 prompt 用 challenge 上下文兜底，仍为空的答案弹结构化一次性输入
+    // 对话框（`request_keyboard_interactive_answer`），绝不是在 PTY 里瞎敲。
+    // 以下三个纯助手是该链路的用户可见面——逐字锁定（堡垒机排障依赖这些文案
+    // 的稳定性，且 sanitize 保证服务器可控文本进不了 UI 注入面）。
+
+    #[test]
+    fn keyboard_interactive_round_budget_is_bounded() {
+        // 防御性锁定：服务器循环重问时必须有确定性失败，而不是无限轮询；
+        // 静默改动这个预算会改变堡垒机（koko MFA 多轮）的登录语义。
+        assert_eq!(KEYBOARD_INTERACTIVE_MAX_ROUNDS, 4);
+    }
+
+    #[test]
+    fn keyboard_interactive_guidance_explains_unanswered_and_rejected() {
+        // 没有回答：指引配置 TOTP 种子 / OTP 提示词（Quick Sudo 2FA 设置）。
+        let unanswered = keyboard_interactive_guidance(&["\"[OTP Code]: \"".to_string()], false);
+        assert!(unanswered.contains("the server asked for"), "{unanswered}");
+        assert!(unanswered.contains("nothing was answered"), "{unanswered}");
+        assert!(unanswered.contains("TOTP secret"), "{unanswered}");
+
+        // 回答被拒：不再引导去配置（已配置但服务器拒收），只报拒绝事实。
+        let rejected = keyboard_interactive_guidance(&["\"Password: \"".to_string()], true);
+        assert!(
+            rejected.contains("rejected the submitted answer"),
+            "{rejected}"
+        );
+        assert!(!rejected.contains("TOTP secret"), "{rejected}");
+
+        // 空提问列表：不追加任何子句（连接错误保持精简）。
+        assert_eq!(keyboard_interactive_guidance(&[], false), "");
+    }
+
+    #[test]
+    fn keyboard_interactive_manual_challenge_dedupes_and_sanitizes() {
+        // 服务器可控文本：ANSI 转义剥离（着色 prompt 还原成纯文本，转义序列
+        // 进不了对话框）、重复部分去重（koko 的 instructions 与 prompt 常语义
+        // 重复）、空输入为空串。
+        let challenge = keyboard_interactive_manual_challenge(
+            "Please Enter MFA Code.",
+            "\u{1b}[1m[OTP Code]: \u{1b}[0m",
+        );
+        assert!(challenge.contains("Please Enter MFA Code."), "{challenge}");
+        // normalize 会对每段 trim，行尾空格被剥掉是既有归一化语义。
+        assert!(challenge.contains("[OTP Code]:"), "{challenge}");
+        assert!(!challenge.contains('\u{1b}'), "{challenge}");
+
+        let deduped = keyboard_interactive_manual_challenge("Same line.", "Same line.");
+        assert_eq!(deduped, "Same line.");
+        assert_eq!(keyboard_interactive_manual_challenge("  ", "\t"), "");
+    }
+
+    #[test]
+    fn challenge_display_text_dedupes_seen_wording() {
+        let mut seen: Vec<String> = Vec::new();
+        let first = challenge_display_text("Please Enter MFA Code.", &seen);
+        assert_eq!(first.as_deref(), Some("Please Enter MFA Code."));
+        seen.push(first.expect("first display"));
+        // 同一段文案第二次出现（instructions 与 prompt 重复）不再上屏。
+        assert_eq!(
+            challenge_display_text("Please Enter MFA Code.", &seen),
+            None
+        );
+        // 空文案与纯控制字符文案都不产生展示片段。
+        assert_eq!(challenge_display_text("", &[]), None);
+        assert_eq!(challenge_display_text("\u{1b}\u{7}", &[]), None);
     }
 
     #[tokio::test]

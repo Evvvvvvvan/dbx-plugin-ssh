@@ -3642,6 +3642,10 @@ const {
   loadDirectory: (path?: string) => loadDirectory(path),
   // 懒引用：save 链/trzszBusy 都在本调用点之后才声明（TDZ），闭包只在传输时执行。
   receiveAllowed: () => !trzszBusy.value,
+  // 经典 rz 提示（issue #171）：选文件必须在用户手势内触发隐藏 input click；
+  // 取消/超时后收起提示横幅。
+  pickUploadFiles: () => zmodemInput.value?.click(),
+  dismissNotice: () => { noticeOpen.value = false; noticeActions.value = []; },
   probeLocalCapabilities: () => probeLocalCapabilities(),
   saveHostFile: (chunks, fileName) => saveHostFile(chunks, fileName),
   loadDownloadUseDefaultDir, askDownloadTarget, loadDownloadDir, resolveDownloadConflictFor,

@@ -29,6 +29,16 @@ describe("zmodem detection decision", () => {
     expect(decision).toEqual({ action: "confirm", role: "receive" });
   });
 
+  it("prompts instead of denying a send-role session with no pending files when peer-rz prompts are on (issue #171)", () => {
+    // 经典 lrzsz rz：远端手敲 rz → 完整 hex ZRINIT → send 角色检测；无待传
+    // 文件时不再立即 deny，改为提示用户 opt-in。
+    expect(decideZmodemDetection(stubDetection("send"), false, true, { promptPeerRz: true })).toEqual({ action: "prompt-upload" });
+    // 关闭提示恢复既有语义。
+    expect(decideZmodemDetection(stubDetection("send"), false, true)).toEqual({ action: "deny", reason: "roleMismatch" });
+    // 已有待传文件时提示开关不影响既有路径。
+    expect(decideZmodemDetection(stubDetection("send"), true, true, { promptPeerRz: true })).toEqual({ action: "confirm", role: "send" });
+  });
+
   it("denies a receive-role session while an upload is pending (upload owns the stream)", () => {
     const detection = stubDetection("receive");
     const decision = decideZmodemDetection(detection, true, true);
@@ -209,5 +219,90 @@ describe("sendZmodemFiles", () => {
     const file = new File([new Uint8Array(4)], "b.bin");
     await sendZmodemFiles(session, [file]);
     expect((session as { close: ReturnType<typeof vi.fn> }).close).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+// —— 经典 lrzsz rz 握手检测（issue #171）——
+// lrzsz 的首个 ZMODEM 帧恒为 hex 形态（`**` + CAN + 'B' + hex 帧体 + hex CRC16）；
+// zmodem.js 的 sentry 以 COMMON_ZM_HEX_START（`**\x18B0`）作门槛后走完整
+// 帧解析 + CRC 校验——这里用真实帧字节验证检测分界。
+
+/** CRC-16/CCITT-FALSE（ZMODEM 帧校验：poly 0x1021、init 0、非反射——与
+ *  zmodem.js zcrc.js 同款）。 */
+function zmodemCrc16(bytes: readonly number[]): number {
+  let crc = 0;
+  for (const byte of bytes) {
+    crc ^= (byte & 0xff) << 8;
+    for (let bit = 0; bit < 8; bit += 1) crc = crc & 0x8000 ? (crc << 1) ^ 0x1021 : crc << 1;
+  }
+  return crc & 0xffff;
+}
+
+/** 构造合法（或指定破坏 CRC 的）hex 首帧：type=ZRINIT(0x01)/ZRQINIT(0x00)。 */
+function hexFirstFrame(type: number, corruptCrc = false): number[] {
+  // 能力位（ZF3=0x03 = CANFDX|CANOVIO）：zmodem.js 的 Send 会话构造校验
+  // 全双工/重叠 IO，缺位会直接 throw（lrzsz 真机帧亦带这两个能力位）。
+  const raw = [type, 0x00, 0x00, 0x00, 0x03];
+  let crc = zmodemCrc16(raw);
+  if (corruptCrc) crc ^= 0xffff;
+  // CRC 拆高/低两字节再转 hex（合成一个数字会丢前导零 → 奇数位 hex 解析 NaN）。
+  const hex = [...raw, (crc >> 8) & 0xff, crc & 0xff].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  const bytes: number[] = [0x2a, 0x2a, 0x18, 0x42]; // ** CAN B
+  for (const char of hex) bytes.push(char.charCodeAt(0));
+  // lrzsz 的 hex 帧以 CR LF 结尾（帧解析以此定界）。
+  bytes.push(0x0d, 0x0a);
+  return bytes;
+}
+
+describe("hex ZRINIT detection (classic lrzsz rz, issue #171)", () => {
+  function makeSentry() {
+    const onDetect = vi.fn();
+    const handlers: ZmodemSentryHandlers = {
+      send: vi.fn(),
+      toTerminal: vi.fn(),
+      onDetect,
+      onRetract: vi.fn(),
+    };
+    return { onDetect, handlers, sentry: createZmodemSentry(handlers) };
+  }
+
+  it("detects a real lrzsz rz handshake (hex ZRINIT) as a send-role session", () => {
+    const { onDetect, handlers, sentry } = makeSentry();
+    // rz 打印横幅后紧跟 hex ZRINIT（同一帧切片内到达）。
+    const banner = [...new TextEncoder().encode("rz\r\nrz waiting to receive.\r\n")];
+    sentry.consume(new Uint8Array([...banner, ...hexFirstFrame(0x01)]).buffer);
+    expect(handlers.onDetect).toHaveBeenCalledTimes(1);
+    const detection = onDetect.mock.calls[0][0] as { get_session_role(): string };
+    expect(detection.get_session_role()).toBe("send");
+  });
+
+  it("detects across fragmented chunks (header split over consecutive frames)", () => {
+    const { handlers, sentry } = makeSentry();
+    const frame = [...hexFirstFrame(0x01)];
+    sentry.consume(new Uint8Array([0x2a, 0x2a, 0x18]).buffer);
+    sentry.consume(new Uint8Array(frame.slice(3)).buffer);
+    expect(handlers.onDetect).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not detect a corrupted-CRC hex frame (宁漏勿误)", () => {
+    const { handlers, sentry } = makeSentry();
+    sentry.consume(new Uint8Array(hexFirstFrame(0x01, true)).buffer);
+    expect(handlers.onDetect).not.toHaveBeenCalled();
+  });
+
+  it("does not detect ordinary text that merely contains the ** prefix", () => {
+    const { handlers, sentry } = makeSentry();
+    const text = [...new TextEncoder().encode("echo '**\x18B0' && ls -la\r\n** random hex 0123456789abcdef\r\n")];
+    sentry.consume(new Uint8Array(text).buffer);
+    expect(handlers.onDetect).not.toHaveBeenCalled();
+  });
+
+  it("keeps the sz direction working: hex ZRQINIT detects as a receive-role session", () => {
+    const { onDetect, handlers, sentry } = makeSentry();
+    sentry.consume(new Uint8Array(hexFirstFrame(0x00)).buffer);
+    expect(handlers.onDetect).toHaveBeenCalledTimes(1);
+    const detection = onDetect.mock.calls[0][0] as { get_session_role(): string };
+    expect(detection.get_session_role()).toBe("receive");
   });
 });

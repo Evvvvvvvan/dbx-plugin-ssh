@@ -31,16 +31,25 @@ const ZMODEM_CHUNK_SIZE = 64 * 1024;
  */
 export type ZmodemDetectionDecision =
   | { action: "confirm"; role: "send" | "receive" }
+  | { action: "prompt-upload" }
   | { action: "deny"; reason: "uploadPending" | "roleMismatch" };
 
 export function decideZmodemDetection(
   detection: { get_session_role(): string },
   pendingUploadFiles: boolean,
   receiveAllowed = true,
+  options: { promptPeerRz?: boolean } = {},
 ): ZmodemDetectionDecision {
   const role = detection.get_session_role();
   if (role === "send") {
-    return pendingUploadFiles ? { action: "confirm", role } : { action: "deny", reason: "roleMismatch" };
+    if (pendingUploadFiles) return { action: "confirm", role };
+    // 经典 lrzsz rz（用户在远端手敲 rz，issue #171）：send 角色检测携带的是
+    // 完整 hex ZRINIT——机器生成且经 zmodem.js 帧解析 + CRC16 校验才走到这，
+    // 自然文本误中需要刻意构造。提示式接管：不自动弹窗、不自动占线，用户
+    // 选择参与才 confirm；超时/取消一律 deny（远端干净退出）。关闭提示时
+    // 维持既有语义（deny = 发 abort 序列让对端结束）。
+    if (options.promptPeerRz) return { action: "prompt-upload" };
+    return { action: "deny", reason: "roleMismatch" };
   }
   if (pendingUploadFiles) return { action: "deny", reason: "uploadPending" };
   if (role === "receive" && receiveAllowed) return { action: "confirm", role };

@@ -28,6 +28,11 @@ export function useZmodem(options: {
   loadDirectory: (path?: string) => Promise<void>;
   /** trzsz 持流时拒绝接收（deny 走 abort 序列，远端干净退出）。 */
   receiveAllowed: () => boolean;
+  /** 经典 rz 提示（issue #171）：用户点「选择文件上传」后打开文件选择器
+   *  （必须在用户手势内调用——宿主 webview 拦截非手势的程序化 click）。 */
+  pickUploadFiles: () => void;
+  /** 经典 rz 提示取消/超时后收起提示横幅。 */
+  dismissNotice: () => void;
   probeLocalCapabilities: () => Promise<{ canSaveLocal: boolean; downloadsDir: string } | undefined>;
   saveHostFile: (chunks: Uint8Array[], fileName: string) => Promise<void>;
   loadDownloadUseDefaultDir: () => boolean;
@@ -37,9 +42,14 @@ export function useZmodem(options: {
   applyChosenDirAsDefault: (dir: string) => void;
   revealTransferTarget: (path: string) => Promise<void>;
 }) {
-  const { t, showNotice, showError, connected, terminal: terminalGet, sendTerminalBytes, dispatchTerminalOutput, loadDirectory, receiveAllowed, probeLocalCapabilities, saveHostFile, loadDownloadUseDefaultDir, askDownloadTarget, loadDownloadDir, resolveDownloadConflictFor, applyChosenDirAsDefault, revealTransferTarget } = options;
+  const { t, showNotice, showError, connected, terminal: terminalGet, sendTerminalBytes, dispatchTerminalOutput, loadDirectory, receiveAllowed, pickUploadFiles, dismissNotice, probeLocalCapabilities, saveHostFile, loadDownloadUseDefaultDir, askDownloadTarget, loadDownloadDir, resolveDownloadConflictFor, applyChosenDirAsDefault, revealTransferTarget } = options;
 
 const ZMODEM_DETECTION_TIMEOUT_MS = 5000;
+// 经典 rz 提示窗（issue #171）：lrzsz rz 等 ZRINIT 应答约 40s，但会先降级
+// 重发（4 次）再退回 "C"（X/YMODEM 试探）；10s 内不参与就 deny，宁漏勿占。
+const ZMODEM_RZ_PROMPT_TIMEOUT_MS = 10000;
+// 提示期间挂起的检测：rz 重发的 ZRINIT 会再触发 on_detect，挂起即可去重。
+let promptedZmodemDetection: ZmodemDetection | undefined;
 
 const zmodemState = ref<"idle" | "waiting" | "uploading" | "receiving">("idle");
 const zmodemFileName = ref("");
@@ -94,27 +104,46 @@ function resetZmodemSentry() {
 }
 
 function handleZmodemDetection(detection: ZmodemDetection) {
-  const decision = decideZmodemDetection(detection, pendingZmodemFiles.length > 0, receiveAllowed());
+  // 提示挂起期间 rz 会重发 ZRINIT（keep-alive）：静默忽略重复检测，
+  // 不重置提示计时、不叠加横幅。
+  if (promptedZmodemDetection) return;
+  const decision = decideZmodemDetection(detection, pendingZmodemFiles.length > 0, receiveAllowed(), { promptPeerRz: true });
+  if (decision.action === "prompt-upload") {
+    enterZmodemRzPrompt(detection);
+    return;
+  }
   if (decision.action === "deny") {
     detection.deny();
     if (decision.reason === "uploadPending") finishZmodemUpload(new Error(t("zmodemUploadInterrupted")));
     return;
   }
+  if (decision.role === "receive") {
+    window.clearTimeout(zmodemDetectionTimer);
+    try {
+      zmodemSession = detection.confirm();
+    } catch (cause) {
+      finishZmodemUpload(cause);
+      return;
+    }
+    startZmodemReceive(zmodemSession);
+    return;
+  }
+  window.clearTimeout(zmodemDetectionTimer);
+  beginZmodemSendSession(detection, pendingZmodemFiles);
+}
+
+/** 发送会话公共入口（菜单上传与经典 rz 提示共用）：confirm 检测、进入
+ * uploading 态、泵文件；失败统一 finishZmodemUpload 收尾。 */
+function beginZmodemSendSession(detection: ZmodemDetection, files: File[]) {
   try {
     zmodemSession = detection.confirm();
   } catch (cause) {
     finishZmodemUpload(cause);
     return;
   }
-  window.clearTimeout(zmodemDetectionTimer);
-  if (decision.role === "receive") {
-    startZmodemReceive(zmodemSession);
-    return;
-  }
   zmodemState.value = "uploading";
   zmodemSampledAt = performance.now();
   zmodemSampledBytes = 0;
-  const files = pendingZmodemFiles;
   void sendZmodemFiles(zmodemSession, files, updateZmodemProgress)
     .then(() => {
       showNotice(t("zmodemUploadComplete", { count: files.length }));
@@ -122,6 +151,35 @@ function handleZmodemDetection(detection: ZmodemDetection) {
       void loadDirectory();
     })
     .catch(finishZmodemUpload);
+}
+
+/** 经典 rz 提示（issue #171）：远端手敲 rz 等待接收。非阻塞横幅给两个
+ *  动作（选择文件 / 取消）；确认前不接管任何字节——普通输出照常上屏，
+ *  超时/取消 deny（abort 序列），远端 rz 自行退出。 */
+function enterZmodemRzPrompt(detection: ZmodemDetection) {
+  promptedZmodemDetection = detection;
+  zmodemState.value = "waiting";
+  zmodemFileName.value = "";
+  zmodemTransferred.value = 0;
+  zmodemTotalSize.value = 0;
+  window.clearTimeout(zmodemDetectionTimer);
+  zmodemDetectionTimer = window.setTimeout(() => cancelZmodemRzPrompt(), ZMODEM_RZ_PROMPT_TIMEOUT_MS);
+  showNotice(t("zmodemRzPrompt"), [
+    { label: t("zmodemRzPick"), run: () => pickUploadFiles() },
+    { label: t("cancel"), run: () => cancelZmodemRzPrompt() },
+  ]);
+}
+
+/** 收尾提示路径：deny 检测（abort 序列让远端 rz 退出）、清挂起引用、
+ *  复位状态并收起横幅。菜单上传路径不经此（finishZmodemUpload 负责）。 */
+function cancelZmodemRzPrompt() {
+  const detection = promptedZmodemDetection;
+  promptedZmodemDetection = undefined;
+  window.clearTimeout(zmodemDetectionTimer);
+  try { detection?.deny(); } catch { /* 会话已消失：忽略 */ }
+  zmodemState.value = "idle";
+  zmodemFileName.value = "";
+  dismissNotice();
 }
 
 function updateZmodemProgress(progress: ZmodemUploadProgress) {
@@ -170,6 +228,7 @@ function finishZmodemUpload(cause?: unknown) {
  * input routed into a dead sentry.
  */
 function cancelZmodemUpload() {
+  promptedZmodemDetection = undefined;
   window.clearTimeout(zmodemDetectionTimer);
   if (zmodemSession && !zmodemSession.has_ended()) {
     try { zmodemSession.abort(); } catch {}
@@ -191,6 +250,18 @@ function onZmodemInput(event: Event) {
   const files = Array.from(input.files || []);
   input.value = "";
   if (!files.length || !connected.value) return;
+  const prompted = promptedZmodemDetection;
+  if (prompted) {
+    // 经典 rz 提示路径：文件已选定，确认挂起的检测直接开传（远端 rz 已在
+    // 等待，不再回发 rz\r）。
+    promptedZmodemDetection = undefined;
+    window.clearTimeout(zmodemDetectionTimer);
+    pendingZmodemFiles = files;
+    zmodemFileName.value = files[0]?.name || "";
+    zmodemTotalSize.value = files.reduce((sum, file) => sum + file.size, 0);
+    beginZmodemSendSession(prompted, files);
+    return;
+  }
   pendingZmodemFiles = files;
   zmodemState.value = "waiting";
   zmodemFileName.value = files[0]?.name || "";

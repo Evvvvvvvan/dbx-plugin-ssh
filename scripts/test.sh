@@ -34,7 +34,12 @@ node scripts/connection-forms/verify.mjs
 # 方法注册四路比对（backend 分派 ↔ mock 桩 ↔ 前端 invoke ↔ PROTOCOL 文档）：
 # 分派臂/桩/调用点三方不一致是硬门禁，文档滞后 report-only。
 node scripts/mock_host_registry_check.mjs
-cargo test --manifest-path backend/Cargo.toml
+# 单测密闭：宿主桥端口读 DBX_APP_DATA_DIR/mcp-bridge-port，未设时回落真实
+# app 数据目录——开发机上 DBX 运行中会让 read_only 稳定性等用例读到真实连接
+# （首次命中/二次抖动即漂移），甚至经 ensure_app_bridge 的 open -a 兜底拉起
+# DBX。钉到一次性空目录（与 CI 无运行 DBX 同态），启动命令置 no-op。
+DBX_APP_DATA_DIR="$DBX_PLUGIN_DATA_DIR" DBX_APP_LAUNCH_CMD="true" \
+  cargo test --manifest-path backend/Cargo.toml
 
 echo "==> dead-code warning gate"
 # 未接线的功能会先以 dead_code 警告形态暴露（案例：remembered 审批 /

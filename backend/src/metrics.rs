@@ -173,61 +173,6 @@ async fn merge_accelerator_sections(handle: &Handle<SshClient>, metrics: &mut se
     }
 }
 
-/// Top-level section names of the metrics document, used by the MCP
-/// `ssh_metrics` tool's optional `sections` projection so agents can pull
-/// just the slice they need instead of the full document. Keep in sync with
-/// what [`collect_metrics`] / [`parse_metrics_output`] actually emit.
-pub const METRICS_SECTIONS: &[&str] = &[
-    "hostname",
-    "kernel",
-    "uptimeSeconds",
-    "cpu",
-    "memory",
-    "disks",
-    "network",
-    "processes",
-    "topMemory",
-    "osId",
-    "osPretty",
-    // Accelerator overviews (IMPL_PLAN Task P1-4); emitted by
-    // [`collect_metrics`] whenever the sidecar runs, `available: false` on
-    // hosts without NVIDIA / Ascend hardware.
-    "gpu",
-    "npu",
-];
-
-/// Validates requested section names against the known universe. Unknown
-/// names fail fast with the valid list in the error (matching the tool
-/// layer's typo-guidance style) so a typo cannot silently return a
-/// near-empty document.
-pub fn validate_section_names(requested: &[String]) -> Result<(), String> {
-    for name in requested {
-        if !METRICS_SECTIONS.contains(&name.as_str()) {
-            return Err(format!(
-                "Unknown section: '{}'. Valid sections: {}",
-                name,
-                METRICS_SECTIONS.join(", ")
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Projects the metrics document onto the requested top-level sections.
-/// Known-but-absent names (e.g. `osId` on hosts with no readable
-/// os-release) are simply omitted. Pure so it is unit-testable without a
-/// server.
-pub fn project_metrics_sections(
-    metrics: &mut serde_json::Value,
-    requested: &[String],
-) -> Result<(), String> {
-    validate_section_names(requested)?;
-    if let Some(object) = metrics.as_object_mut() {
-        object.retain(|key, _| requested.iter().any(|name| name == key));
-    }
-    Ok(())
-}
-
 /// Parses the collector output into the metrics JSON object: the base
 /// CPU/memory/disk document plus the `network`, `processes`, `topMemory` and
 /// per-disk `inodeUsePercent` extensions. Pure so it can be unit-tested
@@ -1450,54 +1395,5 @@ bad line here
         assert!(kill_command(1234, 19).is_err());
     }
 
-    #[test]
-    fn section_projection_keeps_only_requested_keys() {
-        let mut doc = parse_metrics_output(LINUX_FIXTURE);
-        assert!(doc.as_object().unwrap().contains_key("network"));
-        project_metrics_sections(&mut doc, &["cpu".to_string(), "memory".to_string()]).unwrap();
-        let keys: Vec<&str> = doc
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(keys, vec!["cpu", "memory"]);
-    }
-
-    #[test]
-    fn section_projection_rejects_unknown_and_tolerates_absent() {
-        let mut doc = parse_metrics_output(LINUX_FIXTURE);
-        // 未知段名 fail-fast 并列出合法段。
-        let error = project_metrics_sections(&mut doc, &["memry".to_string()]).unwrap_err();
-        assert!(error.contains("Unknown section: 'memry'"), "{error}");
-        assert!(error.contains("topMemory"), "{error}");
-        // 原文档未被错误路径破坏。
-        assert!(doc.as_object().unwrap().len() > 3);
-        // 合法但该主机缺失的段（如 osId）静默省略，不算错。
-        project_metrics_sections(&mut doc, &["osId".to_string(), "cpu".to_string()]).unwrap();
-        assert!(doc.as_object().unwrap().contains_key("cpu"));
-    }
-
     // —— GPU / NPU sections（Task P1-4）——————————————————
-
-    #[test]
-    fn gpu_and_npu_sections_validate_and_project() {
-        // 白名单校验放行新段（MCP ssh_metrics 的 sections 枚举同步受益）。
-        validate_section_names(&["gpu".to_string(), "npu".to_string()]).unwrap();
-        let mut doc = parse_metrics_output(LINUX_FIXTURE);
-        if let Some(object) = doc.as_object_mut() {
-            object.insert(
-                "gpu".to_string(),
-                serde_json::json!({ "available": false, "gpus": [] }),
-            );
-        }
-        project_metrics_sections(&mut doc, &["gpu".to_string()]).unwrap();
-        let keys: Vec<&str> = doc
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(keys, vec!["gpu"]);
-    }
 }

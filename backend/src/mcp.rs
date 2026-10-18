@@ -23,10 +23,8 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 use crate::agent_approvals;
 use crate::agent_terminal::{self, AgentTerminalMode};
-use crate::alert_triage;
 use crate::app_bridge;
 use crate::audit_log;
-use crate::docker;
 use crate::exec::{self, AuthFlowMode, Hints, SudoAuth};
 use crate::host_key::HostKeyVerifier;
 use crate::mcp_safety::{self, CommandRisk};
@@ -35,12 +33,10 @@ use crate::model::{
 };
 use crate::multi_exec;
 use crate::preferences;
-use crate::sftp_copy;
 use crate::sftp_name;
 use crate::sftp_raw;
 use crate::ssh::{
-    classify_raw_kind, raw_delete_tree, RawSftpClient, SshClient, SshRuntime,
-    NO_TERMINAL_SESSION_MESSAGE,
+    classify_raw_kind, RawSftpClient, SshClient, SshRuntime, NO_TERMINAL_SESSION_MESSAGE,
 };
 use crate::sudo_allowlist;
 use crate::sudo_profiles;
@@ -340,16 +336,14 @@ pub fn scope_allows(scope: &[String], id: &str, name: Option<&str>, host: &str) 
 }
 
 /// Confirm-mode gate set (§1.3): write tools plus the exec family.
-/// Read-only tools and `ssh_close` are never intercepted. `docker_action` is
-/// intentionally structured; the frontend shows its canonical command but
-/// keeps that confirmation field read-only, unlike ordinary SSH commands.
+/// Read-only tools and `ssh_close` are never intercepted.
 fn is_confirm_gated_tool(name: &str) -> bool {
     is_write_tool(name) || matches!(name, "ssh_exec" | "ssh_multi_exec" | "ssh_terminal_input")
 }
 
 /// Tools whose resolved target must sit inside a non-empty
-/// `connectionScope` (§1.3). Local/offline tools (known-hosts management,
-/// Quick Sudo profiles, alert triage, the list tool itself) stay outside.
+/// `connectionScope` (§1.3). Local tools (known-hosts management, the list
+/// tool itself) stay outside.
 fn is_connection_scoped_tool(name: &str) -> bool {
     if is_confirm_gated_tool(name) {
         return true;
@@ -357,26 +351,13 @@ fn is_connection_scoped_tool(name: &str) -> bool {
     matches!(
         name,
         "ssh_task_status"
-            | "ssh_metrics"
-            | "docker_list"
-            | "docker_action"
-            | "ssh_test_connection"
             | "ssh_close"
             | "sftp_list_dir"
             | "sftp_stat"
-            | "sftp_exists"
-            | "sftp_pwd"
             | "sftp_read_file"
             | "sftp_write_file"
             | "sftp_upload"
             | "sftp_download"
-            | "sftp_mkdir"
-            | "sftp_remove"
-            | "sftp_rename"
-            | "sftp_chmod"
-            | "sftp_disk_usage"
-            | "sftp_copy"
-            | "sftp_move"
     )
 }
 
@@ -1164,37 +1145,13 @@ impl McpState {
             } else {
                 "command"
             };
-            // docker_action carries no `command` argument: derive the exact
-            // approval text (`docker rm <id>`, or the configured container
-            // CLI for podman/custom daemons) from the validated action so
-            // the dialog shows precisely what will run, and a malformed
-            // id/action/engine parameter fails here instead of after
-            // approval.
-            let command: String = if name == "docker_action" {
-                let container_id = required_str(arguments, "containerId")?;
-                docker::validate_container_id(container_id)?;
-                let action = docker::parse_action(required_str(arguments, "action")?)?;
-                let engine = docker::parse_engine(arguments)?;
-                docker::action_command(&engine, action, container_id)
-            } else {
-                required_str(arguments, command_key)?.to_string()
-            };
+            let command: String = required_str(arguments, command_key)?.to_string();
             let connection_id = arguments.get("connectionId").and_then(Value::as_str);
             let approved = self
                 .runtime
                 .request_mcp_confirm(name, &command, connection_id, emitter)
                 .await?;
-            // docker_action is intentionally structured: its canonical text
-            // is evidence for the action/container pair, not an alternate
-            // shell input. Refuse edits instead of displaying one action and
-            // executing another.
-            if name == "docker_action" && approved != command {
-                return Err(
-                    "Docker action confirmation text is not editable; approve the displayed canonical command or cancel"
-                        .to_string(),
-                );
-            }
-            // Other command-based tools retain the existing editable approval
+            // Command-based tools retain the existing editable approval
             // contract: the approved text replaces the original execution
             // input.
             if approved != command {
@@ -1536,71 +1493,6 @@ impl McpState {
             // blanket cleanup below.
             "sftp_upload" => self.sftp_upload_tool(arguments).await,
             "sftp_download" => self.sftp_download_tool(arguments).await,
-            // Global Quick Sudo profile management: local config reads and
-            // writes through the shared runtime store (not remote writes, so
-            // these stay outside the read-only tool gate).
-            "ssh_quick_sudo_profiles_list" => Ok(self.runtime.profiles_list()),
-            "ssh_quick_sudo_profiles_save" => self.runtime.profiles_save(arguments).await,
-            "ssh_quick_sudo_profiles_delete" => {
-                let id = required_str(arguments, "id")?;
-                self.runtime.profiles_delete(id).await
-            }
-            "ssh_test_connection" => {
-                // Saved-connection addressing first: a registry reference
-                // (embedded bridge or a normalized stdio call) dials with the
-                // stored credentials; inline credentials stay the fallback
-                // for standalone --mcp sessions. An unregistered stdio
-                // reference never reaches here — it is forwarded through the
-                // app bridge (is_connection_bound_tool) before this arm runs.
-                let connection = match self.registered_connection_by_ref(arguments).await? {
-                    Some(connection) => connection,
-                    None => stored_connection_from_arguments(arguments).map_err(|error| {
-                        // A reference the local session cannot resolve (no
-                        // registry entry, bridge down) must keep the self-heal
-                        // path visible instead of the bare "missing host".
-                        let has_reference = non_empty_argument(arguments, "connectionId").is_some()
-                            || non_empty_argument(arguments, "connectionName").is_some()
-                            || endpoint_selector(arguments).is_some();
-                        if has_reference {
-                            format!(
-                                "{error}. The saved connection could not be resolved in this \
-                                 session: start the DBX app (its sidecar holds the credentials), \
-                                 list saved connections with ssh_list_connections, or provide \
-                                 inline credentials (host/username plus password or \
-                                 privateKeyPath/privateKeyContent)."
-                            )
-                        } else {
-                            error
-                        }
-                    })?,
-                };
-                let started = std::time::Instant::now();
-                let (handle, jumps) = self.runtime.connect_headless(&connection).await?;
-                let latency_ms = started.elapsed().as_millis() as u64;
-                let _ = handle
-                    .disconnect(
-                        russh::Disconnect::ByApplication,
-                        "MCP connection test complete",
-                        "English",
-                    )
-                    .await;
-                for jump in jumps {
-                    let _ = jump
-                        .disconnect(
-                            russh::Disconnect::ByApplication,
-                            "MCP jump connection closed",
-                            "English",
-                        )
-                        .await;
-                }
-                Ok(json!({
-                    "ok": true,
-                    "host": connection.host,
-                    "port": connection.port,
-                    "username": connection.username,
-                    "latencyMs": latency_ms,
-                }))
-            }
             "ssh_list_known_hosts" => {
                 let verifier = HostKeyVerifier::new(self.runtime.known_hosts_path());
                 let entries: Vec<Value> = verifier
@@ -1625,13 +1517,6 @@ impl McpState {
                 let removed = verifier.remove_known_host(host, port)?;
                 Ok(json!({ "host": host, "port": port, "removed": removed }))
             }
-            "ssh_alert_triage" => {
-                // Offline intent recognition: the raw alert payload is
-                // normalized and classified without any SSH I/O, so the
-                // playbook can run before an operator even picks a host.
-                let payload = required_str(arguments, "payload")?;
-                Ok(alert_triage::triage_view(&alert_triage::triage(payload)))
-            }
             _ => {
                 let mut result = match name {
                     "ssh_exec" | "ssh_exec_sudo" => {
@@ -1641,92 +1526,6 @@ impl McpState {
                     "ssh_terminal_input" => self.ssh_terminal_input_tool(arguments).await,
                     "ssh_multi_exec" => self.ssh_multi_exec_tool(arguments).await,
                     "ssh_task_status" => self.ssh_task_status_tool(arguments).await,
-                    "ssh_metrics" => {
-                        // Section names are validated before dialing so a
-                        // typo fails fast without a connection round-trip.
-                        let sections = metrics_sections(arguments)?;
-                        let connection = self.connection(arguments).await?;
-                        let mut metrics = exec::collect_metrics(&connection).await?;
-                        if let Some(sections) = &sections {
-                            exec::project_metrics_sections(&mut metrics, sections)?;
-                        }
-                        Ok(metrics)
-                    }
-                    "sftp_disk_usage" => {
-                        // M25：与工作台 sftp_disk_usage 同口径——远端路径
-                        // 组件归一后再进 shell 命令（df -kP）。
-                        let path = normalize_remote_path(required_str(arguments, "path")?)?;
-                        let connection = self.connection(arguments).await?;
-                        let command = format!("df -kP {}", exec::shell_quote(&path));
-                        // Plugin-internal plumbing: no client setEnv, keeping
-                        // the df output parseable regardless of locale overrides.
-                        let outcome =
-                            exec::exec_plain(&connection, &command, Duration::from_secs(20), &[])
-                                .await?;
-                        exec::parse_disk_usage(&outcome.output).ok_or_else(|| {
-                            format!("Could not parse disk usage: {}", outcome.output)
-                        })
-                    }
-                    "docker_list" => {
-                        // target:"local" queries the daemon on the machine
-                        // the sidecar runs on — no connection to resolve.
-                        // Otherwise read-only collection on the pooled
-                        // connection; the probe degrades to available:false
-                        // instead of erroring. Optional cli/socket/host
-                        // parameters retarget Podman or a custom daemon.
-                        let engine = docker::parse_engine(arguments)?;
-                        if docker::parse_target(arguments)? == docker::DockerTarget::Local {
-                            docker::collect_list_local(&engine).await
-                        } else {
-                            let connection = self.connection(arguments).await?;
-                            // Quick Sudo credentials resolve from local
-                            // sources only; resolution failure degrades to
-                            // None and the collector keeps the needsSudo
-                            // hint instead of elevating.
-                            let stored = self
-                                .registered_connection_by_ref(arguments)
-                                .await
-                                .ok()
-                                .flatten();
-                            let sudo_auth =
-                                self.resolve_sudo_auth(arguments, None, stored).await.ok();
-                            docker::collect_list(&connection, sudo_auth.as_ref(), &engine).await
-                        }
-                    }
-                    "docker_action" => {
-                        // Validation before any connection I/O (same
-                        // fail-fast shape as metrics_sections).
-                        let container_id = required_str(arguments, "containerId")?;
-                        docker::validate_container_id(container_id)?;
-                        let action = docker::parse_action(required_str(arguments, "action")?)?;
-                        let engine = docker::parse_engine(arguments)?;
-                        if docker::parse_target(arguments)? == docker::DockerTarget::Local {
-                            docker::perform_action_local(&engine, container_id, action).await
-                        } else {
-                            let connection = self.connection(arguments).await?;
-                            // Quick Sudo credentials resolve up front from local
-                            // sources only (registry + profile store); a resolution
-                            // failure degrades to None and the fallback surfaces
-                            // the configuration guidance. No password argument
-                            // exists on this tool by contract.
-                            let stored = self
-                                .registered_connection_by_ref(arguments)
-                                .await
-                                .ok()
-                                .flatten();
-                            let sudo_auth =
-                                self.resolve_sudo_auth(arguments, None, stored).await.ok();
-                            docker::perform_action(
-                                &connection,
-                                sudo_auth.as_ref(),
-                                false,
-                                &engine,
-                                container_id,
-                                action,
-                            )
-                            .await
-                        }
-                    }
                     other => self.sftp_tool(other, arguments).await,
                 };
                 if result.is_err() {
@@ -2604,46 +2403,6 @@ impl McpState {
                     "gid": metadata.gid,
                 }))
             }
-            "sftp_exists" => {
-                // M25：组件归一，与工作台 sftp/exists 同口径。
-                let path = normalize_remote_path(required_str(arguments, "path")?)?;
-                if encoding == sftp_name::NameEncoding::Latin1 {
-                    // latin-1（M18）：裸包 LSTAT，只认 NO_SUCH_FILE 为
-                    // 「不存在」，其余错误如实上抛。仅裸包客户端建立失败回退
-                    // 高层（M17-B 写工具同策略）。
-                    match open_raw_sftp(&handle).await {
-                        Ok(mut client) => {
-                            let exists = raw_sftp_exists(&mut client, &path).await?;
-                            return Ok(json!({ "path": path, "exists": exists }));
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "[ssh] MCP sftp_exists: raw byte client unavailable, falling back: {error}"
-                            );
-                        }
-                    }
-                }
-                let sftp = sftp_bind(&sftp_ready_error)?;
-                // Only "no such file" means absent: a permission error or a
-                // dead channel must surface as an error, never as a
-                // misleading `exists: false`.
-                let exists = match sftp.lock().await.metadata(&path).await {
-                    Ok(_) => true,
-                    Err(error) if is_no_such_file_error(&error) => false,
-                    Err(error) => return Err(sftp_error(error)),
-                };
-                Ok(json!({ "path": path, "exists": exists }))
-            }
-            "sftp_pwd" => {
-                let sftp = sftp_bind(&sftp_ready_error)?;
-                let home = sftp
-                    .lock()
-                    .await
-                    .canonicalize(".")
-                    .await
-                    .map_err(sftp_error)?;
-                Ok(json!({ "home": home }))
-            }
             "sftp_read_file" => {
                 // M25：组件归一，与工作台读取族同口径。
                 let path = normalize_remote_path(required_str(arguments, "path")?)?;
@@ -2754,204 +2513,6 @@ impl McpState {
                     .await
                     .map_err(|error| format!("SFTP write flush failed: {error}"))?;
                 Ok(json!({ "path": path, "bytes": content.len() }))
-            }
-            "sftp_mkdir" => {
-                // M25：组件归一，与工作台 sftp_create_directory 同口径。
-                let path = normalize_remote_path(required_str(arguments, "path")?)?;
-                if encoding == sftp_name::NameEncoding::Latin1 {
-                    // latin-1（M17）：显示路径整条按 latin1_encode_display 还原
-                    // 字节后走裸包 MKDIR。仅裸包通道建立失败回退高层（建立阶段
-                    // 尚未发出任何请求，回退不会重复执行）；操作错误原样上抛，
-                    // 不回退（与工作台 sftp_create_directory 同策略）。
-                    match open_raw_sftp(&handle).await {
-                        Ok(mut client) => {
-                            client
-                                .mkdir(&sftp_name::latin1_encode_display(&path))
-                                .await?;
-                            return Ok(json!({ "path": path, "created": true }));
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "[ssh] MCP sftp_mkdir: raw byte client unavailable, falling back: {error}"
-                            );
-                        }
-                    }
-                }
-                let sftp = sftp_bind(&sftp_ready_error)?;
-                sftp.lock()
-                    .await
-                    .create_dir(&path)
-                    .await
-                    .map_err(sftp_error)?;
-                Ok(json!({ "path": path, "created": true }))
-            }
-            "sftp_remove" => {
-                // M25：组件归一，与工作台删除族同口径。
-                let path = normalize_remote_path(required_str(arguments, "path")?)?;
-                if path == "/" {
-                    return Err("Refusing to delete the filesystem root".to_string());
-                }
-                let recursive = arg_bool(arguments, "recursive")?.unwrap_or(false);
-                if encoding == sftp_name::NameEncoding::Latin1 {
-                    // latin-1（M17）：显示路径还原字节后走裸包删除。LSTAT 判型
-                    // 分派与高层分支一致（symlink/文件 REMOVE、目录递归树删、
-                    // 非递归目录报错），符号链接绝不跟随。回退策略同 mkdir。
-                    match open_raw_sftp(&handle).await {
-                        Ok(mut client) => {
-                            let raw_path = sftp_name::latin1_encode_display(&path);
-                            let attrs = client.lstat(&raw_path).await?;
-                            if classify_raw_kind(attrs.permissions) == "directory" {
-                                if !recursive {
-                                    return Err(format!(
-                                        "{path} is a directory; pass recursive=true"
-                                    ));
-                                }
-                                raw_delete_tree(&mut client, &raw_path).await?;
-                            } else {
-                                client.remove(&raw_path).await?;
-                            }
-                            return Ok(json!({ "path": path, "removed": true }));
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "[ssh] MCP sftp_remove: raw byte client unavailable, falling back: {error}"
-                            );
-                        }
-                    }
-                }
-                let sftp = sftp_bind(&sftp_ready_error)?;
-                let metadata = sftp
-                    .lock()
-                    .await
-                    .symlink_metadata(&path)
-                    .await
-                    .map_err(sftp_error)?;
-                if metadata.is_symlink() || !metadata.is_dir() {
-                    sftp.lock()
-                        .await
-                        .remove_file(&path)
-                        .await
-                        .map_err(sftp_error)?;
-                } else if recursive {
-                    remove_tree(&sftp, path.clone()).await?;
-                } else {
-                    return Err(format!("{path} is a directory; pass recursive=true"));
-                }
-                Ok(json!({ "path": path, "removed": true }))
-            }
-            "sftp_rename" => {
-                // M25：源与目标都是远端路径，都要组件归一（M24 前例：
-                // raw_read_chunk 同期在两条车道拉齐了同一口径）。
-                let source = normalize_remote_path(required_str(arguments, "sourcePath")?)?;
-                let target = normalize_remote_path(required_str(arguments, "targetPath")?)?;
-                if encoding == sftp_name::NameEncoding::Latin1 {
-                    // latin-1（M17）：源是列表回传的显示路径（latin1_encode_
-                    // display 精确逆变换还原字节），目标是 AI 新输入/组合的
-                    // 显示文本（latin-1 域内字符映回同值字节，域外 UTF-8 兜底，
-                    // 与工作台新输入语义一致）。裸包 RENAME 保证改名不破坏
-                    // 非 UTF-8 字节。回退策略同 mkdir。
-                    match open_raw_sftp(&handle).await {
-                        Ok(mut client) => {
-                            client
-                                .rename(
-                                    &sftp_name::latin1_encode_display(&source),
-                                    &sftp_name::latin1_encode_display(&target),
-                                )
-                                .await?;
-                            return Ok(json!({
-                                "sourcePath": source,
-                                "targetPath": target,
-                                "renamed": true,
-                            }));
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "[ssh] MCP sftp_rename: raw byte client unavailable, falling back: {error}"
-                            );
-                        }
-                    }
-                }
-                let sftp = sftp_bind(&sftp_ready_error)?;
-                sftp.lock()
-                    .await
-                    .rename(&source, &target)
-                    .await
-                    .map_err(sftp_error)?;
-                Ok(json!({ "sourcePath": source, "targetPath": target, "renamed": true }))
-            }
-            "sftp_chmod" => {
-                // M25：组件归一，与工作台 chmod 同口径。
-                let path = normalize_remote_path(required_str(arguments, "path")?)?;
-                let mode = arguments.get("mode").ok_or_else(|| {
-                    "Missing or invalid parameter: mode (expected an octal value up to 7777, \
-                     e.g. \"644\" or 0644)"
-                        .to_string()
-                })?;
-                let mode = parse_chmod_mode(mode)?;
-                if encoding == sftp_name::NameEncoding::Latin1 {
-                    // latin-1（M18）：显示路径还原字节后裸包 SETSTAT（只带
-                    // permissions 子集）。仅裸包客户端建立失败回退高层；操作
-                    // 错误原样上抛（与 M17-B 写工具同策略）。
-                    match open_raw_sftp(&handle).await {
-                        Ok(mut client) => {
-                            return raw_sftp_chmod(&mut client, &path, mode).await;
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "[ssh] MCP sftp_chmod: raw byte client unavailable, falling back: {error}"
-                            );
-                        }
-                    }
-                }
-                let sftp = sftp_bind(&sftp_ready_error)?;
-                let metadata = russh_sftp::protocol::FileAttributes {
-                    permissions: Some(mode),
-                    ..Default::default()
-                };
-                sftp.lock()
-                    .await
-                    .set_metadata(&path, metadata)
-                    .await
-                    .map_err(sftp_error)?;
-                Ok(json!({ "path": path, "mode": format!("{mode:04o}") }))
-            }
-            "sftp_copy" | "sftp_move" => {
-                let op = if name == "sftp_move" {
-                    sftp_copy::CopyOp::Move
-                } else {
-                    sftp_copy::CopyOp::Copy
-                };
-                let request = sftp_copy::parse_request(arguments)?;
-                // The SFTP channel only enables the rename fast path; its
-                // absence falls back to the shell for every item.
-                let sftp = sftp_ready.clone();
-                if sftp.is_none() {
-                    eprintln!(
-                        "[ssh] MCP {name}: SFTP channel unavailable ({sftp_ready_error}); shell fallback only"
-                    );
-                }
-                // latin-1（M18）：裸包客户端可用时，覆盖预检与同目录 move 的
-                // RENAME 快路径走字节保真（工作台 M17-A 同模式；路径口径为
-                // 显示形式）。执行层边界（登记，同工作台 M17-A）：远端
-                // `cp`/`mv` 的 exec 命令串是 UTF-8 String，服务器原始字节经
-                // shell 参数不可控，copy 与跨目录 move 的执行层保持字面量
-                // 发送（clean 名不受影响，非 ASCII 名由服务器侧报错）。
-                let raw = if encoding == sftp_name::NameEncoding::Latin1 {
-                    match open_raw_sftp(&handle).await {
-                        Ok(client) => Some(client),
-                        Err(error) => {
-                            eprintln!(
-                                "[ssh] MCP {name}: raw byte client unavailable, literal precheck fallback: {error}"
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                Ok(sftp_copy::execute(&handle, sftp, raw, op, &request)
-                    .await
-                    .into_json())
             }
             other => Err(format!("Unknown tool: {other}")),
         }
@@ -3465,43 +3026,6 @@ impl McpState {
     }
 }
 
-async fn remove_tree(sftp: &Arc<AsyncMutex<SftpSession>>, root: String) -> Result<(), String> {
-    // 与工作台删除族同源的根守卫：调用方已拒绝 "/"，此处兜底。
-    if root == "/" {
-        return Err("Refusing to recursively delete the filesystem root".to_string());
-    }
-    let mut pending = vec![root];
-    let mut directories = Vec::new();
-    while let Some(directory) = pending.pop() {
-        directories.push(directory.clone());
-        let entries = sftp
-            .lock()
-            .await
-            .read_dir(directory)
-            .await
-            .map_err(sftp_error)?;
-        for entry in entries {
-            if entry.file_type() == FileType::Dir {
-                pending.push(entry.path());
-            } else {
-                sftp.lock()
-                    .await
-                    .remove_file(entry.path())
-                    .await
-                    .map_err(sftp_error)?;
-            }
-        }
-    }
-    for directory in directories.into_iter().rev() {
-        sftp.lock()
-            .await
-            .remove_dir(directory)
-            .await
-            .map_err(sftp_error)?;
-    }
-    Ok(())
-}
-
 /// MCP 工具面的连接级文件名编码判定（M17）：arguments 携带的 connectionId
 /// （保存连接；dispatch 层已把 connectionName/端点选择器归一化为该字段）
 /// 命中 `sftp_name_encoding_overrides` 时优先，否则跟随全局
@@ -3581,22 +3105,6 @@ async fn lookup_remote_uid_gid(
         fields.next().and_then(|field| field.parse().ok()),
         fields.next().and_then(|field| field.parse().ok()),
     )
-}
-
-/// latin-1（M18）`sftp_exists` 裸包分支：裸包 LSTAT，只把
-/// SSH_FX_NO_SUCH_FILE 映射为「不存在」，其余错误如实上抛——与 auto 分支
-/// 「权限错误/死通道绝不误报 exists:false」的契约一致。
-async fn raw_sftp_exists<S>(client: &mut sftp_raw::RawSftp<S>, path: &str) -> Result<bool, String>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + std::marker::Unpin,
-{
-    match client.lstat(&sftp_name::latin1_encode_display(path)).await {
-        Ok(_) => Ok(true),
-        Err(error) => match sftp_raw::error_status(&error) {
-            Some(sftp_raw::SSH_FX_NO_SUCH_FILE) => Ok(false),
-            _ => Err(error),
-        },
-    }
 }
 
 /// latin-1（M18）`sftp_read_file` 裸包分支：显示路径还原字节后
@@ -3698,74 +3206,12 @@ where
     Ok(content.len())
 }
 
-/// latin-1（M18）`sftp_chmod` 裸包分支：显示路径还原字节后 SETSTAT 只带
-/// permissions 子集（与 auto 分支 set_metadata 的 attrs 语义一致；mode 解析
-/// 复用 [`parse_chmod_mode`]，建立失败回退高层、操作错误原样上抛）。
-async fn raw_sftp_chmod<S>(
-    client: &mut sftp_raw::RawSftp<S>,
-    path: &str,
-    mode: u32,
-) -> Result<Value, String>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + std::marker::Unpin,
-{
-    client
-        .setstat(
-            &sftp_name::latin1_encode_display(path),
-            &sftp_raw::RawAttrs {
-                permissions: Some(mode),
-                ..sftp_raw::RawAttrs::default()
-            },
-        )
-        .await?;
-    Ok(json!({ "path": path, "mode": format!("{mode:04o}") }))
-}
-
 fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value
         .get(key)
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
         .ok_or_else(|| format!("Missing or invalid parameter: {key} (expected a non-empty string)"))
-}
-
-/// Parses the optional `ssh_metrics` `sections` projection argument.
-/// Accepted shapes (LLM input tolerance): absent/null, a single section
-/// name string, or an array of section names. An empty array is refused so
-/// a caller can never mistake "no sections" for "all sections"; unknown
-/// names fail fast against the known universe before any dialing.
-fn metrics_sections(arguments: &Value) -> Result<Option<Vec<String>>, String> {
-    let Some(value) = arguments.get("sections").filter(|v| !v.is_null()) else {
-        return Ok(None);
-    };
-    let names: Vec<String> = match value {
-        Value::String(name) => vec![name.clone()],
-        Value::Array(items) => items
-            .iter()
-            .map(|item| {
-                item.as_str()
-                    .map(str::to_string)
-                    .filter(|text| !text.is_empty())
-                    .ok_or_else(|| "sections must be non-empty section-name strings".to_string())
-            })
-            .collect::<Result<Vec<String>, String>>()?,
-        _ => {
-            return Err(
-                "sections must be a section name or an array of section names \
-                 (e.g. [\"cpu\", \"memory\"]); omit it for the full document"
-                    .to_string(),
-            )
-        }
-    };
-    if names.is_empty() {
-        return Err(
-            "sections must name at least one section; omit the argument for \
-             the full document"
-                .to_string(),
-        );
-    }
-    exec::validate_section_names(&names)?;
-    Ok(Some(names))
 }
 
 /// Enumerates EVERY absent required string parameter in one error
@@ -3856,54 +3302,6 @@ pub(crate) fn arg_bool(arguments: &Value, key: &str) -> Result<Option<bool>, Str
     Err(format!("{key} must be a boolean, got {value}"))
 }
 
-/// Parses `sftp_chmod`'s `mode`. LLMs pass the octal permission in several
-/// shapes; all are normalized to permission bits:
-/// - string digits (`"644"`, `"0644"`, optional `0o` prefix) → octal;
-/// - a number whose decimal digits are all 0-7 (`644`) → octal digits;
-/// - any other number (`384` = 0o600, `493` = 0o755) → raw permission bits.
-fn parse_chmod_mode(value: &Value) -> Result<u32, String> {
-    const MAX_MODE_TEXT: &str =
-        "mode must be an octal value up to 7777 (e.g. \"644\", \"0755\" or 644)";
-    let octal = |text: &str| {
-        u32::from_str_radix(text, 8)
-            .ok()
-            .filter(|mode| *mode <= 0o7777)
-            .ok_or_else(|| MAX_MODE_TEXT.to_string())
-    };
-    if let Some(text) = value.as_str() {
-        let trimmed = text.trim();
-        let digits = trimmed
-            .strip_prefix("0o")
-            .or_else(|| trimmed.strip_prefix("0O"))
-            .unwrap_or(trimmed);
-        return octal(digits);
-    }
-    let Some(number) = value.as_i64() else {
-        return Err(MAX_MODE_TEXT.to_string());
-    };
-    if number < 0 {
-        return Err(MAX_MODE_TEXT.to_string());
-    }
-    let digits = number.to_string();
-    if digits.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) {
-        return octal(&digits);
-    }
-    u32::try_from(number)
-        .ok()
-        .filter(|mode| *mode <= 0o7777)
-        .ok_or_else(|| MAX_MODE_TEXT.to_string())
-}
-
-/// True for SFTP "no such file" statuses only: `sftp_exists` must not
-/// report a permission error or a dead channel as a missing path.
-fn is_no_such_file_error(error: &russh_sftp::client::error::Error) -> bool {
-    matches!(
-        error,
-        russh_sftp::client::error::Error::Status(status)
-            if status.status_code == russh_sftp::protocol::StatusCode::NoSuchFile
-    )
-}
-
 /// Every MCP tool name this sidecar registers, kept in sync with
 /// `tool_definitions` (a unit test pins the two together). Backs the
 /// unknown-tool check with its did-you-mean suggestion.
@@ -3914,33 +3312,16 @@ pub const TOOL_NAMES: &[&str] = &[
     "ssh_terminal_input",
     "ssh_run_bg",
     "ssh_task_status",
-    "ssh_metrics",
-    "docker_list",
-    "docker_action",
-    "ssh_alert_triage",
     "ssh_close",
-    "ssh_test_connection",
     "ssh_list_known_hosts",
     "ssh_list_connections",
     "ssh_remove_known_host",
-    "ssh_quick_sudo_profiles_list",
-    "ssh_quick_sudo_profiles_save",
-    "ssh_quick_sudo_profiles_delete",
     "sftp_list_dir",
     "sftp_stat",
-    "sftp_exists",
-    "sftp_pwd",
     "sftp_upload",
     "sftp_download",
     "sftp_read_file",
     "sftp_write_file",
-    "sftp_mkdir",
-    "sftp_remove",
-    "sftp_rename",
-    "sftp_chmod",
-    "sftp_copy",
-    "sftp_move",
-    "sftp_disk_usage",
 ];
 
 fn is_known_tool(name: &str) -> bool {
@@ -3966,8 +3347,8 @@ fn unknown_tool_message(name: &str) -> String {
     }
     format!(
         "Unknown tool: '{name}'. {}Use tools/list to list the {} available tools \
-         (ssh_exec, ssh_exec_sudo, ssh_run_bg, ssh_task_status, ssh_metrics, \
-         ssh_terminal_input, ssh_multi_exec, ssh_alert_triage, sftp_*, ...).",
+         (ssh_exec, ssh_exec_sudo, ssh_run_bg, ssh_task_status, \
+         ssh_terminal_input, ssh_multi_exec, sftp_*, ...).",
         suggestion
             .map(|tool| format!("Did you mean '{tool}'? "))
             .unwrap_or_default(),
@@ -4056,23 +3437,10 @@ fn is_connection_bound_tool(name: &str) -> bool {
             | "ssh_exec_sudo"
             | "ssh_run_bg"
             | "ssh_task_status"
-            | "ssh_metrics"
-            | "docker_list"
-            | "docker_action"
-            | "ssh_test_connection"
             | "sftp_list_dir"
             | "sftp_stat"
-            | "sftp_exists"
-            | "sftp_pwd"
             | "sftp_read_file"
             | "sftp_write_file"
-            | "sftp_mkdir"
-            | "sftp_remove"
-            | "sftp_rename"
-            | "sftp_chmod"
-            | "sftp_copy"
-            | "sftp_move"
-            | "sftp_disk_usage"
             | "sftp_upload"
             | "sftp_download"
     )
@@ -4328,17 +3696,7 @@ fn terminal_input_gate(
 fn is_write_tool(name: &str) -> bool {
     matches!(
         name,
-        "ssh_exec_sudo"
-            | "ssh_run_bg"
-            | "docker_action"
-            | "sftp_write_file"
-            | "sftp_upload"
-            | "sftp_mkdir"
-            | "sftp_remove"
-            | "sftp_rename"
-            | "sftp_chmod"
-            | "sftp_copy"
-            | "sftp_move"
+        "ssh_exec_sudo" | "ssh_run_bg" | "sftp_write_file" | "sftp_upload"
     )
 }
 
@@ -4349,12 +3707,7 @@ fn is_write_tool(name: &str) -> bool {
 fn sensitive_read_path(name: &str, arguments: &Value) -> Option<String> {
     if !matches!(
         name,
-        "sftp_list_dir"
-            | "sftp_read_file"
-            | "sftp_stat"
-            | "sftp_exists"
-            | "sftp_download"
-            | "ssh_task_status"
+        "sftp_list_dir" | "sftp_read_file" | "sftp_stat" | "sftp_download" | "ssh_task_status"
     ) {
         return None;
     }
@@ -4880,45 +4233,6 @@ fn connection_selector_requirements() -> Value {
     ])
 }
 
-/// Selector anyOf for the docker family: unlike pure SSH tools it also
-/// accepts `{"target": "local"}` — the daemon on the machine the sidecar
-/// runs on (Docker Desktop, OrbStack) — so agents can reach local docker
-/// without inventing an SSH connection.
-fn docker_selector_requirements() -> Value {
-    json!([
-        { "required": ["target"] },
-        { "required": ["connectionId"] },
-        { "required": ["connectionName"] },
-        { "required": ["host", "username"] },
-    ])
-}
-
-const TARGET_PROPERTY: (&str, &str, &str) = (
-    "target",
-    "string",
-    "\"local\" to query the Docker daemon on the machine this MCP server runs on (Docker Desktop, OrbStack, rootless); omit or \"ssh\" to target the SSH connection selected by connectionId/connectionName/host+username. Exactly one of target/local-connection arguments must be present",
-);
-
-/// Engine/endpoint properties shared by the docker family: they retarget
-/// the call to Podman or a custom daemon (rootless socket, remote tcp
-/// daemon) without inventing a new tool. The endpoint rides the engine's
-/// own env var (DOCKER_HOST / CONTAINER_HOST), never a shell flag.
-const DOCKER_CLI_PROPERTY: (&str, &str, &str) = (
-    "cli",
-    "string",
-    "Container CLI to run on the target machine: binary name or full path (default \"docker\"; e.g. \"podman\", \"/usr/local/bin/podman\", \"C:\\\\Program Files\\\\Podman\\\\podman.exe\"). Letters, digits and _ . / \\ : - only",
-);
-const DOCKER_SOCKET_PROPERTY: (&str, &str, &str) = (
-    "socket",
-    "string",
-    "Daemon unix socket for this call (e.g. \"/run/user/1000/podman/podman.sock\"; a bare path gains unix://). Mutually exclusive with host; applied via DOCKER_HOST/CONTAINER_HOST env vars",
-);
-const DOCKER_HOSTTCP_PROPERTY: (&str, &str, &str) = (
-    "host",
-    "string",
-    "Daemon tcp endpoint for this call (e.g. \"127.0.0.1:2375\" or \"tcp://10.0.0.8:2376\"). Mutually exclusive with socket; applied via DOCKER_HOST/CONTAINER_HOST env vars",
-);
-
 /// Advisory MCP tool annotations (spec "Tool annotations"): per-tool hints
 /// clients may use to pre-approve read-only tools or gate destructive ones.
 /// Advisory only — the server-side gates (mcp_safety whitelist, confirm
@@ -4926,34 +4240,24 @@ const DOCKER_HOSTTCP_PROPERTY: (&str, &str, &str) = (
 /// a client does with these hints. The classification deliberately mirrors
 /// the internal gate sets (`is_write_tool` / `is_confirm_gated_tool` /
 /// read-only sparing) so hints and enforcement cannot drift apart in
-/// opposite directions: the whole exec family and every
-/// remove/move/overwrite/delete tool is destructive=true, everything the
-/// confirm gate spares as provably read-only is readOnly=true, and the
-/// mutating-but-non-destructive writes (mkdir/rename/chmod, profile save,
-/// close) sit destructive=false between the two.
+/// opposite directions: the exec family and the overwrite-capable transfer
+/// tools are destructive=true, everything the confirm gate spares as
+/// provably read-only is readOnly=true, and `ssh_close` sits
+/// destructive=false between the two.
 fn tool_annotations(name: &str) -> Value {
     // Provably no mutation of remote or local state (matches the set the
     // confirm gate spares).
     const READ_ONLY: &[&str] = &[
         "ssh_list_connections",
         "ssh_list_known_hosts",
-        "ssh_quick_sudo_profiles_list",
-        "ssh_metrics",
-        "ssh_alert_triage",
-        "ssh_test_connection",
         "ssh_task_status",
         "sftp_list_dir",
         "sftp_stat",
-        "sftp_exists",
-        "sftp_pwd",
         "sftp_read_file",
-        "sftp_disk_usage",
-        // Docker panel read surface: list/poll containers only.
-        "docker_list",
     ];
     // May destroy or replace existing state: the exec family (arbitrary
-    // remote commands), store deletions, and remove/move/overwrite-capable
-    // writes (matches the confirm-gated set plus the delete tools).
+    // remote commands), store deletions, and overwrite-capable writes
+    // (matches the confirm-gated set).
     const DESTRUCTIVE: &[&str] = &[
         "ssh_exec",
         "ssh_exec_sudo",
@@ -4961,28 +4265,20 @@ fn tool_annotations(name: &str) -> Value {
         "ssh_terminal_input",
         "ssh_run_bg",
         "ssh_remove_known_host",
-        "ssh_quick_sudo_profiles_delete",
-        "sftp_remove",
-        "sftp_move",
-        "sftp_copy",
         "sftp_upload",
         "sftp_download",
         "sftp_write_file",
-        // Container lifecycle (rm/kill especially) is destructive; the tool
-        // description spells out the confirm-first semantics.
-        "docker_action",
     ];
     // Mutating but non-destructive, and repeating them converges to the
     // same state instead of compounding (idempotentHint).
-    const IDEMPOTENT_MUTATING: &[&str] =
-        &["ssh_close", "ssh_quick_sudo_profiles_save", "sftp_chmod"];
+    const IDEMPOTENT_MUTATING: &[&str] = &["ssh_close"];
     let read_only = READ_ONLY.contains(&name);
     let destructive = DESTRUCTIVE.contains(&name);
     let mut annotations = json!({
         "readOnlyHint": read_only,
         "destructiveHint": destructive,
         "idempotentHint": read_only || IDEMPOTENT_MUTATING.contains(&name),
-        "openWorldHint": name != "ssh_alert_triage",
+        "openWorldHint": true,
     });
     if let Some(title) = tool_title(name) {
         annotations["title"] = json!(title);
@@ -5001,33 +4297,16 @@ fn tool_title(name: &str) -> Option<&'static str> {
         "ssh_terminal_input" => "Inject terminal input",
         "ssh_run_bg" => "Start background SSH task",
         "ssh_task_status" => "Poll background SSH task",
-        "ssh_metrics" => "Collect server metrics",
-        "docker_list" => "List containers (Docker/Podman; SSH host or local daemon)",
-        "docker_action" => "Manage container (Docker/Podman; SSH host or local daemon)",
-        "ssh_alert_triage" => "SSH alert triage",
         "ssh_close" => "Close SSH connection",
-        "ssh_test_connection" => "Test SSH connection",
         "ssh_list_known_hosts" => "List known hosts",
         "ssh_list_connections" => "List SSH connections",
         "ssh_remove_known_host" => "Remove known host",
-        "ssh_quick_sudo_profiles_list" => "List Quick Sudo profiles",
-        "ssh_quick_sudo_profiles_save" => "Save Quick Sudo profile",
-        "ssh_quick_sudo_profiles_delete" => "Delete Quick Sudo profile",
         "sftp_list_dir" => "List remote directory",
         "sftp_stat" => "Stat remote path",
-        "sftp_exists" => "Check remote path exists",
-        "sftp_pwd" => "Remote home directory",
         "sftp_upload" => "Upload file over SFTP",
         "sftp_download" => "Download file over SFTP",
         "sftp_read_file" => "Read remote file",
         "sftp_write_file" => "Write remote file",
-        "sftp_mkdir" => "Create remote directory",
-        "sftp_remove" => "Remove remote path",
-        "sftp_rename" => "Rename remote path",
-        "sftp_chmod" => "Change remote permissions",
-        "sftp_copy" => "Copy remote files",
-        "sftp_move" => "Move remote files",
-        "sftp_disk_usage" => "Remote disk usage",
         _ => return None,
     })
 }
@@ -5124,52 +4403,6 @@ pub fn tool_definitions() -> Value {
             },
         },
         {
-            "name": "ssh_metrics",
-            "description": "Collect server metrics (CPU utilization, load, memory, swap, disk mounts with inode usage, uptime, per-interface network rx/tx rates, top 8 processes by CPU and by memory) using read-only commands. Pass sections to return only the named top-level sections and keep the response small.",
-            "inputSchema": {
-                "type": "object",
-                "properties": connection_properties(&[]),
-                "anyOf": connection_selector_requirements(),
-            },
-        },
-        {
-            "name": "docker_list",
-            "description": "List containers on a remote SSH host, or on the local machine with {\"target\":\"local\"} (docker/podman ps -a via read-only shell collection): name, image, state, status, ports, creation time. Works with Docker and Podman: pass cli (e.g. \"podman\") and optionally socket or host (mutually exclusive) to retarget the daemon — the endpoint rides DOCKER_HOST/CONTAINER_HOST env vars, never a shell flag. When the CLI is missing or the daemon socket is denied, available=false and containers=[] instead of an error; needsSudo=true marks the denied case, where lifecycle actions can still run through the connection's Quick Sudo credentials.",
-            "inputSchema": {
-                "type": "object",
-                "properties": connection_properties(&[TARGET_PROPERTY, DOCKER_CLI_PROPERTY, DOCKER_SOCKET_PROPERTY, DOCKER_HOSTTCP_PROPERTY]),
-                "anyOf": docker_selector_requirements(),
-            },
-        },
-        {
-            "name": "docker_action",
-            "description": "Run a lifecycle action (start | stop | restart | kill | rm) on one container (remote SSH host, or local with {\"target\":\"local\"}). Docker and Podman: pass cli/socket/host to retarget. DESTRUCTIVE for rm and kill: get explicit human confirmation first; start/stop/restart are reversible. containerId is 12-64 lowercase hex. Only a daemon-socket permission failure retries via Quick Sudo credentials (stdin, never argv). Read-only connections are refused.",
-            "inputSchema": {
-                "type": "object",
-                "properties": connection_properties(&[
-                    TARGET_PROPERTY,
-                    DOCKER_CLI_PROPERTY,
-                    DOCKER_SOCKET_PROPERTY,
-                    DOCKER_HOSTTCP_PROPERTY,
-                    ("containerId", "string", "Container id (12-64 lowercase hex characters, as returned by docker_list)"),
-                    ("action", "string", "Lifecycle action: start | stop | restart | kill | rm. rm/kill are destructive and need explicit human confirmation"),
-                ]),
-                "required": ["containerId", "action"],
-                "anyOf": docker_selector_requirements(),
-            },
-        },
-        {
-            "name": "ssh_alert_triage",
-            "description": "Triage an ops alert OFFLINE (no SSH connection): normalizes a heterogeneous alert payload, classifies the intent by bilingual keyword scoring (cpu / memory / disk / oom / inode / network / service / generic), and returns a whitelist-safe diagnostic playbook. Pass the raw alert as a JSON string (fields like alertId/title/severity/source/message are recognized; unknown shapes degrade to generic). Read-only: nothing is executed and no suggestion contains sudo.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "payload": { "type": "string", "description": "Raw alert payload as a JSON string; heterogeneous fields (alertId/title/severity/source/message/data) are normalized" },
-                },
-                "required": ["payload"],
-            },
-        },
-        {
             "name": "ssh_close",
             "description": "Close the cached SSH/SFTP connection for a host after finishing work.",
             "inputSchema": {
@@ -5177,11 +4410,6 @@ pub fn tool_definitions() -> Value {
                 "properties": connection_properties(&[]),
                 "anyOf": connection_selector_requirements(),
             },
-        },
-        {
-            "name": "ssh_test_connection",
-            "description": "Verify connectivity and authentication without running commands. Accepts inline SSH settings (including the jump chain) or a saved connection reference: connectionId / connectionName / a unique host+port+username endpoint resolve through the DBX app (app bridge or lifecycle registry), so no credentials need to travel in tool arguments.",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[]), "anyOf": connection_selector_requirements() },
         },
         {
             "name": "ssh_list_known_hosts",
@@ -5206,60 +4434,14 @@ pub fn tool_definitions() -> Value {
             },
         },
         {
-            "name": "ssh_quick_sudo_profiles_list",
-            "description": "List the plugin's global Quick Sudo profiles: named sudo password/TOTP/prompt presets reusable across connections. Secrets are reported as configured flags only, never as values.",
-            "inputSchema": { "type": "object", "properties": {} },
-        },
-        {
-            "name": "ssh_quick_sudo_profiles_save",
-            "description": "Create or update a global Quick Sudo profile (supply id to update). Empty sudoPassword/totpSecret keep the stored values; clearSudoPassword/clearTotpSecret remove them. Returns the profile without secrets.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "Profile id to update; omit to create" },
-                    "name": { "type": "string", "description": "Unique display name (max 64 characters)" },
-                    "sudoPassword": { "type": "string", "description": "Sudo password; empty keeps the stored one" },
-                    "totpSecret": { "type": "string", "description": "TOTP secret (otpauth:// URI, base32 key, or static code); multiple secrets (newline/semicolon separated) rotate automatically — unexpired, unused codes first. Empty keeps the stored one" },
-                    "clearSudoPassword": { "type": "boolean", "description": "Set true to remove the stored sudo password" },
-                    "clearTotpSecret": { "type": "boolean", "description": "Set true to remove the stored TOTP secret" },
-                    "authFlowMode": { "type": "string", "enum": ["password_only", "password_plus_otp", "password_then_otp"], "description": AUTH_FLOW_MODE_DESCRIPTION },
-                    "passwordPromptHint": { "type": "string", "description": "Text fragment to recognize a non-standard sudo password prompt when built-in patterns miss it" },
-                    "totpPromptHint": { "type": "string", "description": "Text fragment to recognize a non-standard TOTP/verification-code prompt when built-in patterns miss it" },
-                    "sudoUsePty": { "type": "boolean", "description": "Request a PTY for sudo executions using this profile" },
-                },
-                "required": ["name"],
-            },
-        },
-        {
-            "name": "ssh_quick_sudo_profiles_delete",
-            "description": "Delete a global Quick Sudo profile by id. Connections bound to it fall back to their own sudo configuration.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "Profile id" },
-                },
-                "required": ["id"],
-            },
-        },
-        {
             "name": "sftp_list_dir",
-            "description": "List a remote directory over SFTP. Names follow the connection's file-name encoding preference: on latin-1 connections entries are decoded from raw server bytes to display form, and a returned path passed back to sftp_mkdir/sftp_remove/sftp_rename addresses the same server bytes.",
+            "description": "List a remote directory over SFTP. Names follow the connection's file-name encoding preference: on latin-1 connections entries are decoded from raw server bytes to display form, and a returned path passed back to the other SFTP tools addresses the same server bytes.",
             "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote directory path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
         },
         {
             "name": "sftp_stat",
             "description": "Inspect a remote path over SFTP (size, permissions, timestamps).",
             "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
-        },
-        {
-            "name": "sftp_exists",
-            "description": "Check whether a remote path exists.",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
-        },
-        {
-            "name": "sftp_pwd",
-            "description": "Return the remote login user's home directory (canonicalized absolute path over SFTP).",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[]), "anyOf": connection_selector_requirements() },
         },
         {
             "name": "sftp_upload",
@@ -5298,58 +4480,6 @@ pub fn tool_definitions() -> Value {
                 ("overwrite", "boolean", "Set true to replace an existing file"),
             ]), "required": ["path", "content"] },
         },
-        {
-            "name": "sftp_mkdir",
-            "description": "Create a remote directory. Paths follow the same display convention as sftp_list_dir responses (on latin-1 connections a display path maps back to the original server bytes).",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote directory path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
-        },
-        {
-            "name": "sftp_remove",
-            "description": "Remove a remote file or directory (directories need recursive=true). Paths follow the same display convention as sftp_list_dir responses (on latin-1 connections a display path maps back to the original server bytes).",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[
-                ("path", "string", "Remote path"),
-                ("recursive", "boolean", "Set true to remove directories recursively"),
-            ]), "required": ["path"], "anyOf": connection_selector_requirements() },
-        },
-        {
-            "name": "sftp_rename",
-            "description": "Rename or move a remote path. Paths follow the same display convention as sftp_list_dir responses (on latin-1 connections display paths map back to the original server bytes).",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[
-                ("sourcePath", "string", "Existing remote path"),
-                ("targetPath", "string", "New remote path"),
-            ]), "required": ["sourcePath", "targetPath"] },
-        },
-        {
-            "name": "sftp_chmod",
-            "description": "Change permission bits of a remote path (octal, e.g. 0644).",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[
-                ("path", "string", "Remote path"),
-                ("mode", "string", "Octal permission value such as 0644 or 0755. Strings are read as octal digits (an optional 0o prefix is accepted); a number with only 0-7 digits (e.g. 644) is read as octal digits, any other number (e.g. 384 = 0o600) as raw permission bits"),
-            ]), "required": ["path", "mode"] },
-        },
-        {
-            "name": "sftp_copy",
-            "description": "Copy remote files or directories into a target directory on the same server (recursive, preserves permissions; write operation). Existing targets require overwrite=true.",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[
-                ("from", "string", "Remote source path, or an array of source paths"),
-                ("toDir", "string", "Existing remote directory that receives the copies"),
-                ("overwrite", "boolean", "Set true to replace existing targets"),
-            ]), "required": ["from", "toDir"] },
-        },
-        {
-            "name": "sftp_move",
-            "description": "Move remote files or directories into a target directory on the same server (the sources are removed; write operation). Existing targets require overwrite=true.",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[
-                ("from", "string", "Remote source path, or an array of source paths"),
-                ("toDir", "string", "Existing remote directory that receives the moved items"),
-                ("overwrite", "boolean", "Set true to replace existing targets"),
-            ]), "required": ["from", "toDir"] },
-        },
-        {
-            "name": "sftp_disk_usage",
-            "description": "Report filesystem usage for the mount containing a remote path.",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
-        },
     ]);
     // Connection-bound tools share the selector alternatives; add them here
     // after the compact JSON declarations so path/command required fields
@@ -5362,51 +4492,10 @@ pub fn tool_definitions() -> Value {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let is_connection_bound = matches!(
-                name.as_str(),
-                "sftp_list_dir"
-                    | "sftp_stat"
-                    | "sftp_exists"
-                    | "sftp_pwd"
-                    | "sftp_upload"
-                    | "sftp_download"
-                    | "sftp_read_file"
-                    | "sftp_write_file"
-                    | "sftp_mkdir"
-                    | "sftp_remove"
-                    | "sftp_rename"
-                    | "sftp_chmod"
-                    | "sftp_copy"
-                    | "sftp_move"
-                    | "sftp_disk_usage"
-            );
-            if !is_connection_bound {
-                tool["annotations"] = tool_annotations(&name);
-            } else {
-                if let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) {
-                    schema.insert("anyOf".to_string(), connection_selector_requirements());
-                }
-                tool["annotations"] = tool_annotations(&name);
+            if let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) {
+                schema.insert("anyOf".to_string(), connection_selector_requirements());
             }
-            // ssh_metrics advertises its optional sections projection
-            // (declared post-hoc: the property carries a dynamic enum from
-            // METRICS_SECTIONS, which the compact literal cannot inline).
-            if name == "ssh_metrics" {
-                if let Some(props) = tool
-                    .pointer_mut("/inputSchema/properties")
-                    .and_then(Value::as_object_mut)
-                {
-                    props.insert(
-                        "sections".to_string(),
-                        json!({
-                            "type": "array",
-                            "items": { "type": "string", "enum": exec::METRICS_SECTIONS },
-                            "uniqueItems": true,
-                            "description": "Optional projection onto top-level sections (hostname, kernel, uptimeSeconds, cpu, memory, disks, network, processes, topMemory, osId, osPretty); a single name string is accepted too. Omit for the full document"
-                        }),
-                    );
-                }
-            }
+            tool["annotations"] = tool_annotations(&name);
         }
     }
     tools
@@ -5422,19 +4511,40 @@ mod tests {
         McpState::new(std::env::temp_dir().join(format!("dbx-mcp-test-{}", uuid::Uuid::new_v4())))
     }
 
-    /// tools/list 尺寸预算（#172）：桥模式下 `dbx_plugin_tools` 把整份列表
-    /// 塞进一次工具返回，MCP 客户端对结果大小有硬上限（实测 126k 字符 /
-    /// ~27.9k token 被判超限落盘）。公共连接参数在严格宿主下不可删（未声明
-    /// 参数会在 schema 校验时被丢弃），所以预算靠压缩 description 文本达成。
+    /// tools/list 尺寸预算（#172 / #203）。计量口径必须写清，避免误读：
+    ///
+    /// **量的是什么**：本测试量的是 sidecar `tools/list` 的 raw JSON 序列化
+    /// （serde `Value::to_string`），不是 MCP 客户端实际收到的那份文本。桥模式
+    /// 下宿主 `dbx_plugin_tools`（dbx-mcp，宿主仓 crates/dbx-mcp/src/server.rs）
+    /// 把工具目录重新拼装成自己的文本再返回，两次序列化不是同一结果（0.7.7
+    /// 实测桥文本 ≈ raw × 0.9：99,909 → 90,114；#203 瘦身后 49,492 → ≈44.5k）。
+    ///
+    /// **预算 55_000 的含义**：对照实测客户端落盘线的防回归上限。#203 实测
+    /// Claude Code 在 >50,000 字符落盘（persistenceThresholdCeiling，最严）、
+    /// Qoder CLI ≈75,000；raw ≤55k 对应桥文本 ≤≈49.5k，即 **Claude Code 线内
+    /// 不落盘**。#172 时代的 100k 预算只是防回归，不是客户端无落盘判据——
+    /// 当时 33 个工具实测 90k 桥文本在两个实测客户端都落盘。
+    ///
+    /// **工具面怎么到 16 个的**：#203 两轮瘦身，移除冗余/可推导/命令可实现
+    /// 的工具（sftp_exists、sftp_pwd、ssh_test_connection、ssh_alert_triage、
+    /// Quick Sudo 三件套、ssh_metrics、sftp_disk_usage、docker 两件套、SFTP
+    /// 变更族 mkdir/remove/rename/chmod/copy/move——最后这族与 shell
+    /// mkdir/rm/mv/chmod/cp 语义重复，走 ssh_exec，只读白名单与
+    /// sensitive-path 门在 exec 路径上等价生效）。前端工作台的对应 sidecar
+    /// RPC 方法全部保留，MCP 面收缩不影响 UI。新增工具前先看这个预算：
+    /// 能并进既有工具或用 ssh_exec 实现的不再单列。
+    ///
     /// 超预算时先砍最长 description，而不是删属性名。
     #[test]
-    fn tool_definitions_stay_under_bridge_result_budget() {
+    fn tool_definitions_stay_under_budget() {
         let serialized = tool_definitions().to_string();
         let chars = serialized.chars().count();
         assert!(
-            chars <= 100_000,
-            "tools/list is {chars} chars (budget 100_000); \
-             trim the fattest descriptions in connection_properties/tool_definitions"
+            chars <= 55_000,
+            "tools/list raw JSON is {chars} chars (budget 55_000 = Claude Code's \
+             ~50k persistence line with headroom at the ~0.9 bridge ratio); \
+             trim the fattest descriptions in connection_properties/tool_definitions \
+             or reconsider whether the new tool belongs in the MCP face (#203)"
         );
     }
 
@@ -5502,22 +4612,17 @@ mod tests {
             "ssh_run_bg",
             "ssh_multi_exec",
             "ssh_terminal_input",
-            "docker_action",
             "sftp_write_file",
             "sftp_upload",
-            "sftp_remove",
         ] {
             assert!(is_confirm_gated_tool(gated), "{gated} should be gated");
         }
         for spared in [
             "ssh_close",
-            "ssh_metrics",
-            "docker_list",
-            "ssh_test_connection",
             "sftp_list_dir",
+            "sftp_stat",
             "sftp_read_file",
             "sftp_download",
-            "ssh_alert_triage",
         ] {
             assert!(!is_confirm_gated_tool(spared), "{spared} must not be gated");
         }
@@ -5532,8 +4637,6 @@ mod tests {
             "ssh_list_connections",
             "ssh_list_known_hosts",
             "ssh_remove_known_host",
-            "ssh_quick_sudo_profiles_list",
-            "ssh_alert_triage",
         ] {
             assert!(!is_connection_scoped_tool(local), "{local}");
         }
@@ -5584,18 +4687,10 @@ mod tests {
         for name in [
             "ssh_list_connections",
             "ssh_list_known_hosts",
-            "ssh_quick_sudo_profiles_list",
-            "ssh_metrics",
-            "docker_list",
-            "ssh_alert_triage",
-            "ssh_test_connection",
             "ssh_task_status",
             "sftp_list_dir",
             "sftp_stat",
-            "sftp_exists",
-            "sftp_pwd",
             "sftp_read_file",
-            "sftp_disk_usage",
         ] {
             let a = annotations(name);
             assert_eq!(a["readOnlyHint"], true, "{name} should be readOnly");
@@ -5612,12 +4707,7 @@ mod tests {
             "ssh_multi_exec",
             "ssh_terminal_input",
             "ssh_run_bg",
-            "docker_action",
             "ssh_remove_known_host",
-            "ssh_quick_sudo_profiles_delete",
-            "sftp_remove",
-            "sftp_move",
-            "sftp_copy",
             "sftp_upload",
             "sftp_download",
             "sftp_write_file",
@@ -5626,26 +4716,18 @@ mod tests {
             assert_eq!(a["readOnlyHint"], false, "{name} should not be readOnly");
             assert_eq!(a["destructiveHint"], true, "{name} should be destructive");
         }
-        // Mutating but non-destructive writes.
-        for name in [
-            "sftp_mkdir",
-            "sftp_rename",
-            "sftp_chmod",
-            "ssh_quick_sudo_profiles_save",
-        ] {
-            let a = annotations(name);
-            assert_eq!(a["readOnlyHint"], false, "{name}");
-            assert_eq!(a["destructiveHint"], false, "{name}");
-        }
-        // Closed-world: alert triage runs fully offline.
-        assert_eq!(annotations("ssh_alert_triage")["openWorldHint"], false);
+        // Mutating but non-destructive (idempotent) write surface.
+        let a = annotations("ssh_close");
+        assert_eq!(a["readOnlyHint"], false, "ssh_close");
+        assert_eq!(a["destructiveHint"], false, "ssh_close");
+        // Closed-world: every catalogued tool talks to the outside world.
         assert_eq!(annotations("ssh_exec")["openWorldHint"], true);
         // Every declared tool is covered by the explicit sets — no tool may
         // slip through with unreviewed hints.
         let tools = definitions.as_array().unwrap();
         assert_eq!(
             tools.len(),
-            33,
+            16,
             "tool count changed; revisit annotation sets"
         );
         for tool in tools {
@@ -5657,69 +4739,14 @@ mod tests {
                     name,
                     "ssh_list_connections"
                         | "ssh_list_known_hosts"
-                        | "ssh_quick_sudo_profiles_list"
-                        | "ssh_metrics"
-                        | "docker_list"
-                        | "ssh_alert_triage"
-                        | "ssh_test_connection"
                         | "ssh_task_status"
                         | "sftp_list_dir"
                         | "sftp_stat"
-                        | "sftp_exists"
-                        | "sftp_pwd"
                         | "sftp_read_file"
-                        | "sftp_disk_usage"
                 ),
                 "{name} readOnlyHint drift"
             );
         }
-    }
-
-    #[test]
-    fn metrics_sections_argument_shapes_and_fail_fast() {
-        // 缺省/null → None（返回全量文档）。
-        assert_eq!(metrics_sections(&json!({})).unwrap(), None);
-        assert_eq!(
-            metrics_sections(&json!({ "sections": null })).unwrap(),
-            None
-        );
-        // 单字符串 / 数组两种形态都收（LLM 容错）。
-        assert_eq!(
-            metrics_sections(&json!({ "sections": "cpu" })).unwrap(),
-            Some(vec!["cpu".to_string()])
-        );
-        assert_eq!(
-            metrics_sections(&json!({ "sections": ["cpu", "memory"] })).unwrap(),
-            Some(vec!["cpu".to_string(), "memory".to_string()])
-        );
-        // 空数组拒绝：绝不能把"没点名"误当"全量"。
-        assert!(metrics_sections(&json!({ "sections": [] })).is_err());
-        // 未知段名 fail-fast 并列出合法段（拨号前拒绝）。
-        let error = metrics_sections(&json!({ "sections": ["memry"] })).unwrap_err();
-        assert!(error.contains("Unknown section: 'memry'"), "{error}");
-        assert!(error.contains("topMemory"), "{error}");
-        // 非字符串项精确报错。
-        assert!(metrics_sections(&json!({ "sections": [42] })).is_err());
-    }
-
-    #[test]
-    fn metrics_schema_advertises_sections_projection() {
-        let definitions = tool_definitions();
-        let metrics = definitions
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tool| tool["name"] == "ssh_metrics")
-            .unwrap();
-        let sections = &metrics["inputSchema"]["properties"]["sections"];
-        assert_eq!(sections["type"], "array");
-        let enum_names: Vec<&str> = sections["items"]["enum"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_str().unwrap())
-            .collect();
-        assert_eq!(enum_names, exec::METRICS_SECTIONS);
     }
 
     #[test]
@@ -6287,8 +5314,6 @@ mod tests {
             "ssh_run_bg",
             "ssh_terminal_input",
             "ssh_task_status",
-            "ssh_metrics",
-            "ssh_test_connection",
             "sftp_list_dir",
             "sftp_upload",
         ] {
@@ -6428,28 +5453,14 @@ mod tests {
             "ssh_terminal_input",
             "ssh_multi_exec",
             "ssh_task_status",
-            "ssh_metrics",
             "ssh_close",
-            "ssh_test_connection",
             "ssh_list_known_hosts",
             "ssh_list_connections",
             "ssh_remove_known_host",
-            "ssh_quick_sudo_profiles_list",
-            "ssh_quick_sudo_profiles_save",
-            "ssh_quick_sudo_profiles_delete",
             "sftp_list_dir",
             "sftp_stat",
-            "sftp_exists",
-            "sftp_pwd",
             "sftp_read_file",
             "sftp_write_file",
-            "sftp_mkdir",
-            "sftp_remove",
-            "sftp_rename",
-            "sftp_chmod",
-            "sftp_copy",
-            "sftp_move",
-            "sftp_disk_usage",
             "sftp_upload",
             "sftp_download",
         ] {
@@ -6520,12 +5531,6 @@ mod tests {
                 "{tool_name} lacks runInTerminal"
             );
         }
-        let metrics = tools.iter().find(|t| t["name"] == "ssh_metrics").unwrap();
-        assert!(metrics["description"]
-            .as_str()
-            .unwrap()
-            .contains("inode usage"));
-
         // Notifications produce no response; unknown methods return the
         // standard JSON-RPC -32601 (Method not found), family-wide with
         // ldap/kafka/files.
@@ -6907,40 +5912,29 @@ mod tests {
         // Test-only secret assembled at runtime (never a real credential).
         let secret = format!("test-{}", uuid::Uuid::new_v4());
 
+        // MCP 工具面已收（#203 工具瘦身）；store 行为经 runtime 方法直接覆盖。
         let saved = state
-            .run_tool(
-                "ssh_quick_sudo_profiles_save",
-                &json!({
-                    "name": "ops",
-                    "sudoPassword": secret,
-                    "totpSecret": "JBSWY3DPEHPK3PXP",
-                    "authFlowMode": "password_plus_otp",
-                    "sudoUsePty": true,
-                }),
-                None,
-            )
+            .runtime
+            .profiles_save(&json!({
+                "name": "ops",
+                "sudoPassword": secret,
+                "totpSecret": "JBSWY3DPEHPK3PXP",
+                "authFlowMode": "password_plus_otp",
+                "sudoUsePty": true,
+            }))
             .await
             .unwrap();
         assert_eq!(saved["created"], true);
         assert_eq!(saved["profile"]["sudoPasswordSet"], true);
         assert_eq!(saved["profile"]["totpConfigured"], true);
 
-        let listed = state
-            .run_tool("ssh_quick_sudo_profiles_list", &json!({}), None)
-            .await
-            .unwrap();
+        let listed = state.runtime.profiles_list();
         let rendered = listed.to_string();
         assert!(!rendered.contains(&secret), "secret leaked: {rendered}");
         assert!(rendered.contains("\"sudoPasswordSet\":true"));
 
         // Duplicate names are rejected, unknown references report clearly.
-        let duplicate = state
-            .run_tool(
-                "ssh_quick_sudo_profiles_save",
-                &json!({ "name": "OPS" }),
-                None,
-            )
-            .await;
+        let duplicate = state.runtime.profiles_save(&json!({ "name": "OPS" })).await;
         assert!(duplicate.unwrap_err().contains("already in use"));
         let missing = resolve_profile_reference(
             &sudo_profiles::load_store(&dir),
@@ -6949,15 +5943,9 @@ mod tests {
         assert!(missing.unwrap_err().contains("not found"));
 
         let id = saved["profile"]["id"].as_str().unwrap().to_string();
-        let removed = state
-            .run_tool("ssh_quick_sudo_profiles_delete", &json!({ "id": id }), None)
-            .await
-            .unwrap();
+        let removed = state.runtime.profiles_delete(&id).await.unwrap();
         assert_eq!(removed["removed"], true);
-        let listed = state
-            .run_tool("ssh_quick_sudo_profiles_list", &json!({}), None)
-            .await
-            .unwrap();
+        let listed = state.runtime.profiles_list();
         assert_eq!(listed["profiles"].as_array().unwrap().len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6994,15 +5982,12 @@ mod tests {
         let call_secret = format!("call-{}", uuid::Uuid::new_v4());
 
         let saved = state
-            .run_tool(
-                "ssh_quick_sudo_profiles_save",
-                &json!({
-                    "name": "src-ops",
-                    "sudoPassword": profile_secret,
-                    "totpSecret": "JBSWY3DPEHPK3PXP",
-                }),
-                None,
-            )
+            .runtime
+            .profiles_save(&json!({
+                "name": "src-ops",
+                "sudoPassword": profile_secret,
+                "totpSecret": "JBSWY3DPEHPK3PXP",
+            }))
             .await
             .unwrap();
         assert_eq!(saved["created"], true);
@@ -7616,34 +6601,24 @@ mod tests {
     #[tokio::test]
     async fn read_only_tools_are_stable_under_repeated_calls() {
         let state = state();
-        let payload = json!({
-            "alertId": "churn-1", "title": "CPU 使用率过高",
-            "severity": "critical", "source": "prometheus",
-            "message": "node-1 cpu_usage above 0.9",
-        });
-        let first_triage = state
-            .call_tool(
-                "ssh_alert_triage",
-                &json!({ "payload": payload.to_string() }),
-                None,
-            )
+        let first_connections = state
+            .call_tool("ssh_list_connections", &json!({}), None)
             .await
-            .expect("triage");
+            .expect("connections");
         let first_hosts = state
             .call_tool("ssh_list_known_hosts", &json!({}), None)
             .await
             .expect("known_hosts");
         let first_settings = state.settings_get();
         for index in 1..100 {
-            let triage = state
-                .call_tool(
-                    "ssh_alert_triage",
-                    &json!({ "payload": payload.to_string() }),
-                    None,
-                )
+            let connections = state
+                .call_tool("ssh_list_connections", &json!({}), None)
                 .await
-                .expect("triage");
-            assert_eq!(triage, first_triage, "triage drifted at call {index}");
+                .expect("connections");
+            assert_eq!(
+                connections, first_connections,
+                "connections drifted at call {index}"
+            );
             let hosts = state
                 .call_tool("ssh_list_known_hosts", &json!({}), None)
                 .await
@@ -7823,7 +6798,11 @@ mod tests {
         let mut state = state();
         state.bridge_fallback = false;
         let error = state
-            .call_tool("ssh_metrics", &json!({ "connectionId": "ghost" }), None)
+            .call_tool(
+                "sftp_stat",
+                &json!({ "connectionId": "ghost", "path": "/tmp" }),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -7904,7 +6883,7 @@ mod tests {
 
         // No connection reference: local path.
         let plan = state
-            .bridge_forward_plan("ssh_metrics", &json!({}))
+            .bridge_forward_plan("sftp_list_dir", &json!({}))
             .await
             .unwrap();
         assert!(plan.is_none());
@@ -8105,7 +7084,11 @@ mod tests {
                 .insert(id.to_string(), stored);
         }
         let error = state
-            .call_tool("ssh_metrics", &json!({ "connectionName": "Twin" }), None)
+            .call_tool(
+                "sftp_stat",
+                &json!({ "connectionName": "Twin", "path": "/tmp" }),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -8219,12 +7202,11 @@ mod tests {
         );
     }
 
-    /// Saved-connection addressing must reach the dialers: with the fix, an
-    /// sftp call referencing a registered connection attempts the dial (a
-    /// refused-port error) instead of dying on the pre-fix pool lookup, and
-    /// ssh_test_connection no longer demands inline `host`.
+    /// Saved-connection addressing must reach the dialers: an sftp/exec call
+    /// referencing a registered connection attempts the dial (a refused-port
+    /// error) instead of dying on the pre-fix pool lookup.
     #[tokio::test]
-    async fn sftp_and_test_connection_resolve_saved_reference_before_dialing() {
+    async fn sftp_and_exec_resolve_saved_reference_before_dialing() {
         let state = state();
         let stored = StoredConnection::from_lifecycle_params(&json!({
             "connection": {
@@ -8245,10 +7227,13 @@ mod tests {
 
         for (tool, arguments) in [
             (
-                "sftp_exists",
+                "sftp_stat",
                 json!({ "connectionName": "Prod", "path": "/tmp" }),
             ),
-            ("ssh_test_connection", json!({ "connectionName": "Prod" })),
+            (
+                "ssh_exec",
+                json!({ "connectionName": "Prod", "command": "true" }),
+            ),
         ] {
             let error = state.call_tool(tool, &arguments, None).await.unwrap_err();
             assert!(
@@ -8263,32 +7248,6 @@ mod tests {
     /// stdio smoke asserts the tool by name, so a dispatch-only protocol
     /// method (`ssh/alert/triage`) without an MCP tool would regress the
     /// intent-recognition surface. Offline: no connection I/O involved.
-    #[tokio::test]
-    async fn alert_triage_is_wired_as_an_mcp_tool() {
-        let state = state();
-        let response = state
-            .call_tool(
-                "ssh_alert_triage",
-                &json!({
-                    "payload": json!({
-                        "alertId": "unit-1",
-                        "title": "CPU 使用率过高",
-                        "severity": "critical",
-                        "source": "prometheus",
-                        "message": "node-1 cpu_usage above 0.9",
-                    })
-                    .to_string()
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-        let envelope_text = response["content"][0]["text"].as_str().unwrap();
-        let result: Value = serde_json::from_str(envelope_text).unwrap();
-        assert_eq!(result["normalized"]["alertId"], "unit-1");
-        assert_eq!(result["category"], "cpu");
-        assert!(!result["suggestions"].as_array().unwrap().is_empty());
-    }
 
     #[tokio::test]
     async fn read_only_connection_gates_writes_and_unknown_commands() {
@@ -8422,28 +7381,6 @@ mod tests {
         assert!(arg_bool(&json!({ "flag": "maybe" }), "flag")
             .unwrap_err()
             .contains("must be a boolean"));
-    }
-
-    #[test]
-    fn chmod_mode_parsing_accepts_llm_variants() {
-        // 字符串八进制（含 0o 前缀与补零）。
-        assert_eq!(parse_chmod_mode(&json!("644")).unwrap(), 0o644);
-        assert_eq!(parse_chmod_mode(&json!("0644")).unwrap(), 0o644);
-        assert_eq!(parse_chmod_mode(&json!(" 0o755 ")).unwrap(), 0o755);
-        assert_eq!(parse_chmod_mode(&json!("4755")).unwrap(), 0o4755);
-        // 纯 0-7 数字的数字按八进制读：644 不是 0o1350。
-        assert_eq!(parse_chmod_mode(&json!(644)).unwrap(), 0o644);
-        assert_eq!(parse_chmod_mode(&json!(600)).unwrap(), 0o600);
-        assert_eq!(parse_chmod_mode(&json!(0)).unwrap(), 0);
-        // 其他数字按原始权限位读（Python 0o600 字面量 = 384）。
-        assert_eq!(parse_chmod_mode(&json!(384)).unwrap(), 0o600);
-        assert_eq!(parse_chmod_mode(&json!(493)).unwrap(), 0o755);
-        // 越界与非法输入。
-        assert!(parse_chmod_mode(&json!("999")).is_err());
-        assert!(parse_chmod_mode(&json!(-1)).is_err());
-        assert!(parse_chmod_mode(&json!(8192)).is_err());
-        assert!(parse_chmod_mode(&json!(1.5)).is_err());
-        assert!(parse_chmod_mode(&json!(true)).is_err());
     }
 
     #[test]
@@ -8668,7 +7605,7 @@ mod tests {
             .copied()
             .filter(|name| is_connection_bound_tool(name))
             .collect();
-        assert_eq!(forwarders.len(), 23, "connection-bound tool set drifted");
+        assert_eq!(forwarders.len(), 10, "connection-bound tool set drifted");
         for name in forwarders {
             let arguments = match name {
                 "ssh_exec" | "ssh_exec_sudo" | "ssh_run_bg" => {
@@ -8676,9 +7613,6 @@ mod tests {
                 }
                 "ssh_task_status" => {
                     json!({ "connectionId": "ghost", "logPath": "/tmp/.dbx-ssh-tasks/x.log" })
-                }
-                "docker_action" => {
-                    json!({ "connectionId": "ghost", "containerId": "d4a7c9f1e2b3", "action": "start" })
                 }
                 "sftp_upload" => json!({ "connectionId": "ghost",
                     "localPath": "/tmp/in", "remotePath": "/tmp/out" }),
@@ -8699,13 +7633,7 @@ mod tests {
             assert_eq!(forwarded["connectionId"], "ghost");
         }
         // 本地工具与本地无连接工具不进转发计划。
-        for name in [
-            "ssh_close",
-            "ssh_list_connections",
-            "ssh_alert_triage",
-            "ssh_list_known_hosts",
-            "ssh_quick_sudo_profiles_list",
-        ] {
+        for name in ["ssh_close", "ssh_list_connections", "ssh_list_known_hosts"] {
             let plan = state
                 .bridge_forward_plan(name, &json!({ "connectionId": "ghost" }))
                 .await
@@ -9030,80 +7958,6 @@ mod tests {
 
     /// alert_triage 工具面（ssh_alert_triage）扩类：network / oom /
     /// service / generic / 中英混合按 KEYWORDS 表实际行为断言；每条建议
-    /// 命令在工具出口处仍满足 D6（只读白名单可执行、无重定向/替换/sudo）。
-    #[tokio::test]
-    async fn alert_triage_tool_surface_classifies_extended_intents() {
-        let state = state();
-        let cases: [(&str, &str); 9] = [
-            // (payload, 期望 category)
-            (
-                r#"{"alertId":"n1","message":"network eth0 packet loss 5%, bandwidth saturated"}"#,
-                "network",
-            ),
-            // 中英混合：丢包 + bandwidth 双命中仍归 network。
-            (
-                r#"{"message":"网络抖动, 丢包严重, bandwidth 不足"}"#,
-                "network",
-            ),
-            // OOM 优先于 memory（out of memory 同时命中 memory 关键词）。
-            (
-                r#"{"message":"Out of memory: oom-kill killed process 4321 (java)"}"#,
-                "oom",
-            ),
-            (
-                r#"{"message":"systemd unit cron.service restart failed"}"#,
-                "service",
-            ),
-            // 零命中回落 generic。
-            (
-                r#"{"message":"backup job completed without errors at 03:00"}"#,
-                "generic",
-            ),
-            // 中英混合 CPU。
-            (r#"{"message":"CPU loadavg 飙升, 处理器过热"}"#, "cpu"),
-            (r#"{"message":"内存 swap 已满, mem usage 99%"}"#, "memory"),
-            (r#"{"message":"磁盘 no space left on device"}"#, "disk"),
-            (r#"{"message":"inode usage 98% on /var"}"#, "inode"),
-        ];
-        for (payload, expected) in cases {
-            let result = state
-                .call_tool("ssh_alert_triage", &json!({ "payload": payload }), None)
-                .await
-                .expect("triage must succeed offline");
-            let envelope: Value =
-                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-            assert_eq!(envelope["category"], expected, "payload: {payload}");
-            let suggestions = envelope["suggestions"].as_array().unwrap();
-            assert!(!suggestions.is_empty(), "payload: {payload}");
-            for item in suggestions {
-                let command = item["command"].as_str().unwrap();
-                assert_eq!(
-                    mcp_safety::assess_command(command),
-                    CommandRisk::ReadOnly,
-                    "suggestion not read-only: {command}"
-                );
-                assert!(!command.contains('>'));
-                assert!(!command.contains("sudo"));
-                assert!(!command.contains("$("));
-            }
-        }
-        // service 类建议替换出具体 unit 名（服务名抽取在工具面生效）。
-        let result = state
-            .call_tool(
-                "ssh_alert_triage",
-                &json!({ "payload": r#"{"message":"systemd unit cron.service restart failed"}"# }),
-                None,
-            )
-            .await
-            .unwrap();
-        let envelope: Value =
-            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(
-            envelope["suggestions"][0]["command"],
-            "systemctl status cron.service"
-        );
-    }
-
     /// settings 联动回归：mcp/settings/set 的每个可调项都能立即驱动受影响
     /// 工具的行为（传输根收窄、上传限额、confirm 档 fail-closed、scope 闸），
     /// settings_get 回显生效值与 persisted 值。
@@ -9347,11 +8201,7 @@ mod tests {
         assert!(error.contains("confirmDestructive"), "{error}");
         // 本地工具携带未知参数照常成功。
         let result = st
-            .call_tool(
-                "ssh_alert_triage",
-                &json!({ "payload": "cpu high", "extra": 42 }),
-                None,
-            )
+            .call_tool("ssh_list_known_hosts", &json!({ "extra": 42 }), None)
             .await
             .unwrap();
         assert_eq!(result["isError"], false);
@@ -9687,31 +8537,6 @@ mod dbx_bridge_tests {
     }
 
     #[tokio::test]
-    async fn raw_sftp_exists_maps_no_such_file_only() {
-        // 存在：LSTAT → ATTRS。
-        let (mut client, log) =
-            stub_raw_sftp(vec![sftp_raw::test_support::attrs_body(1, 0o100644)]).await;
-        assert!(raw_sftp_exists(&mut client, "/d/caf\u{e9}.txt")
-            .await
-            .unwrap());
-        let lstat = &sftp_raw::test_support::recorded_requests(&log)[1];
-        assert_eq!(lstat[0], 7); // FXP_LSTAT
-        assert_eq!(&lstat[9..], b"/d/caf\xe9.txt");
-
-        // 不存在：LSTAT → SSH_FX_NO_SUCH_FILE。
-        let (mut client, _) = stub_raw_sftp(vec![sftp_raw::test_support::status_body(2)]).await;
-        assert!(!raw_sftp_exists(&mut client, "/d/caf\u{e9}.txt")
-            .await
-            .unwrap());
-
-        // 其余错误如实上抛：绝不把权限失败误报成 exists:false（auto 分支
-        // 同契约）。
-        let (mut client, _) = stub_raw_sftp(vec![sftp_raw::test_support::status_body(3)]).await;
-        let error = raw_sftp_exists(&mut client, "/d/x").await.unwrap_err();
-        assert!(error.contains("status 3"), "{error}");
-    }
-
-    #[tokio::test]
     async fn raw_sftp_read_file_round_trips_latin1_path_and_flags_truncation() {
         // 截断：max_bytes=5，服务器回 11 字节 → truncated=true + 截到 5。
         let (mut client, log) = stub_raw_sftp(vec![
@@ -9899,21 +8724,5 @@ mod dbx_bridge_tests {
             &download_open[9..9 + raw_path.len()],
             &upload_open[9..9 + raw_path.len()]
         );
-    }
-
-    #[tokio::test]
-    async fn raw_sftp_chmod_sends_setstat_with_latin1_path_bytes() {
-        let (mut client, log) = stub_raw_sftp(vec![sftp_raw::test_support::status_body(0)]).await;
-        let result = raw_sftp_chmod(&mut client, "/d/caf\u{e9}.txt", 0o600)
-            .await
-            .unwrap();
-        assert_eq!(result["mode"], json!("0600"));
-        let setstat = &sftp_raw::test_support::recorded_requests(&log)[1];
-        assert_eq!(setstat[0], 9); // FXP_SETSTAT
-        assert_eq!(&setstat[9..20], b"/d/caf\xe9.txt");
-        // attrs 只带 permissions 子集：flags=ATTR_PERMISSIONS(0x4) + mode。
-        let attrs = &setstat[20..]; // path 之后紧跟编码 attrs
-        assert_eq!(&attrs[..4], &4_u32.to_be_bytes());
-        assert_eq!(&attrs[4..], &0o600_u32.to_be_bytes());
     }
 }

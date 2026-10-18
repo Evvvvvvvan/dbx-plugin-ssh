@@ -2605,32 +2605,40 @@ def main() -> None:
             print(f"    unknown-id / allowlist / empty-custom all rejected (available={editor_id})")
 
         def case_mcp_sftp_toolface():
-            # M17-B MCP 工具面：sftp_mkdir/sftp_list_dir/sftp_rename/sftp_remove
-            # （+ sftp_exists 收口）在 autonomous 模式经 mcp/call 基本往返。
+            # M17-B MCP 工具面（#203 瘦身后 = 只读浏览面）：sftp_list_dir /
+            # sftp_stat / sftp_read_file 在 autonomous 模式经 mcp/call 基本往返；
+            # 变更族（mkdir/rename/remove 等）已移出 MCP 面，改由 ssh_exec 走
+            # shell——与 agent 实际路径一致，一并验证该组合可用。
             # smoke_mcp.py 走独立 --mcp stdio 进程；这里沿既有 ssh_exec 先例走
             # embedded 桥（mcp/call + lifecycle），同一工具实现、无需第二进程。
-            created = call_tool_embedded("sftp_mkdir", {"path": mcp_dir}, connection_id=connection_id)
-            if created.get("created") is not True:
-                raise AssertionError(f"sftp_mkdir result: {created}")
-            listing = call_tool_embedded("sftp_list_dir", {"path": home}, connection_id=connection_id)
+            # 临时目录放 /tmp：mcp_safety 灾难门对家目录（≤2 层）下的递归
+            # rm 也拦（/tmp 下常规清理豁免），agent 实际使用同样会选 /tmp。
+            base = f"/tmp/.dbx-mcp-smoke-{int(time.time())}"
+            renamed = f"{base}-renamed"
+            call_tool_embedded("ssh_exec", {"command": f"mkdir -p '{base}'"},
+                               connection_id=connection_id)
+            listing = call_tool_embedded("sftp_list_dir", {"path": "/tmp"}, connection_id=connection_id)
             names = [str(e.get("name")) for e in listing.get("entries", [])]
-            if mcp_dir.rsplit("/", 1)[-1] not in names:
-                raise AssertionError(f"mcp sftp_list_dir missing {mcp_dir}: {names[:10]}…")
-            renamed = call_tool_embedded("sftp_rename",
-                                         {"sourcePath": mcp_dir, "targetPath": mcp_dir_renamed},
-                                         connection_id=connection_id)
-            if renamed.get("renamed") is not True:
-                raise AssertionError(f"sftp_rename result: {renamed}")
-            removed = call_tool_embedded("sftp_remove",
-                                         {"path": mcp_dir_renamed, "recursive": True},
-                                         connection_id=connection_id)
-            if removed.get("removed") is not True:
-                raise AssertionError(f"sftp_remove result: {removed}")
-            exists = call_tool_embedded("sftp_exists", {"path": mcp_dir_renamed},
-                                        connection_id=connection_id)
-            if exists.get("exists") is not False:
-                raise AssertionError(f"removed dir still exists per MCP tool: {exists}")
-            print("    mcp mkdir/list/rename/remove/exists round-trip ok")
+            if base.rsplit("/", 1)[-1] not in names:
+                raise AssertionError(f"mcp sftp_list_dir missing {base}: {names[:10]}…")
+            stat = call_tool_embedded("sftp_stat", {"path": base}, connection_id=connection_id)
+            if "size" not in stat or "permissions" not in stat:
+                raise AssertionError(f"mcp sftp_stat shape: {stat}")
+            inner = call_tool_embedded("sftp_list_dir", {"path": base},
+                                       connection_id=connection_id)
+            if not isinstance(inner.get("entries"), list):
+                raise AssertionError(f"mcp sftp_list_dir on dir: {inner}")
+            call_tool_embedded("ssh_exec",
+                               {"command": f"mv '{base}' '{renamed}'"},
+                               connection_id=connection_id)
+            call_tool_embedded("ssh_exec",
+                               {"command": f"rm -r '{renamed}'"},
+                               connection_id=connection_id)
+            after = call_tool_embedded("sftp_list_dir", {"path": "/tmp"}, connection_id=connection_id)
+            remaining = [str(e.get("name")) for e in after.get("entries", [])]
+            if renamed.rsplit("/", 1)[-1] in remaining:
+                raise AssertionError(f"removed dir still listed per MCP tool: {remaining[:10]}…")
+            print("    mcp list/stat + shell-mutation round-trip ok")
 
         print("\n--- alert triage + audit group ---")
         report.run("ssh/alert/triage normalize+classify+playbook", "ssh/alert/triage",

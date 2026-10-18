@@ -39,6 +39,8 @@ describe("ssh pluginStore wiring", () => {
         "ssh-terminal-appearance",
         // dock 面板精简工具条隐藏偏好。
         "ssh-panel-toolbar-hidden",
+        // Docker 浮层宽度（issue #170，拖拽手柄 300..720）。
+        "ssh-docker-panel-width",
         "telnet-connect-last",
         "serial-connect-last",
         "vnc-connect-last",

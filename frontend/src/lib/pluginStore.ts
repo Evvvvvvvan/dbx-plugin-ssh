@@ -56,6 +56,9 @@ export const PLUGIN_STORE_KEYS: readonly string[] = [
   "ssh-terminal-appearance",
   // dock 面板（底部栏）精简工具条的隐藏偏好（"1" = 隐藏）。
   "ssh-panel-toolbar-hidden",
+  // Docker 浮层宽度（issue #170，拖拽手柄调宽 300..720）：persistDockerPanelWidth
+  // 写穿。漏登记 = 水合不拉，拖宽后重启回落默认 680。
+  "ssh-docker-panel-width",
   // 结构化补全引擎选择（FIG wave-1，契约 §2.3）：SettingsDialog 引擎下拉
   // 自治读写，App 每次调度前直读（fig-safe 默认 / fig / off；fig 与 fig-safe
   // 批次 1 行为相同，差异自 generator 接线起）。

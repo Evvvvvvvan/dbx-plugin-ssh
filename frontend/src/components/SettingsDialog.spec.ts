@@ -86,6 +86,7 @@ function mountSettings(sessionId?: string) {
       webglEnabled: false,
       localShell: "/bin/zsh",
       terminalBehavior: { ...TERMINAL_BEHAVIOR_DEFAULTS },
+      paneDirection: "auto",
       terminalHotkeys: hotkeyBindings,
       applePlatform: false,
       actionLinks: { ...ACTION_LINK_SETTINGS_DEFAULTS, matchers: { ...ACTION_LINK_SETTINGS_DEFAULTS.matchers } },

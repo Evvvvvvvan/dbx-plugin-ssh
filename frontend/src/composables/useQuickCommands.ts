@@ -1,10 +1,13 @@
 import { ref, type Ref } from "vue";
 import type { Terminal } from "@xterm/xterm";
 import {
+  dissolveQuickCommandGroup,
   loadQuickCommandsFromStore,
+  migrateQuickCommandGroups,
   normalizeQuickCommands,
   persistQuickCommands,
   quickCommandText,
+  renameQuickCommandGroup,
   upsertQuickCommand,
   type QuickCommand,
 } from "../lib/quickCommands";
@@ -31,7 +34,8 @@ export function useQuickCommands(options: {
 }) {
   const { t, showNotice, session, commandRunning, terminalTransferBusy, terminal: terminalGet, trackPendingInput, sendTerminalBytes, hideGhostSuggestion } = options;
 
-// 快速命令：用户自定义片段（≤20 条）。
+// 快速命令：用户自定义片段（≤200 条，issue #201），可选分组（组信息反规范
+// 化在每条命令上，组视图由 lib 派生）。
 const quickCommands = ref<QuickCommand[]>([]);
 // 管理视图在途态（saving/importing 作为在途态传给设置节）。
 const quickSaving = ref(false);
@@ -48,7 +52,9 @@ async function hydrateQuickCommands() {
   }
   try {
     const response = await window.dbxPlugin.invoke<{ commands: unknown }>("ssh/quickCommands/list");
-    quickCommands.value = persistQuickCommands(normalizeQuickCommands(response.commands));
+    // 首次搬迁即做分组迁移（issue #201）：旧 sidecar 数据没有组字段，消毒
+    // 后天然归入未分组，写回的 pluginStore 即新 schema。
+    quickCommands.value = persistQuickCommands(migrateQuickCommandGroups(normalizeQuickCommands(response.commands)));
   } catch {
     // 后端不可用（如旧版 sidecar）：键未落，下次启动重试搬迁；内存态兜底。
   }
@@ -98,8 +104,9 @@ function sendSudoRefresh() {
 }
 
 /** 单条保存（新建/编辑共用）：id 缺省表示新建（前端生成 id）；名称兜底、
- * 截断与 20 条超限丢弃最旧由 upsertQuickCommand 维持（与原后端语义一致）。 */
-async function saveQuickCommand(command: { id?: string; name: string; command: string }) {
+ * 截断与 200 条超限丢弃最旧由 upsertQuickCommand 维持（与原后端语义一致）。
+ * groupId/groupName 可选：空组 id = 未分组（issue #201）。 */
+async function saveQuickCommand(command: { id?: string; name: string; command: string; groupId?: string; groupName?: string }) {
   if (quickSaving.value) return;
   quickSaving.value = true;
   try {
@@ -107,11 +114,24 @@ async function saveQuickCommand(command: { id?: string; name: string; command: s
       id: command.id ?? randomUUID(),
       name: command.name,
       command: command.command,
+      ...(command.groupId?.trim() ? { groupId: command.groupId.trim(), groupName: command.groupName?.trim() || command.groupId.trim() } : {}),
     };
     quickCommands.value = persistQuickCommands(upsertQuickCommand(quickCommands.value, entry));
   } finally {
     quickSaving.value = false;
   }
+}
+
+/** 分组改名（issue #201）：批量回写组名后整表落盘。 */
+async function renameQuickCommandGroupById(groupId: string, name: string) {
+  if (!groupId.trim() || !name.trim()) return;
+  quickCommands.value = persistQuickCommands(renameQuickCommandGroup(quickCommands.value, groupId.trim(), name.trim()));
+}
+
+/** 删除分组（issue #201）：组内命令移回未分组，命令本身保留。 */
+async function dissolveQuickCommandGroupById(groupId: string) {
+  if (!groupId.trim()) return;
+  quickCommands.value = persistQuickCommands(dissolveQuickCommandGroup(quickCommands.value, groupId.trim()));
 }
 
 /** 批量导入：本地逐条 upsert（超限丢最旧，与单条保存同语义）后一次性落盘。 */
@@ -139,8 +159,10 @@ async function importQuickCommands(items: Array<{ name: string; command: string 
     deleteQuickCommand,
     sendQuickCommand,
     pasteQuickCommand,
-    sendSudoRefresh,
-    saveQuickCommand,
-    importQuickCommands,
+  sendSudoRefresh,
+  saveQuickCommand,
+  renameQuickCommandGroupById,
+  dissolveQuickCommandGroupById,
+  importQuickCommands,
   };
 }

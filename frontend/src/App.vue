@@ -103,6 +103,7 @@ import {
   terminalSearchSeedFromSelection,
   normalizeDropTargetDir,
   resolveDropTargetDir,
+  transferBusyPaneClass,
   type TerminalSearchOptions,
 } from "./lib/terminalInteraction";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
@@ -125,7 +126,7 @@ import { pickModalFocusTarget } from "./lib/modalFocus";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
 import { readClipboardText, writeClipboardText, type ClipboardDeps } from "./lib/clipboardBridge";
 import { friendlySftpError } from "./lib/sftpErrors";
-import { terminalFlexBasis } from "./lib/paneLayout";
+import { paneDirectionClass, resolvePaneDirection, sanitizePaneDirection, terminalFlexBasis, type PaneDirectionPref } from "./lib/paneLayout";
 import { isCountdownActive } from "./lib/recordingCountdown";
 import { type SftpTypeFilter } from "./lib/sftpFileFilters";
 import {
@@ -161,7 +162,7 @@ import {
 import { COMMAND_HISTORY_LIMIT, mergeShellHistory, parseShellHistoryText, persistableCommandHistoryBuckets, pushCommandHistory, sanitizeCommandHistoryBuckets, sanitizeCommandHistoryLimit, trimCommandHistoryBuckets } from "./lib/commandHistory";
 import { EnterLineTracker, acceptCommandWithContinuation, canCaptureEnterLine, echoConfirmsLine, extractDesyncedCommand, extractEchoedCommand } from "./lib/terminalEnterCapture";
 import { applyLineEditControlChar } from "./lib/terminalLineModel";
-import { loadGhostTabAccept, matchesGhostFullAccept, matchesGhostWordAccept, saveGhostTabAccept } from "./lib/ghostAcceptKey";
+import { loadGhostTabAccept, matchesGhostFullAccept, matchesGhostWordAccept, resolveCtrlFRoute, saveGhostTabAccept } from "./lib/ghostAcceptKey";
 import { isPasswordPromptLine, loadPromptHintsDismissed, loadPromptHintsEnabled, savePromptHintsDismissed, savePromptHintsEnabled, shouldShowPromptHints } from "./lib/terminalPromptHints";
 import { readWorkbenchUiMirror, writeWorkbenchUiMirror } from "./lib/workbenchUiMirror";
 // 终端交互提示守卫（issue #150 及其反馈扩展）：远端询问输入/要求选择（MFA/
@@ -190,7 +191,7 @@ import type { CompletionItem } from "./lib/completion/core/types";
 import { sanitizeNameEncoding, type SftpNameEncoding } from "./lib/sftpName";
 import { batchUploadPercent, clampTransferConcurrency, clampTransferDownloadLimit, clampTransferMaxActive, runTransfers, sanitizeTransferDuplicatePolicy, type TransferDuplicatePolicy, type TransferTask,
 } from "./lib/transferQueue";
-import { filterQuickCommands, QUICK_COMMANDS_LIMIT } from "./lib/quickCommands";
+import { filterQuickCommands, groupQuickCommands, quickCommandGroupCount, type QuickCommandGroupView, QUICK_COMMANDS_LIMIT } from "./lib/quickCommands";
 import { flippedOverlayBottom, overlayBelowTop, type SuggestionAnchor } from "./lib/overlayPlacement";
 import { choosePromptHintsPlacement, PROMPT_HINTS_FALLBACK_BAR_HEIGHT } from "./lib/terminalPromptHints";
 import { registerWatch } from "./lib/watchEdits";
@@ -366,6 +367,7 @@ import GpuNpuMonitor from "./components/GpuNpuMonitor.vue";
 import FolderPickerDialog from "./components/FolderPickerDialog.vue";
 import SideNavPanel from "./components/SideNavPanel.vue";
 import DockerPanel from "./components/DockerPanel.vue";
+import { dockerPanelWidthStyle, DOCKER_PANEL_WIDTH_DEFAULT, DOCKER_PANEL_WIDTH_STORE_KEY, dockerPanelWidthAfterDrag, persistDockerPanelWidth, sanitizeDockerPanelWidth } from "./lib/dockerPanelWidth";
 import DockerWhaleLogo from "./components/DockerWhaleLogo.vue";
 import { Switch } from "./components/ui/switch";
 import { defaultPatternFor, newCustomEditorId, resolveEditorForFile, sanitizeEditorConfig, type CustomEditor, type EditorConfig, type KnownEditor, type ResolvedEditor } from "./lib/editorRules";
@@ -621,6 +623,8 @@ const suggestionMaxCharsState = ref(64);
 // ghost 接受键（Warp 多键模型）：→ / Ctrl+F / Ctrl+E 整段、Ctrl+→ 逐词恒可用
 // （lib/ghostAcceptKey.ts 匹配矩阵）；唯一可配置项是「Tab 接受建议」开关
 // （Warp Tab key behavior），pluginStore 权威 + 内存态供按键分支与键帽回显。
+// issue #108a 起 Ctrl+F 只在 ghost 建议可见待接受时作接受键，无 ghost 归终端
+// 搜索（iTerm2 同位，resolveCtrlFRoute 判定）；→ / Ctrl+E 行为不变。
 const ghostTabAccept = ref(loadGhostTabAccept());
 // 键位胶囊（Warp accept-autosuggestion-hint 同位）的下拉菜单与展示标签。
 const ghostKeycapMenuOpen = ref(false);
@@ -738,6 +742,10 @@ const hostKeyPrompt = ref<HostKeyPrompt>();
 const rememberHostKey = ref(true);
 const splitRatio = ref(58);
 const paneOrder = ref<SshWorkbenchPaneOrder>("terminal-left");
+// 布局方向偏好（issue #187）：auto 沿用 CSS 断点（窄屏上下/宽屏左右）；
+// vertical 始终上下（终端在上、SFTP 在下），horizontal 始终左右。持久化走
+// WORKBENCH_LAYOUT_KEY 布局偏好档（与 paneOrder 同层，writeWorkbenchState 写穿）。
+const paneDirection = ref<PaneDirectionPref>("auto");
 // SFTP 面板可见性：每个工作台即时开关（写入 workbenchState）；
 // 新工作台的初始值取全局"默认打开"偏好（pluginStore）。
 const sftpPaneOpen = ref(loadSftpPaneDefaultOpen());
@@ -928,6 +936,8 @@ const {
   pasteQuickCommand,
   sendSudoRefresh,
   saveQuickCommand,
+  renameQuickCommandGroupById,
+  dissolveQuickCommandGroupById,
   importQuickCommands,
 } = useQuickCommands({
   t: (key, values) => t(key, values),
@@ -948,6 +958,20 @@ const quickMenuOpen = ref(false);
 const quickSearch = ref("");
 const quickExpandedId = ref<string | null>(null);
 const filteredQuickCommands = computed(() => filterQuickCommands(quickCommands.value, quickSearch.value));
+// 分组视图（issue #201）：派生组 + 折叠态（会话内 UI 态，不持久化）。仅一条
+// 未分组时不渲染组头（等同旧扁平视图，避免噪声）；有真实分组才分组展示。
+const groupedQuickCommands = computed<QuickCommandGroupView[]>(() => groupQuickCommands(filteredQuickCommands.value));
+const quickHasRealGroups = computed(() => quickCommandGroupCount(quickCommands.value) > 0);
+const quickCollapsedGroups = ref<string[]>([]);
+function toggleQuickGroupCollapse(groupId: string) {
+  const index = quickCollapsedGroups.value.indexOf(groupId);
+  if (index >= 0) quickCollapsedGroups.value.splice(index, 1);
+  else quickCollapsedGroups.value.push(groupId);
+}
+function quickGroupName(group: QuickCommandGroupView): string {
+  return group.id ? group.name : t("quickCommandsUngrouped");
+}
+const quickCommandGroupSummary = computed(() => t("quickCommandsGroupSummary", { groups: quickCommandGroupCount(quickCommands.value), count: quickCommands.value.length }));
 // 命令建议 + 结构化补全（FIG wave-1）：浮层/引擎/调度中枢收口在
 // composables/useCommandSuggestions。
 const {
@@ -1742,8 +1766,15 @@ const terminalBasis = computed(() => ({
 }));
 const orderedPaneClass = computed(() => [
   paneOrder.value === "sftp-left" ? "panes panes--reversed" : "panes",
+  paneDirectionClass(paneDirection.value),
   sftpPaneOpen.value ? "" : "panes--solo",
 ].filter(Boolean).join(" "));
+// 分栏当前生效轴向：auto 模式下跟随视口断点（与 style.css @media 同值），
+// 强制模式恒定。事件时机（拖拽/键盘）现读现用，不做响应式缓存——resize 不会
+// 触发重算，但下次事件自然取到新值。
+function currentPaneDirection(): "column" | "row" {
+  return resolvePaneDirection({ pref: paneDirection.value, viewportWidth: typeof window !== "undefined" ? window.innerWidth : undefined });
+}
 // 列表排序/搜索/列布局/虚拟滚动：收口在 composables/useSftpListLayout。
 const {
   sortedEntries,
@@ -1790,6 +1821,7 @@ function applyWorkbenchLayoutPrefs() {
   }
   if (!prefs) return;
   if (prefs.paneOrder) paneOrder.value = prefs.paneOrder;
+  if (prefs.paneDirection) paneDirection.value = sanitizePaneDirection(prefs.paneDirection);
   if (prefs.splitRatio !== undefined) splitRatio.value = prefs.splitRatio;
   // 面板开合记的是用户最近一次的手动切换；偏好里没有时维持设置页的
   // 「默认打开」偏好（sftpPaneOpen ref 的初始值即来自它）。
@@ -1882,6 +1914,7 @@ function writeWorkbenchState() {
   try {
     pluginStore.setItem(WORKBENCH_LAYOUT_KEY, JSON.stringify({
       paneOrder: paneOrder.value,
+      paneDirection: paneDirection.value,
       splitRatio: splitRatio.value,
       sftpPaneOpen: sftpPaneOpen.value,
       visibleColumns: visibleColumns.value,
@@ -2358,6 +2391,18 @@ function handleTerminalKey(event: KeyboardEvent) {
     // 用过即散：接受 ghost 命中引导条教的键位（→ / Ctrl+F / Ctrl+E），此后不再教。
     dismissPromptHints();
     acceptGhostSuggestion();
+    return consume();
+  }
+  // Ctrl+F 终端搜索（issue #108a，iTerm2 同位）：ghost 建议可见待接受时上方
+  // 分支已把 Ctrl+F 消费为整段接受（Warp 键位模型不变）；无 ghost 才轮到
+  // 搜索。传输占用（trz/zmodem 协议拥有输入流）时放行——与 resolveTerminalInputRoute
+  // 同判，不打断传输（Ctrl+F 的 0x06 由传输 filter/远端自行解释）。
+  if (
+    event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey &&
+    event.key.toLowerCase() === "f" &&
+    resolveCtrlFRoute({ ghostVisible: !!ghostMatch.value, transferBusy: terminalTransferBusy.value }) === "search"
+  ) {
+    openTerminalSearch();
     return consume();
   }
   // 命令建议浮层开启时优先消费导航/回填键；Tab 仅在延伸/显式选中时回填，
@@ -3597,6 +3642,10 @@ const {
   loadDirectory: (path?: string) => loadDirectory(path),
   // 懒引用：save 链/trzszBusy 都在本调用点之后才声明（TDZ），闭包只在传输时执行。
   receiveAllowed: () => !trzszBusy.value,
+  // 经典 rz 提示（issue #171）：选文件必须在用户手势内触发隐藏 input click；
+  // 取消/超时后收起提示横幅。
+  pickUploadFiles: () => zmodemInput.value?.click(),
+  dismissNotice: () => { noticeOpen.value = false; noticeActions.value = []; },
   probeLocalCapabilities: () => probeLocalCapabilities(),
   saveHostFile: (chunks, fileName) => saveHostFile(chunks, fileName),
   loadDownloadUseDefaultDir, askDownloadTarget, loadDownloadDir, resolveDownloadConflictFor,
@@ -4092,16 +4141,18 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
       return;
     }
     const attemptMs = Date.now() - attemptStarted;
-    // "Connection is not active"：sidecar 连接注册表还没有该连接。boot 恢复
-    // 场景先等待宿主重放 connect 生命周期；非 boot 路径先主动请求宿主重放，
-    // 成功后在有界窗口内轮询。宿主请求失败则立即呈现错误。认证 /
-    // host-key 拒绝是秒级永久错误，重试不可能自愈——跳过重试直接进 error 态，
-    // 呈现 friendly 文案 + Reconnect 出口（P1-1）。决策细节见 connectRetry.ts。
+    // "Connection is not active"：sidecar 连接注册表还没有该连接。web 刷新后
+    // 宿主进程不重启、不会重放 connection/connect（#202），boot 恢复与手动
+    // 场景等价——首败都主动请求宿主按最新配置重开一次（幂等；webview 拿不到
+    // 凭据，boot 态调用安全），成功后在有界窗口内轮询。宿主请求失败则立即
+    // 呈现错误。认证 / host-key 拒绝是秒级永久错误，重试不可能自愈——跳过
+    // 重试直接进 error 态，呈现 friendly 文案 + Reconnect 出口（P1-1）。
+    // 决策细节见 connectRetry.ts。
     const inactive = isConnectionInactiveError(cause);
     // A live workbench can outlast its sidecar connection registration. Ask
     // the host to replay the vault-backed lifecycle once before polling for
     // the new registration. The webview never receives the credentials.
-    if (inactive && !bootRestore && openRetryAttempt === 0 && !hostReopenAttempted) {
+    if (inactive && openRetryAttempt === 0 && !hostReopenAttempted) {
       await requestHostReopenConnection();
     }
     // 预拨号面板的引导竞态：宿主在创建条目时已开始 connect，openSession 只
@@ -5102,6 +5153,42 @@ const forwardsOpen = ref(false);
 // 覆盖终端一角，不占分栏宽度；关闭即卸载并停轮询。面板本体仍由 DockerPanel
 // 自治（会话解析/轮询/动作/引擎设置都在组件内）。
 const dockerPanelOpen = ref(false);
+// 面板宽度（issue #170）：左缘拖拽手柄调宽（300..720，lib/dockerPanelWidth
+// 纯计算），pluginStore 持久化、启动水合；内联宽度保留 calc 容器守卫。
+function loadDockerPanelWidth(): number {
+  try {
+    return sanitizeDockerPanelWidth(pluginStore.getItem(DOCKER_PANEL_WIDTH_STORE_KEY)) ?? DOCKER_PANEL_WIDTH_DEFAULT;
+  } catch {
+    return DOCKER_PANEL_WIDTH_DEFAULT;
+  }
+}
+const dockerPanelWidth = ref(loadDockerPanelWidth());
+const dockerPanelResizing = ref(false);
+function startDockerPanelResize(event: PointerEvent) {
+  event.preventDefault();
+  const startX = event.clientX;
+  const startWidth = dockerPanelWidth.value;
+  dockerPanelResizing.value = true;
+  const handle = event.currentTarget as HTMLElement;
+  const move = (next: PointerEvent) => {
+    // 浮层锚右缘、左缘拖拽：向左拖 = 变宽（纯计算在 lib，钳制在内）。
+    dockerPanelWidth.value = dockerPanelWidthAfterDrag({ startWidth, startX, currentX: next.clientX });
+  };
+  const release = () => {
+    handle.removeEventListener("pointermove", move);
+    handle.removeEventListener("pointerup", release);
+    handle.removeEventListener("pointercancel", release);
+    if (handle.hasPointerCapture(event.pointerId)) {
+      try { handle.releasePointerCapture(event.pointerId); } catch { /* 已被隐式释放 */ }
+    }
+    dockerPanelResizing.value = false;
+    persistDockerPanelWidth(dockerPanelWidth.value);
+  };
+  handle.setPointerCapture(event.pointerId);
+  handle.addEventListener("pointermove", move);
+  handle.addEventListener("pointerup", release);
+  handle.addEventListener("pointercancel", release);
+}
 
 // 关键词高亮：规则表 CRUD 收口在 composables/useHighlightRules（渲染引擎在下方）。
 const {
@@ -6311,6 +6398,14 @@ function applyTerminalBehavior() {
 }
 
 /** 行为设置局部更新（设置页控件）：归一化 → 持久化 → 即时生效。 */
+// 布局方向偏好改动（issue #187）：轴向切换后终端/SFTP 尺寸变化，重排 xterm。
+// 持久化由 WORKBENCH_LAYOUT watch 统一写穿。
+function setPaneDirection(value: PaneDirectionPref) {
+  if (paneDirection.value === value) return;
+  paneDirection.value = value;
+  scheduleFit();
+}
+
 function updateTerminalBehavior(patch: Partial<TerminalBehaviorSettings>) {
   const next = sanitizeTerminalBehavior({ ...terminalBehavior.value, ...patch });
   const copyChanged = next.copyOnSelect !== terminalBehavior.value.copyOnSelect;
@@ -6334,12 +6429,20 @@ function startDividerDrag(event: PointerEvent) {
   const container = paneContainer.value;
   if (!container) return;
   const pointerId = event.pointerId;
+  // 纵向布局（强制上下或窄屏断点）把手沿 Y 轴拖拽：按下时定轴，拖动中不变。
+  const vertical = currentPaneDirection() === "column";
   const move = (next: PointerEvent) => {
     if (next.pointerId !== pointerId) return;
     const bounds = container.getBoundingClientRect();
-    const fromLeft = ((next.clientX - bounds.left) / bounds.width) * 100;
-    const terminalPercent = paneOrder.value === "terminal-left" ? fromLeft : 100 - fromLeft;
-    splitRatio.value = Math.max(35, Math.min(80, terminalPercent));
+    if (vertical) {
+      // splitRatio 是终端占比；纵向终端恒在上，把手下移 = 终端变高。
+      const fromTop = ((next.clientY - bounds.top) / bounds.height) * 100;
+      splitRatio.value = Math.max(35, Math.min(80, fromTop));
+    } else {
+      const fromLeft = ((next.clientX - bounds.left) / bounds.width) * 100;
+      const terminalPercent = paneOrder.value === "terminal-left" ? fromLeft : 100 - fromLeft;
+      splitRatio.value = Math.max(35, Math.min(80, terminalPercent));
+    }
     scheduleFit();
   };
   // pointercancel 触发时指针已被移出 active 集合：releasePointerCapture 对非
@@ -6361,24 +6464,35 @@ function startDividerDrag(event: PointerEvent) {
   container.addEventListener("pointercancel", release);
 }
 
-// 分栏把手键盘通道（pointer 拖拽对键盘用户不可达）：左右方向键把手 ±16px，
-// Shift 加速 ×3。`delta > 0` 统一表示「把手向右移」。
+// 分栏把手键盘通道（pointer 拖拽对键盘用户不可达）：横向布局左右方向键
+// ±16px，纵向布局上下方向键 ±16px，Shift 加速 ×3。`delta > 0` 表示「把手
+// 向右/向下移」（终端占比随之增大/减小由 nudgeSplitDivider 按轴解释）。
 const DIVIDER_KEY_STEP_PX = 16;
 function onDividerKeydown(event: KeyboardEvent, nudge: (deltaPx: number) => void) {
-  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  const vertical = currentPaneDirection() === "column";
+  const horizontalKeys = event.key === "ArrowLeft" || event.key === "ArrowRight";
+  const verticalKeys = event.key === "ArrowUp" || event.key === "ArrowDown";
+  if (vertical ? !verticalKeys : !horizontalKeys) return;
   event.preventDefault();
   const magnitude = event.shiftKey ? DIVIDER_KEY_STEP_PX * 3 : DIVIDER_KEY_STEP_PX;
-  nudge(event.key === "ArrowRight" ? magnitude : -magnitude);
+  const forward = vertical ? event.key === "ArrowDown" : event.key === "ArrowRight";
+  nudge(forward ? magnitude : -magnitude);
 }
 
 function nudgeSplitDivider(deltaPx: number) {
   const container = paneContainer.value;
   if (!container) return;
   const bounds = container.getBoundingClientRect();
-  if (!bounds.width) return;
-  // splitRatio 是终端占比：terminal-left 时把手右移 = 终端变宽；否则反向。
-  const sign = paneOrder.value === "terminal-left" ? 1 : -1;
-  splitRatio.value = Math.max(35, Math.min(80, splitRatio.value + (deltaPx / bounds.width) * 100 * sign));
+  // splitRatio 是终端占比：横向 terminal-left 时把手右移 = 终端变宽（sftp-left
+  // 反向）；纵向终端恒在上，把手下移 = 终端变高。
+  if (currentPaneDirection() === "column") {
+    if (!bounds.height) return;
+    splitRatio.value = Math.max(35, Math.min(80, splitRatio.value + (deltaPx / bounds.height) * 100));
+  } else {
+    if (!bounds.width) return;
+    const sign = paneOrder.value === "terminal-left" ? 1 : -1;
+    splitRatio.value = Math.max(35, Math.min(80, splitRatio.value + (deltaPx / bounds.width) * 100 * sign));
+  }
   scheduleFit();
   persistState();
 }
@@ -8209,7 +8323,7 @@ async function reattachProtocolSession(): Promise<boolean> {
   return true;
 }
 
-watch([splitRatio, paneOrder, sftpPaneOpen, followDirectory, sudoMode, visibleColumns, sftpShowHidden, sort], persistState, { deep: true });
+watch([splitRatio, paneOrder, paneDirection, sftpPaneOpen, followDirectory, sudoMode, visibleColumns, sftpShowHidden, sort], persistState, { deep: true });
 
 // SFTP 自动连接关闭时的惰性加载：面板从收起到打开的瞬间才补发首次列目录
 // （连接时已打开的面板不触发；已加载过或无会话也不触发，见 shouldLazyLoadSftpListing）。
@@ -8741,7 +8855,33 @@ watch(historyScope, () => {
             </div>
             <div v-if="!quickCommands.length" class="empty compact">{{ t("quickCommandsEmpty") }}</div>
             <div v-else-if="!filteredQuickCommands.length" class="empty compact">{{ t("quickCommandsNoMatch") }}</div>
-            <div v-for="item in filteredQuickCommands" :key="item.id" class="quick-command-row quick-card" :class="{ expanded: quickExpandedId === item.id }">
+            <template v-else-if="quickHasRealGroups">
+              <section v-for="group in groupedQuickCommands" :key="group.id || '__ungrouped__'" class="quick-group">
+                <button class="quick-group-head" :aria-expanded="!quickCollapsedGroups.includes(group.id)" @click="toggleQuickGroupCollapse(group.id)">
+                  <ChevronDown v-if="!quickCollapsedGroups.includes(group.id)" class="quick-group-chevron" />
+                  <ChevronRight v-else class="quick-group-chevron" />
+                  <span class="quick-group-name">{{ quickGroupName(group) }}</span>
+                  <span class="quick-group-count">{{ group.commands.length }}</span>
+                </button>
+                <template v-if="!quickCollapsedGroups.includes(group.id)">
+                  <div v-for="item in group.commands" :key="item.id" class="quick-command-row quick-card" :class="{ expanded: quickExpandedId === item.id }">
+                    <button class="quick-card-main" :title="item.command" :aria-label="item.command" @click="toggleQuickExpand(item.id)">
+                      <Braces class="quick-card-icon" />
+                      <span class="quick-card-text">
+                        <strong>{{ item.name }}</strong>
+                        <span class="mono">{{ item.command }}</span>
+                      </span>
+                    </button>
+                    <div class="quick-card-actions">
+                      <button class="quick-action" :disabled="!connected" @click="sendQuickCommand(item)">{{ t("quickCommandRun") }}</button>
+                      <button class="quick-action" :disabled="!connected" @click="pasteQuickCommand(item)">{{ t("quickCommandPaste") }}</button>
+                    </div>
+                    <div v-if="quickExpandedId === item.id" class="quick-card-full mono">{{ item.command }}</div>
+                  </div>
+                </template>
+              </section>
+            </template>
+            <div v-for="item in filteredQuickCommands" v-else :key="item.id" class="quick-command-row quick-card" :class="{ expanded: quickExpandedId === item.id }">
               <button class="quick-card-main" :title="item.command" :aria-label="item.command" @click="toggleQuickExpand(item.id)">
                 <Braces class="quick-card-icon" />
                 <span class="quick-card-text">
@@ -8756,7 +8896,7 @@ watch(historyScope, () => {
               <div v-if="quickExpandedId === item.id" class="quick-card-full mono">{{ item.command }}</div>
             </div>
             <footer class="quick-command-footer quick-command-footer--readonly">
-              <span class="quick-command-limit">{{ t("quickCommandsLimit", { count: quickCommands.length, limit: 20 }) }}</span>
+              <span class="quick-command-limit">{{ quickCommandGroupSummary }}</span>
               <span class="quick-command-manage-hint">{{ t("quickCommands.manageHint") }}</span>
             </footer>
             </PopoverContent>
@@ -8973,7 +9113,7 @@ watch(historyScope, () => {
     <section ref="paneContainer" :class="orderedPaneClass">
       <ContextMenu :open="terminalMenuOpen" @update:open="(open) => { if (!open) terminalMenuOpen = false; }">
         <ContextMenuTrigger as-child>
-      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed, 'gutter-visible': gutterPaneVisible, 'wallpaper-active': wallpaperActive }" :style="[terminalBasis, gutterPaneStyle]" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave="onTerminalDragLeave" @drop.prevent="onTerminalDrop($event)">
+      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed, 'gutter-visible': gutterPaneVisible, 'wallpaper-active': wallpaperActive, ...transferBusyPaneClass(terminalTransferBusy) }" :style="[terminalBasis, gutterPaneStyle]" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave="onTerminalDragLeave" @drop.prevent="onTerminalDrop($event)">
         <!-- P2-9 背景图层：pointer-events:none 垫底（DOM 序先于 terminal-host），
              透明度 0.1-0.9 由设置页滑杆控制；开启期间强制 DOM 渲染器透出本层。 -->
         <div v-if="wallpaperActive" class="terminal-wallpaper" :style="{ backgroundImage: `url(${wallpaperDataUrl})`, opacity: wallpaperOpacity / 100 }" aria-hidden="true" />
@@ -9476,7 +9616,8 @@ watch(historyScope, () => {
              关闭即卸载停轮询。与指标/录制浮条同角族（同开时后挂者置顶，语义同
              recordings）。内嵌引擎设置 Popover 与确认/日志 Dialog 仍 portal 到
              body。宽度按容器表自然宽给足，窄屏收 100%-16px。 -->
-        <section v-if="dockerPanelOpen" class="docker-float">
+        <section v-if="dockerPanelOpen" class="docker-float" :class="{ 'resize-active': dockerPanelResizing }" :style="{ width: dockerPanelWidthStyle(dockerPanelWidth) }">
+          <div class="docker-float-resize" role="separator" aria-orientation="vertical" :aria-valuenow="dockerPanelWidth" :title="t('docker.dockerResizeHint')" @pointerdown="startDockerPanelResize" />
           <header>
             <h2>{{ t("docker.toolbarTitle") }}</h2>
             <button class="icon-button" :title="t('close')" :aria-label="t('close')" @click="dockerPanelOpen = false"><X /></button>
@@ -9643,7 +9784,7 @@ watch(historyScope, () => {
         v-if="sftpPaneOpen && !isRdpConnection && !localUiMode"
         class="divider"
         role="separator"
-        aria-orientation="vertical"
+        :aria-orientation="currentPaneDirection() === 'column' ? 'horizontal' : 'vertical'"
         :aria-valuenow="Math.round(splitRatio)"
         aria-valuemin="35"
         aria-valuemax="80"
@@ -10296,6 +10437,8 @@ watch(historyScope, () => {
       :local-shell="localShellPref"
       @set-local-shell="setLocalShellPref"
       :terminal-behavior="terminalBehavior"
+      :pane-direction="paneDirection"
+      @update:pane-direction="setPaneDirection"
       :terminal-hotkeys="terminalHotkeys"
       :apple-platform="applePlatform"
       :action-links="actionLinksSettings"
@@ -10329,6 +10472,8 @@ watch(historyScope, () => {
       @save-quick-command="saveQuickCommand"
       @delete-quick-command="deleteQuickCommand"
       @import-quick-commands="importQuickCommands"
+      @rename-quick-command-group="renameQuickCommandGroupById"
+      @dissolve-quick-command-group="dissolveQuickCommandGroupById"
       @browse-download-dir="folderPickerTarget = 'settings'"
       @update:webgl="setWebglEnabled"
       @update-behavior="updateTerminalBehavior"
@@ -10786,6 +10931,13 @@ watch(historyScope, () => {
 .quick-action { height: 22px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 10px; cursor: pointer; }
 .quick-action:hover:not(:disabled) { background: var(--accent); }
 .quick-card-full { flex: 1 1 100%; margin: 2px 4px 4px 27px; color: var(--foreground); font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* 分组头（issue #201）：可折叠 + 组名 + 条数徽标；未分组同样式。 */
+.quick-group { display: flex; flex-direction: column; }
+.quick-group-head { display: flex; align-items: center; gap: 5px; border: 0; padding: 3px 4px; background: transparent; color: var(--muted-foreground); text-align: left; cursor: pointer; }
+.quick-group-head:hover { color: var(--foreground); }
+.quick-group-chevron { width: 13px; height: 13px; flex: 0 0 13px; }
+.quick-group-name { min-width: 0; flex: 1; overflow: hidden; font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.quick-group-count { flex: 0 0 auto; border-radius: 8px; padding: 0 6px; background: var(--muted); color: var(--muted-foreground); font-size: 9px; line-height: 15px; }
 /* 只读 footer：限额 + "管理入口在设置" 指引，不再有编辑动作。 */
 .quick-command-footer { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--border); margin-top: 4px; padding-top: 8px; }
 .quick-command-footer--readonly { justify-content: space-between; }

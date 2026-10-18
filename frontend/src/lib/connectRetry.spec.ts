@@ -71,8 +71,10 @@ describe("decideConnectRetry", () => {
     expect(decideConnectRetry({ ...BASE, inactive: true, hostReopenFailed: true, cause: new Error("Connection is not active") })).toEqual({ kind: "fail" });
   });
 
-  it("keeps boot restore retries independent from an earlier host reopen failure", () => {
-    expect(decideConnectRetry({ ...BASE, inactive: true, bootRestore: true, hostReopenFailed: true, cause: new Error("Connection is not active") })).toEqual({ kind: "retry", attempt: 1, delayMs: BOOT_RESTORE_RETRY_DELAY_MS });
+  it("fails boot restore immediately after a host reopen rejection (#202)", () => {
+    // web 刷新后宿主进程不重启、不会重放 connect：boot 窗口等不到宿主自动
+    // 重放，宿主明确拒绝重开即终态，不再烧满 12×1s 轮询。
+    expect(decideConnectRetry({ ...BASE, inactive: true, bootRestore: true, hostReopenFailed: true, cause: new Error("Connection is not active") })).toEqual({ kind: "fail" });
   });
 
   it("polls inactive errors during boot restore on the dedicated restore window", () => {

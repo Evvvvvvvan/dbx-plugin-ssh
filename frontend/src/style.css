@@ -494,6 +494,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .docker-float > header { display: flex; min-height: 34px; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--border); padding: 3px 4px 3px 12px; }
 .docker-float h2 { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; font-weight: 600; }
 .docker-float > .docker-panel { flex: 1 1 auto; min-height: 0; }
+/* 左缘拖拽手柄（issue #170）：骑在左缘上的 7px 竖条，向左拖 = 变宽
+   （纯计算 lib/dockerPanelWidth，300..720 钳制 + pluginStore 持久化）。
+   命中区左右各外扩 3px，落在浮层圆角外不遮挡内容；拖拽中光标全程列向。 */
+.docker-float-resize { position: absolute; z-index: 7; top: 0; bottom: 0; left: -3px; width: 7px; cursor: col-resize; touch-action: none; }
+.docker-float-resize:hover, .docker-float.resize-active .docker-float-resize { background: color-mix(in srgb, var(--primary) 35%, transparent); }
 .sftp-pane.drag-active { background: color-mix(in srgb, var(--primary) 4%, var(--background)); }
 
 /* SFTP 面板主体：左侧 tree/quick 双 tab 侧栏（可收起为窄条）+ 右侧文件区。
@@ -675,6 +680,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .trzsz-status .trzsz-cancel { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 4px; padding: 0; color: var(--muted-foreground); pointer-events: auto; }
 .trzsz-status .trzsz-cancel:hover { background: var(--accent); color: var(--foreground); }
 .trzsz-status .trzsz-cancel svg { width: 12px; height: 12px; flex: 0 0 12px; }
+/* 传输期间（trz/zmodem，issue #171）显式钉住系统鼠标指针：WKWebView 在原生
+   文件对话框往返后可能残留隐藏/错形光标（指针"看不见"，用户没法点取消）。
+   显式声明压过 .xterm 的 cursor:text 等继承/残留态；类切换本身会触发命中
+   重算，指针随之恢复可见，传输结束回落常规文本 I 形光标。 */
+.terminal-pane.transfer-busy, .terminal-pane.transfer-busy .terminal-host, .terminal-pane.transfer-busy .xterm { cursor: default; }
 /* Auto-reconnect banner pinned inside the terminal pane (top edge): keeps the
    frozen terminal content visible below while countdown + progress + a manual
    "reconnect now" action stay in view. */
@@ -727,12 +737,24 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .spinning { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* 布局方向偏好（issue #187）的纵向覆盖类：与窄屏断点同形的堆叠规则，
+   但不依赖视口——「始终上下」在宽屏同样生效。终端恒在上（.panes--reversed
+   的 row-reverse 被压成 column，左右换位对纵向无意义）。 */
+.panes--vertical, .panes--vertical.panes--reversed { flex-direction: column; }
+.panes--vertical .terminal-pane { width: 100%; height: 52%; flex-basis: auto !important; flex-shrink: 0; }
+.panes--vertical .sftp-pane { width: 100%; height: 48%; }
+.panes--vertical .divider { width: 100%; height: 1px; flex-basis: 1px; cursor: row-resize; }
+.panes--vertical .divider::after { top: -3px; bottom: -3px; left: 0; right: 0; }
+.panes--vertical.panes--solo .terminal-pane { height: 100%; }
+
 @media (max-width: 900px) {
   .follow-directory-control > span { display: none; }
-  .panes, .panes--reversed { flex-direction: column; }
-  .terminal-pane { width: 100%; height: 52%; flex-basis: auto !important; flex-shrink: 0; }
-  .sftp-pane { width: 100%; height: 48%; }
-  .divider { width: 100%; height: 1px; flex-basis: 1px; cursor: row-resize; }
+  /* 窄屏纵向仅是「自动」模式的缺省：强制左右（.panes--horizontal）不受断点
+     影响（issue #187），:not() 提一档特异性压过下面的列布局规则。 */
+  .panes:not(.panes--horizontal), .panes--reversed:not(.panes--horizontal) { flex-direction: column; }
+  .panes:not(.panes--horizontal) .terminal-pane { width: 100%; height: 52%; flex-basis: auto !important; flex-shrink: 0; }
+  .panes:not(.panes--horizontal) .sftp-pane { width: 100%; height: 48%; }
+  .panes:not(.panes--horizontal) .divider { width: 100%; height: 1px; flex-basis: 1px; cursor: row-resize; }
   /* 纵向布局把手命中区向下/上扩展。 */
   .divider::after { top: -3px; bottom: -3px; left: 0; right: 0; }
   /* SFTP 面板收起时终端占满整个工作台（含窄屏纵向布局）。 */
@@ -1180,13 +1202,18 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
    终端外观设置（对标 Tabby 的 Appearance）：主题快照列表、导入动作与色卡。
    设置弹窗自身无 scoped 样式块（历史约定），新控件样式统一落在这里。
    --------------------------------------------------------------------------- */
-.theme-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+/* issue #163：chip 不参与 flex 压缩（flex: 0 0 auto）——被压缩时内部文字
+   换行/溢出边框，视觉上与相邻 chip「裁切重叠」；超长主题名走省略号而不是
+   撑破换行，行高保持一致。 */
+.theme-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .theme-chip {
   display: inline-flex; align-items: center; gap: 5px;
+  flex: 0 0 auto; max-width: 100%;
   border: 1px solid var(--border); border-radius: var(--radius);
   padding: 4px 8px; background: var(--background); color: var(--foreground);
   font-size: 11px; cursor: pointer;
 }
+.theme-chip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .theme-chip:hover { background: var(--accent); }
 .theme-chip.active { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 12%, var(--background)); }
 .theme-chip--dirty { cursor: default; border-style: dashed; color: var(--muted-foreground); }
@@ -1195,9 +1222,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .theme-chip-delete { display: inline-flex; align-items: center; color: var(--muted-foreground); }
 .theme-chip-delete:hover { color: var(--destructive); }
 .theme-chip-delete svg { width: 11px; height: 11px; }
-.theme-save-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.theme-save-row input { min-width: 0; flex: 1 1 180px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
-.theme-save-row button { flex: 0 0 auto; }
+/* issue #163：主题名称行统一区块间距（10px 与设置页其他行一致）；两个动作
+   按钮补 inline-flex 对齐（icon 与文字基线一致、换行后整组下移不与输入框
+   挤在一行），文字不折行避免按钮内两行。 */
+.theme-save-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.theme-save-row input { min-width: 0; flex: 1 1 160px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.theme-save-row button { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.theme-save-row button svg { width: 12px; height: 12px; flex: 0 0 12px; }
 .appearance-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 /* 隐藏的原生文件选择器：外观导入与下载目录选择共用「按钮触发」的交互形态。 */
 .hidden-file-input { display: none; }

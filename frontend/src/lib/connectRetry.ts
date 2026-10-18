@@ -99,8 +99,11 @@ export function decideConnectRetry(options: {
 }): ConnectRetryDecision {
   // Polling the sidecar cannot restore credentials when the host rejected the
   // re-open request. Surface the failure immediately instead of making eleven
-  // identical ssh/session/open calls.
-  if (options.inactive && !options.bootRestore && options.hostReopenFailed) return { kind: "fail" };
+  // identical ssh/session/open calls. Boot restores are included (#202): after
+  // a web refresh the host process is still alive and will NOT replay
+  // connection/connect on its own, so the boot window is no longer waiting on
+  // a host-driven replay — a rejected reopen request is terminal there too.
+  if (options.inactive && options.hostReopenFailed) return { kind: "fail" };
   // "Connection is not active" means the sidecar lost the connection registry
   // (e.g. sidecar restart). The host must refill it; manual entry points poll
   // for a bounded window so a reopen self-heals, then fail with

@@ -2,7 +2,7 @@
 // 右键/粘贴/响铃等终端行为在 terminalBehavior.spec.ts。本文件只覆盖不可配置的
 // 门禁与搜索辅助逻辑。
 import { describe, expect, it } from "vitest";
-import { canAcceptFileDrop, canAcceptTerminalDrop, createTerminalCopyCache, isApplePlatform, isTerminalSelectAllShortcut, normalizeDropTargetDir, resolveDropTargetDir, resolveTerminalKeyAction, resolveTerminalPasteText, resolveTerminalRightClickAction, sanitizeSearchOptions, sanitizeSelectCopyEnabled, terminalSearchSeedFromSelection } from "./terminalInteraction";
+import { canAcceptFileDrop, canAcceptTerminalDrop, transferBusyPaneClass, createTerminalCopyCache, isApplePlatform, isTerminalSelectAllShortcut, normalizeDropTargetDir, resolveDropTargetDir, resolveTerminalKeyAction, resolveTerminalPasteText, resolveTerminalRightClickAction, sanitizeSearchOptions, sanitizeSelectCopyEnabled, terminalSearchSeedFromSelection } from "./terminalInteraction";
 
 describe("terminal interaction preferences (select-to-copy / right-click-paste)", () => {
   it("defaults select-to-copy to enabled and only honors an explicit 'false'", () => {
@@ -119,6 +119,13 @@ describe("terminal drop acceptance", () => {
 
   it("refuses terminal drops while the SFTP panel is open (the panel is the visible drop target)", () => {
     expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: false, sftpPaneOpen: true })).toBe(false);
+  });
+});
+
+describe("transfer-busy pane class (issue #171 cursor visibility)", () => {
+  it("pins the arrow cursor only while a trz/zmodem transfer owns the stream", () => {
+    expect(transferBusyPaneClass(true)).toEqual({ "transfer-busy": true });
+    expect(transferBusyPaneClass(false)).toEqual({});
   });
 });
 

@@ -162,6 +162,19 @@ export function canAcceptTerminalDrop(options: { connected: boolean; canWrite: b
 }
 
 /**
+ * Transfer-busy pane class (issue #171): during trz/zmodem transfers the OS
+ * pointer can end up invisible after the native file-picker round trip
+ * (WKWebView keeps a stale/hidden cursor shape until a CSS cursor change
+ * forces a hit-test re-evaluation). Pinning an explicit arrow cursor on the
+ * pane while a transfer is busy restores visibility, keeps the progress card
+ * and cancel button hoverable, and re-applies the cursor when the class
+ * toggles off so the regular text I-beam comes back.
+ */
+export function transferBusyPaneClass(transferBusy: boolean): { "transfer-busy": true } | Record<string, never> {
+  return transferBusy ? { "transfer-busy": true } : {};
+}
+
+/**
  * Whether a dragleave means the drag truly left the container subtree
  * (issue #197). dragleave also bubbles while the pointer moves between
  * children inside the container, so the old `@dragleave.self` binding

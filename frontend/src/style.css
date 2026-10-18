@@ -675,6 +675,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .trzsz-status .trzsz-cancel { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 4px; padding: 0; color: var(--muted-foreground); pointer-events: auto; }
 .trzsz-status .trzsz-cancel:hover { background: var(--accent); color: var(--foreground); }
 .trzsz-status .trzsz-cancel svg { width: 12px; height: 12px; flex: 0 0 12px; }
+/* 传输期间（trz/zmodem，issue #171）显式钉住系统鼠标指针：WKWebView 在原生
+   文件对话框往返后可能残留隐藏/错形光标（指针"看不见"，用户没法点取消）。
+   显式声明压过 .xterm 的 cursor:text 等继承/残留态；类切换本身会触发命中
+   重算，指针随之恢复可见，传输结束回落常规文本 I 形光标。 */
+.terminal-pane.transfer-busy, .terminal-pane.transfer-busy .terminal-host, .terminal-pane.transfer-busy .xterm { cursor: default; }
 /* Auto-reconnect banner pinned inside the terminal pane (top edge): keeps the
    frozen terminal content visible below while countdown + progress + a manual
    "reconnect now" action stay in view. */

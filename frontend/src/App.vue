@@ -103,6 +103,7 @@ import {
   terminalSearchSeedFromSelection,
   normalizeDropTargetDir,
   resolveDropTargetDir,
+  transferBusyPaneClass,
   type TerminalSearchOptions,
 } from "./lib/terminalInteraction";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
@@ -9013,7 +9014,7 @@ watch(historyScope, () => {
     <section ref="paneContainer" :class="orderedPaneClass">
       <ContextMenu :open="terminalMenuOpen" @update:open="(open) => { if (!open) terminalMenuOpen = false; }">
         <ContextMenuTrigger as-child>
-      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed, 'gutter-visible': gutterPaneVisible, 'wallpaper-active': wallpaperActive }" :style="[terminalBasis, gutterPaneStyle]" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave="onTerminalDragLeave" @drop.prevent="onTerminalDrop($event)">
+      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed, 'gutter-visible': gutterPaneVisible, 'wallpaper-active': wallpaperActive, ...transferBusyPaneClass(terminalTransferBusy) }" :style="[terminalBasis, gutterPaneStyle]" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave="onTerminalDragLeave" @drop.prevent="onTerminalDrop($event)">
         <!-- P2-9 背景图层：pointer-events:none 垫底（DOM 序先于 terminal-host），
              透明度 0.1-0.9 由设置页滑杆控制；开启期间强制 DOM 渲染器透出本层。 -->
         <div v-if="wallpaperActive" class="terminal-wallpaper" :style="{ backgroundImage: `url(${wallpaperDataUrl})`, opacity: wallpaperOpacity / 100 }" aria-hidden="true" />

@@ -1202,13 +1202,18 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
    终端外观设置（对标 Tabby 的 Appearance）：主题快照列表、导入动作与色卡。
    设置弹窗自身无 scoped 样式块（历史约定），新控件样式统一落在这里。
    --------------------------------------------------------------------------- */
-.theme-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+/* issue #163：chip 不参与 flex 压缩（flex: 0 0 auto）——被压缩时内部文字
+   换行/溢出边框，视觉上与相邻 chip「裁切重叠」；超长主题名走省略号而不是
+   撑破换行，行高保持一致。 */
+.theme-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .theme-chip {
   display: inline-flex; align-items: center; gap: 5px;
+  flex: 0 0 auto; max-width: 100%;
   border: 1px solid var(--border); border-radius: var(--radius);
   padding: 4px 8px; background: var(--background); color: var(--foreground);
   font-size: 11px; cursor: pointer;
 }
+.theme-chip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .theme-chip:hover { background: var(--accent); }
 .theme-chip.active { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 12%, var(--background)); }
 .theme-chip--dirty { cursor: default; border-style: dashed; color: var(--muted-foreground); }
@@ -1217,9 +1222,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .theme-chip-delete { display: inline-flex; align-items: center; color: var(--muted-foreground); }
 .theme-chip-delete:hover { color: var(--destructive); }
 .theme-chip-delete svg { width: 11px; height: 11px; }
-.theme-save-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.theme-save-row input { min-width: 0; flex: 1 1 180px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
-.theme-save-row button { flex: 0 0 auto; }
+/* issue #163：主题名称行统一区块间距（10px 与设置页其他行一致）；两个动作
+   按钮补 inline-flex 对齐（icon 与文字基线一致、换行后整组下移不与输入框
+   挤在一行），文字不折行避免按钮内两行。 */
+.theme-save-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.theme-save-row input { min-width: 0; flex: 1 1 160px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.theme-save-row button { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.theme-save-row button svg { width: 12px; height: 12px; flex: 0 0 12px; }
 .appearance-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 /* 隐藏的原生文件选择器：外观导入与下载目录选择共用「按钮触发」的交互形态。 */
 .hidden-file-input { display: none; }

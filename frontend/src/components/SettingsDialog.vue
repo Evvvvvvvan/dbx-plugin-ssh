@@ -1641,7 +1641,7 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
                 @click="applyTheme(theme)"
               >
                 <Check v-if="theme.id === activeThemeId" class="theme-chip-icon" aria-hidden="true" />
-                <span>{{ t(theme.name) }}</span>
+                <span class="theme-chip-label">{{ t(theme.name) }}</span>
                 <span
                   v-if="!theme.builtin"
                   class="theme-chip-delete"

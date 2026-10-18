@@ -14,6 +14,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
+# 与 test.sh 同款一次性数据目录：standalone 运行若读真实用户插件设置，压缩
+# 偏好等会让 smoke 期望误判（compression='none' vs gzip），且测试会写脏用户配置。
+export DBX_PLUGIN_DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dbx-pkg-verify-data.XXXXXX")"
 
 if [ "${1:-}" != "--no-build" ]; then
   echo "==> cargo build --release"

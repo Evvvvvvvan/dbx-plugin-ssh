@@ -82,7 +82,7 @@ WezTerm 的 ssh domain 支持 `spawn` 语义：在已认证 transport 上另开 
 | `mcp/settings/get`、`mcp/settings/set` | MCP SFTP 尺寸限制策略（maxRead/maxUpload/maxDownload，持久化，`--mcp` 同源生效）；`localTransferRoot` 配置 `sftp_upload`/`sftp_download` 本地传输根（绝对路径或空串回落默认根=临时目录+插件数据目录；敏感路径黑名单任何模式叠加生效）。**消费模式注**（存储迁移批 1）：`set` 为部分更新（未指定字段含 `localTransferRoot` 保留）；工作台把可同步子集（maxRead/maxUpload/maxDownload + persisted 权限档）镜像进宿主 `host.storage` 作云同步载荷，sidecar 文件仍是 serve 时即时权威（见 `IMPL_PLAN_STORAGE_SYNC.zh-CN.md`） |
 | `sftp/chmod` | 修改远端路径权限位（八进制）；`sftp_name_encoding` 为 `latin-1` 时路径整条按 wire 还原走裸包 SETSTAT（M17） |
 | `sftp/diskUsage` | 路径所在挂载的磁盘用量 |
-| `sftp/home`、`sftp/list`、`sftp/read` | 浏览、预览远端文件（`sftp/list` 支持可选 `includeOwner` 附加属主/属组；`sftp/read` 支持可选 `offset` 分片续读，见下文）。`sftp/home` 走高层客户端 `canonicalize(".")`（`ssh.rs:3505`；MCP `sftp_pwd` 同源，`mcp.rs:2473`）——**编码边界（登记，M28-A）**：家目录名非 UTF-8 时返回串已含 U+FFFD（高层 lossy 解码，原始字节不可恢复），以其为基准拼接的后续路径无法命中，与 `sftp/list` 节 M17 段登记的 shell cwd 回读同类不可恢复边界 |
+| `sftp/home`、`sftp/list`、`sftp/read` | 浏览、预览远端文件（`sftp/list` 支持可选 `includeOwner` 附加属主/属组；`sftp/read` 支持可选 `offset` 分片续读，见下文）。`sftp/home` 走高层客户端 `canonicalize(".")`（`ssh.rs:3505`）——**编码边界（登记，M28-A）**：家目录名非 UTF-8 时返回串已含 U+FFFD（高层 lossy 解码，原始字节不可恢复），以其为基准拼接的后续路径无法命中，与 `sftp/list` 节 M17 段登记的 shell cwd 回读同类不可恢复边界 |
 | `sftp/createDirectory`、`sftp/rename`、`sftp/delete`、`sftp/exists`、`sftp/rename-unique`、`sftp/touch`、`sftp/write`、`sftp/upload/start/finish`、`sftp/upload-local`、`watch/upload` | SFTP 写操作/预检（`sftp_name_encoding` 为 `latin-1` 时走裸包客户端字节保真，路径来源分工见 `sftp/list` 节 M15-B/M16 段；symlink 三命令见独立行） |
 | `sftp/upload/start`、`finish` | 上传事务生命周期（`resumeTaskId` 断点续传；`finish` 校验后交后台任务推送并立即返回，见「上传两阶段计数与收尾语义」）。start/finish 响应附 `compression: "gzip"\|"none"`（M33 压缩通道决策结果，见「压缩传输（gzip 混合方案）」节；旧客户端可忽略） |
 | `watch/start`、`watch/stop`、`watch/stop-all`、`watch/upload` | 外部编辑器回写 watcher（仅桌面端，见「外部编辑器 watcher（watch/*）」节）：`start` 对 `remote-edit/` 下载目录内的本机文件登记监听并返回 `{watchId}`，内容确认变化后发 `watch/file-modified` 事件；`upload` 把监听文件当前字节按 `sftp/write` 同款原子提交推回远端（latin-1 按所属连接编码走裸包字节保真，M21） |
@@ -250,9 +250,10 @@ service|generic`，同分按固定序、全零落 generic）。响应：
 suggestions: [{command, purposeKey}]}`（字段钳制：title/message ≤2 KiB、dataJson
 ≤16 KiB）。硬约束：playbook 每条命令必须过 `mcp_safety` 只读白名单（单测钉死），
 无重定向/`$()`/`sudo`——建议命令在只读连接上可直接经既有 exec 门执行。该方法是
-纯分诊、无需连接、从不执行命令；执行由调用方经 `ssh_exec` 等门禁完成。MCP 通道
-同名工具 `ssh_alert_triage`（非写工具、无连接参数）。工作台工具栏「告警排查」
-（Siren 图标）弹窗提供粘贴→分析→逐条发送到终端/全部复制。
+纯分诊、无需连接、从不执行命令；执行由调用方经 `ssh_exec` 等门禁完成。工作台
+工具栏「告警排查」（Siren 图标）弹窗提供粘贴→分析→逐条发送到终端/全部复制。
+MCP 工具面同名工具 `ssh_alert_triage` 已随 #203 工具瘦身移出（分类逻辑仍经本
+sidecar 方法提供）。
 
 ## Quick Sudo 全局配置
 
@@ -265,7 +266,7 @@ suggestions: [{command, purposeKey}]}`（字段钳制：title/message ≤2 KiB�
 - `sudo/profiles/save`：参数 `id?`（有=更新须存在，无=新建）、`name`、`sudoPassword?` / `totpSecret?`（空串/缺省=保持原值）、`clearSudoPassword?` / `clearTotpSecret?`（true=清除）、其余策略字段可选；返回 `{ profile: 视图, created }`。错误：名称为空/超长/重复（大小写不敏感）、id 不存在、超出上限。
 - `sudo/profiles/delete`：参数 `id`；返回 `{ success, removed }`；级联清理绑定，并对受影响连接的存活会话即时回退到本连接配置。
 - 连接绑定：`ssh/settings/set { sessionId, quickSudoProfileId }` 选择来源（见「运行时设置」）。绑定生效期间该配置**整体覆盖**本连接的 sudo 密码 / TOTP / 提示词 / 认证流 / `sudo_use_pty`（配置密码为空时回退登录密码，而非本连接 sudo 密码）；终端 auto sudo 与 `ssh/exec{sudo:true}` 走同一编排，自动使用所选来源。配置保存/删除即时热更新所有绑定它的存活会话（字段级覆盖，保留 OTP 防重放记账）。
-- MCP 通道：`ssh_quick_sudo_profiles_list` / `ssh_quick_sudo_profiles_save` / `ssh_quick_sudo_profiles_delete` 三个工具与上述方法同构；`ssh_exec_sudo` 支持可选 `quickSudoProfile`（id 或精确名称）引用全局配置作为默认凭据，调用内联 `sudoPassword` / `totpSecret` 显式给出时优先；引用在发起任何连接 I/O 前解析，未知名称快速报错。
+- MCP 通道：list/save/delete 的 MCP 工具面（`ssh_quick_sudo_profiles_*`）已随 #203 工具瘦身移出——profile 管理走工作台 UI 与本 sidecar 方法族，agent 面保留只读引用能力：`ssh_exec_sudo` 支持可选 `quickSudoProfile`（id 或精确名称）引用全局配置作为默认凭据，调用内联 `sudoPassword` / `totpSecret` 显式给出时优先；引用在发起任何连接 I/O 前解析，未知名称快速报错。
 - MCP 安全门（`mcp_safety.rs`）：`ssh_exec` / `ssh_exec_sudo` 在执行前做命令风险分级——只读连接上仅放行白名单巡检命令（`ssh_exec_sudo` 一律拒绝）；命中灾难模式的命令（`rm -rf` 系统根、mkfs/dd 裸设备、shutdown、`/etc/passwd|sudoers` 覆盖、SQL DROP 等）任何连接都要求 `confirmDestructive: true`，只读连接直接拒绝；`DBX_SSH_MCP_READ_ONLY=1` 可把整个 MCP 进程强制只读。详见 `MCP.zh-CN.md` 生产误操作防范节。
 - 入口桩：宿主贡献点仅有 `connection-provider` / `workbench` / `filesystem-provider` 三种，**没有插件级独立设置页**。因此完整管理 UI 挂在工作台（工具栏钥匙按钮直达管理弹窗；来源绑定在设置弹窗「sudo 凭据来源」，连接表单 `sudo_source` 三选一含 `global`）。连接表单原经 `quick-sudo-profiles` 动作按钮返回配置摘要文本，2026-10-03 按用户反馈移除（点击无响应的发现桩价值有限），`sudo/profiles/*` 方法族与工作台管理 UI 保留。
 
@@ -515,15 +516,15 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 - **shell 拼装入口的分层现状（登记；M26-A 文档审计修正，取代此前「仍按字面量发送」的过时表述）**：`sftp/diskUsage`（工作台与 MCP 两面路径均先 `normalize_remote_path` 再拼 `df -kP`）、`sftp/archive`/`sftp/extract`（`sourcePaths` 经 `clean_source_paths` 逐个归一，`archivePath`/`destinationPath` 归一，远端 `tar`/`mkdir -p` 命令逐参数 `shell_quote`）、sudo 模式全族（`sudo/stat`/`exists`/`touch`/`listDir`/`readFile`/`writeFile`/`mkdir`/`remove`/`removeAll`/`chmod`/`rename` 与 `sudo/download/*` 的路径参数全部归一 + `shell_quote`，`ls -la`/`stat`/`cat`/`head`/`tail`/`touch`/`mkdir -p`/`rm`/`chmod`/`mv`/`mktemp`/`chown` 均无裸拼路径）。这些入口的现状是「**路径参数已 normalize + shell_quote**」（穿越/注入安全），而非字面量裸拼；但 **shell 参数字节保真不可达**——SSH exec 的命令串是 UTF-8 String，latin-1 字节名（0x80–0xFF 单字节）经该边界按 UTF-8 重编码发出，远端按其 locale 解释，与服务器文件名的原始字节不一致：含转义/非 UTF-8 字节的名字经这些入口仍可能由远端报错（`df: no such file`、`tar: cannot stat` 类）或落到错误路径，clean 名（纯 ASCII）行为不变。sudo 族另维持一点原状：路径本就来自用户输入的显示文本，没有 wire 形式的名字来源，latin-1 裸包车道对其不适用。核实结论：该登记段原列入口经后续迭代（MCP diskUsage 见 M25）均已具备归一 + 引用，**没有完全字面量裸拼的残留入口**；真正不可变的是 exec 命令串的 UTF-8 字节边界本身，与同段 M17-A 登记的 copy/move 执行层、`stat -c` 属主查询边界同源。
 
 
-**M17 起 MCP 工具面复用同一编码判定并迁移列表/写工具（字节保真闭环）**：MCP 连接类工具在连接上下文内执行，编码判定直接复用连接级优先链——工具 `arguments` 的 `connectionId`（dispatch 层已把 `connectionName`/端点选择器归一化为该字段，stdio 与 `mcp/call` 同构）命中 `sftp_name_encoding_overrides` 时优先，否则跟随全局 `sftp_name_encoding`，缺省 auto；内联拨号（无 registry 身份）按未覆盖处理。latin-1 生效时：`sftp_list_dir` 改走裸包 READDIR（与工作台列表同源），**名字口径为显示形式**——`name`/`path` 均为 latin-1 解码文本（与工作台看到的显示名一致，不向 AI 消费者暴露 `%XX` wire 噪声），`.`/`..` 跳过，kind 按 v3 类型位归类（缺 permissions 退回 `file`）；`sftp_mkdir`/`sftp_remove`/`sftp_rename` 把路径参数整条按 latin-1 显示编码还原为服务器字节后走裸包 MKDIR/LSTAT+REMOVE/RMDIR/树删/RENAME（remove 判型分派与 auto 分支一致：symlink/文件 REMOVE、目录递归树删、非递归目录报错；rename 源 = 列表回传显示路径、目标 = AI 新输入显示文本，>U+00FF 字符 UTF-8 兜底）。**往返闭环**：latin-1 解码输出恒在 U+0000..=U+00FF 域内，显示 → 字节的 `latin1_encode_display` 是其精确逆变换——AI 把列表返回的 `path` 原样回传给写工具即落回原始字节（单测覆盖）。回退策略与工作台一致：列表 raw 路径任何失败回退高层（读操作安全），写操作仅裸包客户端**建立**失败回退；`auto` 模式下四个工具行为完全不变。
+**M17 起 MCP 工具面复用同一编码判定并迁移列表/写工具（字节保真闭环）**：MCP 连接类工具在连接上下文内执行，编码判定直接复用连接级优先链——工具 `arguments` 的 `connectionId`（dispatch 层已把 `connectionName`/端点选择器归一化为该字段，stdio 与 `mcp/call` 同构）命中 `sftp_name_encoding_overrides` 时优先，否则跟随全局 `sftp_name_encoding`，缺省 auto；内联拨号（无 registry 身份）按未覆盖处理。latin-1 生效时：`sftp_list_dir` 改走裸包 READDIR（与工作台列表同源），**名字口径为显示形式**——`name`/`path` 均为 latin-1 解码文本（与工作台看到的显示名一致，不向 AI 消费者暴露 `%XX` wire 噪声），`.`/`..` 跳过，kind 按 v3 类型位归类（缺 permissions 退回 `file`）；MCP 面写/变更工具已随 #203 瘦身移出（`sftp_write_file`/`sftp_upload`/`sftp_download` 保留裸包字节保真，见下），变更族改走 `ssh_exec` shell 命令。**往返闭环**：latin-1 解码输出恒在 U+0000..=U+00FF 域内，显示 → 字节的 `latin1_encode_display` 是其精确逆变换——AI 把列表返回的 `path` 原样回传给保留的读写工具即落回原始字节（单测覆盖）。回退策略与工作台一致：列表 raw 路径任何失败回退高层（读操作安全），写操作仅裸包客户端**建立**失败回退；`auto` 模式下四个工具行为完全不变。
 
 **遗留（登记）**：① ~~粘贴预检与 `sftp/copy`/`sftp/move` 未迁移 raw~~（M17 已收尾，见上——shell 执行层的字节边界仍登记在案）。② ~~终端拖入上传的自定义目标目录按 wire 前缀处理~~（M17 已收尾，见上；shell cwd 回读的非 UTF-8 字节丢失为不可恢复边界）。③ ~~MCP 工具面其余工具按字面量发送~~（M18 已收尾，见下）。
 
 **M18 起 MCP 工具面剩余 SFTP 工具完成 latin-1 字节保真迁移（M17 遗留 ③ 收尾）**：沿用 M17-B 同一模式（显示路径整条 `latin1_encode_display` 还原字节 + 连接级裸包客户端），latin-1 生效时：
 
-- **读侧**：`sftp_stat` 走裸包 LSTAT（不跟随符号链接，与工作台 `sftp/stat` M17 同口径）；裸包 v3 attrs 不携带 uid/gid，属主数字经 `stat -c '%u %g'` shell 查询尽力而为补齐（非 ASCII 显示名的 shell 字节参数不可控——M17-A 登记边界，失败回 `null`，主元数据不受影响）；`sftp_exists` 走裸包 LSTAT，**只把 SSH_FX_NO_SUCH_FILE 映射为「不存在」**，其余错误如实上抛（auto 分支「权限错误绝不误报 exists:false」契约保持）；`sftp_read_file` 走裸包 OPEN(READ)+READ 分块循环（32 KiB 粒度，v3 规范建议口径），大文件策略沿既有 MCP 边界——单次至多 `maxBytes`（上限 maxDownloadBytes），超出标记 `truncated`，`offset` 分页起点显式携带。
-- **写侧**：`sftp_write_file` 走裸包 OPEN(CREAT|WRITE|TRUNC) 截断直写 + WRITE 32 KiB 分块（**选型**：MCP 面沿既有直写语义，无工作台上传族的 `.dbx-part` 暂存需求；`overwrite=false` 的覆盖预检走裸包 LSTAT，与写入同一字节口径）；`sftp_chmod` 走裸包 SETSTAT（只带 permissions 子集）。
-- **copy/move**：`sftp_copy`/`sftp_move` 沿工作台 M17-A 同模式接入裸包车道（路径口径为**显示形式**，与 MCP 面 rename 一致）：`overwrite=false` 的覆盖预检逐个裸包 LSTAT，同目录 move 的 RENAME 快路径走裸包 RENAME（SFTPv3 不覆盖已存在目标，失败回落 shell `mv`）。**执行层边界（登记，同工作台）**：远端 `cp -a --`/`mv -f --` 的 exec 命令串是 UTF-8 String，服务器原始字节经 shell 参数不可控——copy 与跨目录 move 的执行层保持字面量发送：clean 名（纯 ASCII）行为不变，非 ASCII 名由服务器侧报错。
+- **读侧**：`sftp_stat` 走裸包 LSTAT（不跟随符号链接，与工作台 `sftp/stat` M17 同口径）；裸包 v3 attrs 不携带 uid/gid，属主数字经 `stat -c '%u %g'` shell 查询尽力而为补齐（非 ASCII 显示名的 shell 字节参数不可控——M17-A 登记边界，失败回 `null`，主元数据不受影响）；工作台 `sftp/exists` 走裸包 LSTAT，**只把 SSH_FX_NO_SUCH_FILE 映射为「不存在」**，其余错误如实上抛（auto 分支「权限错误绝不误报 exists:false」契约保持）；`sftp_read_file` 走裸包 OPEN(READ)+READ 分块循环（32 KiB 粒度，v3 规范建议口径），大文件策略沿既有 MCP 边界——单次至多 `maxBytes`（上限 maxDownloadBytes），超出标记 `truncated`，`offset` 分页起点显式携带。
+- **写侧**：`sftp_write_file` 走裸包 OPEN(CREAT|WRITE|TRUNC) 截断直写 + WRITE 32 KiB 分块（**选型**：MCP 面沿既有直写语义，无工作台上传族的 `.dbx-part` 暂存需求；`overwrite=false` 的覆盖预检走裸包 LSTAT，与写入同一字节口径）。
+- **copy/move**：工作台 RPC 面（`sftp/copy` / `sftp/move`）沿 M17-A 同模式接入裸包车道（路径口径为 wire 转义形式）：`overwrite=false` 的覆盖预检逐个裸包 LSTAT，同目录 move 的 RENAME 快路径走裸包 RENAME（SFTPv3 不覆盖已存在目标，失败回落 shell `mv`）。**执行层边界（登记，同工作台）**：远端 `cp -a --`/`mv -f --` 的 exec 命令串是 UTF-8 String，服务器原始字节经 shell 参数不可控——copy 与跨目录 move 的执行层保持字面量发送：clean 名（纯 ASCII）行为不变，非 ASCII 名由服务器侧报错。MCP 面同名工具已随 #203 瘦身移出。
 - **回退策略与 auto 不变性**：读操作（read_file/list_dir）裸包路径任何失败回退高层（读安全）；写操作（stat/exists/write_file/chmod/copy/move 的操作阶段）仅裸包客户端**建立**失败回退，操作错误原样上抛不重试；`auto` 模式下全部工具行为不变。每工具均有 latin-1 往返闭环单测（内存双工桩，字节级断言）。
 
 **M19 起 MCP 传输工具 `sftp_upload`/`sftp_download` 完成 latin-1 字节保真迁移（编码保真家族收尾）**：沿用 M17-B/M18 同一模式（显示路径整条 `latin1_encode_display` 还原字节 + 连接级裸包客户端），latin-1 生效时——`sftp_upload` 走裸包 OPEN(CREAT|WRITE|TRUNC) 截断直写 + WRITE 32 KiB 分块（**选型**：沿既有 MCP 传输直写语义，无工作台上传族的 `.dbx-part` 暂存需求；`overwrite=false` 的覆盖预检走裸包 LSTAT，与写入同一字节口径，复用 M18 `sftp_write_file` 直写核心）；`sftp_download` 走裸包 OPEN(READ)+READ 分块（读取量以 `maxDownloadBytes+1` 探测封顶，超限沿既有 post-read 口径报错；目录的 OPEN 被服务器拒绝后落回高层，由高层给出与 auto 分支一致的「is a directory」错误）。**往返闭环**：upload 响应的 `remotePath` 为显示形式，原样回传给 `sftp_download` 即命中同一组服务器字节（单测以内存双工桩断言两侧 OPEN 帧路径字节一致 + 载荷逐字节回收）。回退策略沿先例：download 读侧裸包路径任何失败回退高层重读（读安全），upload 写侧仅裸包客户端**建立**失败回退，操作错误原样上抛；`auto` 模式下两个工具行为完全不变（本地路径校验、传输根约束、敏感路径拒绝、大小上限均先于拨号，不受影响）。
@@ -543,7 +544,7 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 
 参数同 `sftp/stat`（`sessionId`、`path`），另有可选 `form: "wire"`（M17）：粘贴预检传来的是整条 wire 路径，带该参数时 latin-1 模式整条按 `%XX` 还原字节探测；缺省按「wire 前缀 + 显示末段」分工（见 `sftp/list` 节 M17 段）。返回 `{ exists: bool }`，路径不存在不算错误。
 
-错误语义（M23/R1，两面对齐后口径统一）：只有 SSH_FX_NO_SUCH_FILE 判「不存在」，其余 LSTAT 失败（权限拒绝、通道异常等）如实报错——权限错误绝不误报 `exists: false`（与 MCP 工具 `sftp_exists` 的 M18 契约一致，工作台 RPC 面同一口径）。工作台预检调用方（rename 覆盖预检、粘贴预检、上传撞名预检）对预检报错均按「无法判定、不阻断，交由后续执行时报错」的既有惯例处理——预检无法判定时报错优于误判。
+错误语义（M23/R1，两面对齐后口径统一）：只有 SSH_FX_NO_SUCH_FILE 判「不存在」，其余 LSTAT 失败（权限拒绝、通道异常等）如实报错——权限错误绝不误报 `exists: false`（`sftp/exists` 的 M18 契约，工作台 RPC 面同一口径）。工作台预检调用方（rename 覆盖预检、粘贴预检、上传撞名预检）对预检报错均按「无法判定、不阻断，交由后续执行时报错」的既有惯例处理——预检无法判定时报错优于误判。
 
 ### sftp/read
 
@@ -659,7 +660,7 @@ Docker 家族（`docker/list` / `docker/logs` / `docker/action`）通过固定�
 - **docker/logs**：`{sessionId|target, containerId, tail?, cli?, socket?, host?}`，返回 `{logs, container?}`；`tail` 钳制到 [10, 2000]（默认 200）。inspect 失败（容器消失）降级 `container: null`。
 - **docker/action**：`{sessionId|target, containerId, action, cli?, socket?, host?}`，动词白名单 `start/stop/restart/kill/rm`；`containerId` 必须 12–64 位小写十六进制（容器名一律拒绝）；执行前写审计（意图行 + 失败行，审计文本为 `<cli> <动词> <id>` 短形态，端点 export 只在执行文本里）。plain 失败且命中 daemon 权限签名才回落 Quick Sudo 管线（重放同一条含端点 export 的执行文本；其余失败重试可能把半执行动作应用两次）；本机面无提权管线，daemon 拒绝返回指引文案。kill/rm 由前端/MCP 确认门强制二次确认，只读连接直接拒绝。
 
-MCP 面 `docker_list` / `docker_action` 同语义，schema 同步声明 `cli` / `socket` / `host` 可选属性；`target:"local"` 免连接选择器（schema `anyOf` 首选 `{"required":["target"]}`），`docker_list` 在 needsSudo 时用可解析的 Quick Sudo 凭据自动提权。MCP 确认门的审批文本取 `<cli> <动词> <id>`（Podman 审批显示 `podman rm …`）。
+MCP 面同名工具已随 #203 瘦身移出——容器巡检/生命周期走 `ssh_exec` 执行 `docker ps` 等命令（`docker ps` 在只读白名单内，需要 daemon 权限时由 Quick Sudo/`ssh_exec_sudo` 提权）；工作台 Docker 面板继续走上述 sidecar 方法族。
 
 ## 二进制通道
 

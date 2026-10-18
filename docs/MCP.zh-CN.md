@@ -8,14 +8,14 @@ DBX 的 MCP 服务器（`dbx mcp` 或桌面内置 MCP）内置两个通用插件
 
 | 工具 | 说明 |
 | --- | --- |
-| `dbx_list_plugin_tools` | 列出所有已装插件贡献的 MCP 工具（含本插件的 31 个 SSH/SFTP 工具及其 JSON Schema） |
+| `dbx_list_plugin_tools` | 列出所有已装插件贡献的 MCP 工具（含本插件的 16 个 SSH/SFTP 工具及其 JSON Schema） |
 | `dbx_call_plugin_tool` | 调用插件工具；传 `connectionId` 即引用 DBX 已保存的 SSH 连接，凭据由 DBX 解析转发，**工具参数里不出现任何密码** |
 
 典型调用流（MCP 客户端视角）：
 
 ```
 dbx_list_connections                      → 找到 SSH 连接 id
-dbx_list_plugin_tools                     → 发现 io.dbx.ssh 的 ssh_exec / sftp_* / ssh_metrics 等工具
+dbx_list_plugin_tools                     → 发现 io.dbx.ssh 的 ssh_exec / sftp_* 等工具
 dbx_call_plugin_tool {
   pluginId: "io.dbx.ssh",
   tool: "ssh_exec_sudo",
@@ -55,7 +55,7 @@ dbx-plugin-ssh --mcp
 
 ### stdio 桥接兜底（免内联凭据）
 
-stdio 会话里用 `connectionId` 调用连接类工具（`ssh_exec` / `ssh_exec_sudo` / `ssh_run_bg` / `ssh_task_status` / `ssh_metrics` / `ssh_test_connection` / `sftp_*` 全家）时，若该 id 未在本会话注册，整次调用自动转发给运行中的 DBX 应用本地 TCP 桥执行——应用未运行会自动唤起，凭据由应用侧解析，**不经工具参数**；桥不可用（应用无法唤起、桥端口不可达等）时回落原内联凭据路径，工具面形状不变。
+stdio 会话里用 `connectionId` 调用连接类工具（`ssh_exec` / `ssh_exec_sudo` / `ssh_run_bg` / `ssh_task_status` / `sftp_*` 全家）时，若该 id 未在本会话注册，整次调用自动转发给运行中的 DBX 应用本地 TCP 桥执行——应用未运行会自动唤起，凭据由应用侧解析，**不经工具参数**；桥不可用（应用无法唤起、桥端口不可达等）时回落原内联凭据路径，工具面形状不变。
 
 转发语义注意：
 
@@ -108,7 +108,7 @@ stdio 分发循环对敌意输入保持"进程不崩、连接不挂、后续请�
 }
 ```
 
-- 会话启动时自动连接；`tools/list` 即 31 个工具，无需 DBX 在场。
+- 会话启动时自动连接；`tools/list` 即 16 个工具，无需 DBX 在场。
 - 凭据内联传参、带 `connectionId` / `connectionName` 时自动桥接转发（见上节），
   或在 DBX 桥模式可用时优先走方式一；数据目录默认
   `/tmp/dbx-plugin-data/io.dbx.ssh`，可用 `DBX_PLUGIN_DATA_DIR` 重定向
@@ -116,7 +116,21 @@ stdio 分发循环对敌意输入保持"进程不崩、连接不挂、后续请�
 - 真机回环验证：`DBX_SSH_SMOKE_PASSWORD=… python3 scripts/smoke_mcp.py
   --host <host> --port <port> --username <user>`（凭据走环境变量，不落盘）。
 
-## 工具一览（31 个，两种方式通用）
+## 工具一览（16 个，两种方式通用）
+
+> **#203 工具瘦身**：MCP 面从 33 个工具收缩到 16 个（0.7.8 起）。移除的都是
+> 冗余、可推导或与 shell 命令语义重复的工具：`sftp_exists`（`sftp_stat` 是
+> 严格超集）、`sftp_pwd`（家目录即默认 cwd）、`ssh_test_connection`（首次
+> 真实调用暴露同样信息）、`ssh_alert_triage`（工作台入口与 `ssh/alert/triage`
+> sidecar 方法保留）、`ssh_quick_sudo_profiles_*`（管理走工作台 UI，
+> `ssh_exec_sudo` 的 `quickSudoProfile` 引用保留）、`ssh_metrics` /
+> `sftp_disk_usage`（内部本是 uptime/df，改用 `ssh_exec` 执行，只读白名单
+> 同样放行）、`docker_list` / `docker_action`（`docker ps` 在只读白名单内）、
+> SFTP 变更族 `sftp_mkdir` / `sftp_remove` / `sftp_rename` / `sftp_chmod` /
+> `sftp_copy` / `sftp_move`（shell `mkdir`/`rm`/`mv`/`chmod`/`cp` 语义重复，
+> 走 `ssh_exec`，灾难确认门在 exec 路径上等价生效）。前端工作台的对应
+> sidecar RPC 方法**全部保留**，UI 不受影响；`tools/list` 从 ≈100k 字符降到
+> ≈49k，在 Claude Code 的 ≈50k 落盘阈值之内。
 
 ### 本地传输路径约束（sftp_upload / sftp_download）
 
@@ -143,21 +157,16 @@ MCP 调用方是 LLM，`sftp_upload`（本地读）与 `sftp_download`（本地�
 | `ssh_multi_exec` | 一条命令在多个**已保存连接**上聚合执行并逐目标回结果（隐藏通道语义，不经可见终端/agentTerminalMode）。`targets`：1–10 个连接引用（connectionId/connectionName），保序去重，任一未解析整体拒绝；`mode` parallel（默认，并发）/ sequential（顺序）；`stopOnError` 仅 sequential 生效（首败即停）；`confirmDestructive` 一次覆盖全部目标的灾难门；**不提供 sudo**（提权走单目标 `ssh_exec_sudo`）。逐目标独立过只读白名单门（连接只读时仅放行巡检命令）。stdio 独立模式无注册表，targets 解析即报引导 |
 | `ssh_terminal_input` | 向连接的**存活 DBX 终端**注入原始输入（交互应答 / Ctrl+C / 方向键语义；终端必须已打开）。`\n`/`\r\n` 折叠为 Enter，NUL 剥离，8 KiB 截断；`appendNewline` 默认 false（交互应答自带 `\r`，要执行键入命令置 true）。**输出不收集**——终端本身可见，要收集输出用 `ssh_exec{runInTerminal:true}`。门禁：只读连接仅放行纯控制序列；灾难行需 `confirmDestructive: true`（只读上一律拒绝）；sudo 行受连接 sudo 白名单约束。stdio 模式无工作台 PTY，调用报引导错误 |
 | `ssh_task_status` | 轮询 `ssh_run_bg` 任务：`state`（running/done/missing）、完成后的 `exitCode`、pid 存活状态与输出尾部（`tailBytes`，200–16000）。通过服务器侧日志文件查询，天然跨连接/跨会话 |
-| `ssh_metrics` | CPU/内存/负载/磁盘/运行时长（只读命令）。可选 `sections` 投影：只返回点名的顶层段（`hostname`/`kernel`/`uptimeSeconds`/`cpu`/`memory`/`disks`/`network`/`processes`/`topMemory`/`osId`/`osPretty`），接受单名或数组；未知段名在拨号前 fail-fast 并列出合法段，空数组拒绝（省略参数即全量）。用于压缩大响应的 token 占用 |
-| `ssh_test_connection` | 验证连通性与认证（含跳板链），返回延迟；支持全部连接寻址（`connectionId` / `connectionName` / 唯一 endpoint），保存连接经桥或注册表解析凭据，不解析成功时报自愈引导（启动 DBX app → `ssh_list_connections` → 内联凭据） |
 | `ssh_list_known_hosts` / `ssh_remove_known_host` | 管理插件 known_hosts（不改系统 `~/.ssh/known_hosts`） |
 | `ssh_close` | 关闭缓存的连接（方式二按连接键；方式一由 sidecar 生命周期管理） |
-| `sftp_list_dir` / `sftp_stat` / `sftp_exists` / `sftp_pwd` | 浏览、检查远端路径与登录家目录；**懒建立连接**：无需先 `ssh_exec` 预热，首次调用即按寻址解析并拨号。文件名编码跟随连接级偏好（连接覆盖 > 全局 `sftp_name_encoding` > auto，见 PROTOCOL「扩展文件操作」M17/M18 节）：latin-1 连接上 `sftp_list_dir` 返回的 `name`/`path` 为显示形式（与工作台一致），把返回的 `path` 原样回传给其余 SFTP 工具即落回同一组服务器字节；latin-1 下 `sftp_stat`/`sftp_exists` 走裸包 LSTAT（stat 的 uid/gid 经 shell 查询尽力而为，非 ASCII 名可能为 `null`；exists 只认「无此文件」为不存在，其余错误如实上抛） |
+| `sftp_list_dir` / `sftp_stat` | 浏览与检查远端路径；**懒建立连接**：无需先 `ssh_exec` 预热，首次调用即按寻址解析并拨号。文件名编码跟随连接级偏好（连接覆盖 > 全局 `sftp_name_encoding` > auto，见 PROTOCOL「扩展文件操作」M17/M18 节）：latin-1 连接上 `sftp_list_dir` 返回的 `name`/`path` 为显示形式（与工作台一致），把返回的 `path` 原样回传给其余 SFTP 工具即落回同一组服务器字节；latin-1 下 `sftp_stat` 走裸包 LSTAT（uid/gid 经 shell 查询尽力而为，非 ASCII 名可能为 `null`）。「路径不存在」由 `sftp_stat` 显式报错表达（绝不误报），0.7.8 起 `sftp_exists` / `sftp_pwd` 已从 MCP 面移除（`sftp_stat` 为严格超集；#203 工具瘦身） |
 | `sftp_read_file` / `sftp_write_file` | 读写远端文件（文本或 base64，支持 offset 分页）。latin-1 连接上按显示路径还原服务器字节走裸包 OPEN/READ/WRITE（32 KiB 分块；读侧 `maxBytes` 截断语义不变） |
 | `sftp_upload` / `sftp_download` | 本地 ↔ 远端单文件传输（受 `maxUploadBytes` / `maxDownloadBytes` 限制；本地路径校验先于拨号，校验拒绝不清连接池）。latin-1 连接上远端路径按显示形式还原服务器字节走裸包 OPEN/READ/WRITE（M19，upload 响应的 `remotePath` 原样回传给 download 即命中同一组字节；回退策略同其他 SFTP 工具，见 PROTOCOL「扩展文件操作」M19 节）。本地路径受传输根约束：必须落在 `localTransferRoot`（未配置时为系统临时目录 + 插件数据目录）之内，且任何模式下都拒绝敏感路径（凭据库、shell 启动文件等，见下文「本地传输路径约束」） |
-| `sftp_mkdir` / `sftp_remove` / `sftp_rename` / `sftp_chmod` | 目录与文件管理。latin-1 连接上均按显示路径还原服务器字节走裸包操作（非 UTF-8 文件名保真，回退策略同工作台）；`sftp_chmod` 的 `mode` 兼容多种写法：字符串 `"0644"`/`"0o644"` 按八进制数字读；数字全部由 0-7 组成时也按八进制读（`644` → `0644`），其余数字按原始权限位读（`384` = `0600`） |
-| `sftp_disk_usage` | 路径所在挂载的磁盘用量 |
-| `sftp_copy` / `sftp_move` | 服务器内复制 / 剪切（`from` 单值或数组 → `toDir`，逐项返回成败）。latin-1 连接上覆盖预检与同目录 move 的 RENAME 快路径走裸包字节保真；远端 `cp`/`mv` 执行层按字面量发送（非 ASCII 名由服务器侧报错，边界见 PROTOCOL） |
-| `ssh_alert_triage` | 告警分诊（**无连接参数、从不执行**）：异构告警 JSON（任意 schema）或纯文本 → 结构化 + 双语关键词分类（`cpu/memory/disk/inode/network/oom/service/generic`）+ 只读诊断命令清单（每条带 `purposeKey`；playbook 全部命中只读命令白名单，只读连接上可直接执行）。执行由调用方经 `ssh_exec` 等门禁完成 |
+| `sftp_write_file` 的目录前提 | 变更族（mkdir/rm/mv/chmod/cp）已随 #203 瘦身移出 MCP 面：用 `ssh_exec` 执行 shell 等价命令（`mkdir -p`、`rm`、`mv`、`chmod`、`cp -a`、`df`、`docker ps`），灾难确认门与只读白名单在 exec 路径上等价生效。`sftp_write_file` 仍要求父目录已存在（先 `ssh_exec mkdir -p`） |
 
 **连接寻址（保存连接优先，内联凭据兜底）**：上表除 `ssh_list_connections`、known_hosts 管理与本地工具外的连接类工具，都可用 `connectionId` 精确定位；也可用 `connectionName`，重名时补充 `host` / `port` / `username` 做唯一筛选。若不传 id/name，提供完整 endpoint（`host` + `username`，`port` 默认 22）也会唯一复用已注册连接，因此不需要重复传密码。候选为零时才回落内联凭据/stdio bridge 兜底；候选超过一个时拒绝并列出候选 id，避免静默连错主机或账户。`connectionId` 与其它 selector 同时出现但不一致也会拒绝。
 
-**工具 annotations（MCP 规范 Tool annotations）**：`tools/list` 与 `mcp/tools`（DBX MCP 桥共用同一份定义）为全部 31 个工具附加 `annotations` 元数据——`title`（客户端工具选择器的人读名）、`readOnlyHint`（可证明只读的巡检/读取类工具为 true）、`destructiveHint`（exec 家族与 remove/move/overwrite/删除类为 true；mkdir/rename/chmod/profile save/close 等变更但非破坏类为 false）、`idempotentHint`、`openWorldHint`（`ssh_alert_triage` 全离线为 false，其余默认 true）。hints 仅是建议信号，供 MCP 客户端做只读预放行与破坏性确认分级；服务端安全门（mcp_safety 白名单、confirm 门、只读连接门）始终是最终裁决，hints 分类与内部门禁分类保持一致。宿主侧两条桥路径——dbx-mcp `LocalBackend::list_plugin_tools` 与桌面 `mcp_bridge.rs` ——对工具定义响应均为 serde_json Value 纯透传，annotations 原样到达 `dbx_list_plugin_tools` 客户端。
+**工具 annotations（MCP 规范 Tool annotations）**：`tools/list` 与 `mcp/tools`（DBX MCP 桥共用同一份定义）为全部 16 个工具附加 `annotations` 元数据——`title`（客户端工具选择器的人读名）、`readOnlyHint`（可证明只读的巡检/读取类工具为 true）、`destructiveHint`（exec 家族与 overwrite/删除类为 true；`ssh_close` 为 false）、`idempotentHint`、`openWorldHint`（默认 true）。hints 仅是建议信号，供 MCP 客户端做只读预放行与破坏性确认分级；服务端安全门（mcp_safety 白名单、confirm 门、只读连接门）始终是最终裁决，hints 分类与内部门禁分类保持一致。宿主侧两条桥路径——dbx-mcp `LocalBackend::list_plugin_tools` 与桌面 `mcp_bridge.rs` ——对工具定义响应均为 serde_json Value 纯透传，annotations 原样到达 `dbx_list_plugin_tools` 客户端。
 
 ### LLM 输入容错
 
@@ -167,7 +176,6 @@ MCP 调用方是 LLM，`sftp_upload`（本地读）与 `sftp_download`（本地�
 - **布尔写成字符串可解析**：`confirmDestructive` / `overwrite` / `recursive` / `base64` / `appendNewline` / `stopOnError` / `runInTerminal` / `quickSudo` 接受 `true`/`false`（不区分大小写）及 `"1"/"0"/"yes"/"no"/"on"/"off"` 变体；其他值报 `{key} must be a boolean`。
 - **端口 fail-fast**：`port` 出现但为 0、越界（>65535）或非数字时立即报 `port must be between 1 and 65535` / `port must be an integer`，绝不静默按默认 22 端口拨打错误主机。
 - **未知工具名可行动**：调用未注册工具名报 `Unknown tool: '<名字>'`，分隔符/大小写变体（`sftp-listdir`、`SSH_EXEC`）附 `Did you mean '...'` 建议，所有报错都指向 `tools/list`。
-- **`sftp_exists` 只把 `NoSuchFile` 判为不存在**：权限拒绝等真实错误按错误返回，不再误报 `exists: false`。
 - **`ssh_close` 需要显式连接引用**：无任何 selector 时报指引错误，而不是对无意义的 `mcp-@:22` 池键报 "no cached connection"。
 - **缺参一次枚举全部缺失项**：`ssh_multi_exec`（`targets`/`command`）与
   `sftp_upload` / `sftp_download`（`localPath`/`remotePath`）在多个必填参数
@@ -196,7 +204,7 @@ MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此
    git 变更形态（`branch <名>`、`branch -D`、`tag <名>`、`tag -d`、`remote add`、
    `reflog delete`）、`dmesg -c/-C/-n`、`history -c/-w` 等。
 3. **敏感路径拒绝清单**（只读连接）：命令参数或 SFTP 读工具（`sftp_list_dir`
-   / `sftp_read_file` / `sftp_stat` / `sftp_exists` / `sftp_download` /
+   / `sftp_read_file` / `sftp_stat` / `sftp_download` /
    `ssh_task_status`）的路径命中凭据/私钥位置即拒绝——`~/.ssh`、`.gnupg`、
    `.aws`、`.kube` 目录，`id_rsa` 等 `id_*` / `ssh_host_*_key` 私钥、
    `*.pem/*.key/*.p12/*.pfx`、`/etc/shadow`、`/etc/sudoers`、`.env`、
@@ -356,23 +364,15 @@ confirm fail-closed 与 scope fail-closed（含 list 在作用域下可用）。
 既有只读白名单（含敏感路径拒绝清单）、灾难 `confirmDestructive`、进程级只读
 开关先于路由判定生效，`runInTerminal` 不放宽任何安全门。
 
-## 告警 → 排查（组合用法）
+## 告警 → 排查（工作台入口）
 
-监控告警（Prometheus / Grafana / Zabbix / Sentry webhook 文本等）直接粘给
-`ssh_alert_triage`：工具把任意 schema 的告警体标准化（解析失败整包当 message），
-按双语关键词分类（cpu / memory / disk / inode / network / oom / service / generic），
-返回一组**带 purposeKey 的只读诊断命令**（uptime / free / df / ps 排序 /
-journalctl -k / systemctl status 等静态 playbook，全部命中只读命令白名单——
-只读连接上可直接执行，普通连接不受限）。典型组合：
-
-1. `ssh_alert_triage {payload: <告警原文>}` → 拿到 `normalized` + `category` +
-   `suggestions`；
-2. 依次 `ssh_exec` 执行建议命令（门禁照常；超过 ~10s 的改用 `ssh_run_bg`）；
-3. 结合输出做根因判断；建议命令之外的排查动作沿用既有门禁语义。
-
-该工具只做结构化与清单，不做 LLM 分析；工作台侧等价入口为工具栏「告警排查」
-（Siren 图标）弹窗：粘贴 → 分析 → 逐条发送到当前终端 / 全部复制。
+MCP 工具 `ssh_alert_triage` 已随 #203 工具瘦身移出 MCP 面（分类逻辑保留在
+sidecar `ssh/alert/triage` 方法）。告警分诊的组合用法保留在工作台工具栏
+「告警排查」（Siren 图标）弹窗：粘贴告警文本 → 分析 → 逐条发送到当前终端 /
+全部复制；建议命令仍全部命中只读命令白名单，agent 侧如需同类动作，可直接用
+`ssh_exec` 执行 uptime / free / df / journalctl 等巡检命令（门禁照常，超过
+~10s 的改用 `ssh_run_bg`）。
 
 ## MCP 工具命名与语义
 
-工具命名与语义沿用 `ssh_exec` / `ssh_exec_sudo` / `sftp_*` 工具族约定。本插件在 DBX 桥模式下凭据与审批归宿主（DBX 连接存储 + MCP scope），独立模式用内联凭据 + TOFU，并额外提供 `ssh_metrics`、`sftp_chmod`、`sftp_disk_usage` 与 known_hosts 管理。
+工具命名与语义沿用 `ssh_exec` / `ssh_exec_sudo` / `sftp_*` 工具族约定。本插件在 DBX 桥模式下凭据与审批归宿主（DBX 连接存储 + MCP scope），独立模式用内联凭据 + TOFU，并提供 known_hosts 管理。

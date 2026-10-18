@@ -41,13 +41,6 @@ export interface AgentPromptPayload {
 }
 
 /** `ssh/agent/notice` 事件 payload：低危命令直接注入终端时的告知。 */
-/** MCP Docker lifecycle actions carry structured arguments; never allow the
- * confirmation dialog to turn their rendered command into arbitrary SSH.
- * Normal SSH command confirmations remain editable. */
-export function agentPromptCommandReadOnly(prompt: Pick<AgentPromptPayload, "source" | "tool">): boolean {
-  return prompt.source === "mcp" && prompt.tool === "docker_action";
-}
-
 /** MCP confirmations are process-level and arrive without a terminal session;
  * legacy SSH prompts remain isolated to the active SSH session. */
 export function acceptsAgentPrompt(

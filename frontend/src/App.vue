@@ -5070,7 +5070,6 @@ const {
   agentModeBusy,
   agentModeHint,
   agentPromptHead,
-  agentPromptCommandIsReadOnly,
   clearAgentPrompts,
   stopAgentPromptTimer,
   dismissAgentPrompt,
@@ -10458,7 +10457,7 @@ watch(historyScope, () => {
         </div>
         <label class="agent-prompt-command">
           <span>{{ t("agentPromptCommandLabel") }}</span>
-          <textarea v-model="agentPromptCommand" class="mono" rows="3" spellcheck="false" :readonly="agentPromptCommandIsReadOnly" />
+          <textarea v-model="agentPromptCommand" class="mono" rows="3" spellcheck="false" />
         </label>
         <!-- 记住不限风险档：strict 模式下低危命令同样每次弹审、同样需要免审
              记忆（IMPL_PLAN 预期 strict/auto 下 approve+remember 二次零弹窗）；

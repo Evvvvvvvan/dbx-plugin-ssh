@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 
-use russh::client::Handle;
 use russh_sftp::client::SftpSession;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
@@ -22,7 +21,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::exec;
 use crate::model::normalize_remote_path;
 use crate::sftp_name::{self, NameEncoding};
-use crate::ssh::{RawSftpClient, SshClient, SshRuntime};
+use crate::ssh::{RawSftpClient, SshRuntime};
 
 /// Remote `cp`/`mv` commands run with this budget; recursive directory
 /// copies can legitimately take a while.
@@ -36,22 +35,17 @@ pub enum CopyOp {
 }
 
 /// latin-1 模式下源/目标路径的字节还原口径：工作台 RPC（`sftp/copy`）传
-/// 列表回传的 wire 形式（%XX 转义，[`sftp_name::unescape_wire`] 还原）；
-/// MCP 工具面（M18）传显示形式（latin-1 解码文本，
-/// [`sftp_name::latin1_encode_display`] 还原——与 MCP 面 sftp_rename 等
-/// 工具的名字口径一致）。
+/// 列表回传的 wire 形式（%XX 转义，[`sftp_name::unescape_wire`] 还原）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathForm {
     WireEscaped,
-    Display,
 }
 
 impl PathForm {
-    /// 显示/wire 文本 → 服务器原始字节。
+    /// wire 文本 → 服务器原始字节。
     pub fn decode(self, path: &str) -> Vec<u8> {
         match self {
             PathForm::WireEscaped => sftp_name::unescape_wire(path),
-            PathForm::Display => sftp_name::latin1_encode_display(path),
         }
     }
 }
@@ -271,8 +265,6 @@ enum CopyExecutor<'a> {
     /// Plugin RPC path: routed through [`SshRuntime::exec`] so session
     /// lookup, timeouts and exec bookkeeping stay in one place.
     Session(&'a SshRuntime, &'a str),
-    /// MCP pooled connection: direct handle plus an optional SFTP channel.
-    Headless(&'a Handle<SshClient>, Option<Arc<AsyncMutex<SftpSession>>>),
 }
 
 impl CopyExecutor<'_> {
@@ -297,24 +289,12 @@ impl CopyExecutor<'_> {
                     exit_code: value.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32,
                 })
             }
-            CopyExecutor::Headless(handle, _) => {
-                // Internal copy plumbing: env-free so output parsing stays
-                // independent of the connection's setEnv overrides.
-                exec::exec_plain(
-                    handle,
-                    command,
-                    std::time::Duration::from_secs(REMOTE_COPY_TIMEOUT_SECS),
-                    &[],
-                )
-                .await
-            }
         }
     }
 
     async fn sftp(&self) -> Option<Arc<AsyncMutex<SftpSession>>> {
         match self {
             CopyExecutor::Session(runtime, session_id) => runtime.sftp(session_id).await.ok(),
-            CopyExecutor::Headless(_, sftp) => sftp.clone(),
         }
     }
 }
@@ -354,26 +334,6 @@ pub async fn run(
     )
     .await;
     Ok(outcome.into_json())
-}
-
-/// `sftp_copy` / `sftp_move` MCP tool entry over a pooled headless
-/// connection. `sftp` enables the SFTP-rename fast path for moves. `raw`
-/// 传 latin-1 连接的裸包客户端（M18：Some = latin-1，覆盖预检/同目录
-/// RENAME 快路径字节保真，路径按显示形式还原）；None = auto 语义执行。
-pub async fn execute(
-    handle: &Handle<SshClient>,
-    sftp: Option<Arc<AsyncMutex<SftpSession>>>,
-    raw: Option<RawSftpClient>,
-    op: CopyOp,
-    request: &CopyMoveRequest,
-) -> CopyMoveOutcome {
-    execute_with(
-        CopyExecutor::Headless(handle, sftp),
-        op,
-        request,
-        raw.map(|client| (client, PathForm::Display)),
-    )
-    .await
 }
 
 async fn execute_with(
@@ -721,24 +681,6 @@ mod tests {
         // '%' 自转义闭环：真实名字里的字面 %XX 往返不吞。
         let target = target_path("/tmp", "/src/a%2541b");
         assert_eq!(sftp_name::unescape_wire(&target), b"/tmp/a%41b".to_vec());
-    }
-
-    #[test]
-    fn display_paths_encode_to_server_bytes() {
-        // M18 MCP 工具面（PathForm::Display）：from/toDir 是 latin-1 连接上
-        // 列表回传的显示形式，target_path 拼接后整条 latin1_encode_display
-        // 还原字节——与 MCP 面 sftp_rename 的名字口径一致。
-        let target = target_path("/tmp/caf\u{e9}", "/src/\u{ff}item.txt");
-        assert_eq!(
-            PathForm::Display.decode(&target),
-            b"/tmp/caf\xe9/\xffitem.txt".to_vec()
-        );
-        // ASCII 路径按字面量透传，行为与 auto 一致。
-        let target = target_path("/tmp", "/var/log/app.log");
-        assert_eq!(PathForm::Display.decode(&target), b"/tmp/app.log".to_vec());
-        // 显示形式不引入 %XX 转义语义：字面 %XX 是真实名字的一部分。
-        let target = target_path("/tmp", "/src/a%41b");
-        assert_eq!(PathForm::Display.decode(&target), b"/tmp/a%41b".to_vec());
     }
 
     #[test]

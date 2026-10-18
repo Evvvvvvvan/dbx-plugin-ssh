@@ -1389,8 +1389,6 @@ pub async fn collect_metrics(handle: &Handle<SshClient>) -> Result<serde_json::V
     crate::metrics::collect_metrics(handle).await
 }
 
-pub use crate::metrics::{project_metrics_sections, validate_section_names, METRICS_SECTIONS};
-
 /// Parses the output of the collector script (`METRICS_SCRIPT` in metrics.rs)
 /// into a metrics JSON object.
 /// Pure so it can be unit-tested without a server.

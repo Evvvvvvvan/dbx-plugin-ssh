@@ -743,4 +743,59 @@ mod tests {
             ]
         );
     }
+
+    /// 扩展意图分类矩阵（原 mcp 工具面用例迁移；#203 工具瘦身把
+    /// `ssh_alert_triage` 移出 MCP 目录，分类逻辑本身保留给
+    /// `ssh/alert/triage` sidecar 方法）。
+    #[test]
+    fn classifies_extended_intents_with_read_only_suggestions() {
+        let cases: [(&str, &str); 9] = [
+            // (payload, 期望 category)
+            (
+                r#"{"alertId":"n1","message":"network eth0 packet loss 5%, bandwidth saturated"}"#,
+                "network",
+            ),
+            // 中英混合：丢包 + bandwidth 双命中仍归 network。
+            (
+                r#"{"message":"网络抖动, 丢包严重, bandwidth 不足"}"#,
+                "network",
+            ),
+            // OOM 优先于 memory（out of memory 同时命中 memory 关键词）。
+            (
+                r#"{"message":"Out of memory: oom-kill killed process 4321 (java)"}"#,
+                "oom",
+            ),
+            (
+                r#"{"message":"systemd unit cron.service restart failed"}"#,
+                "service",
+            ),
+            // 零命中回落 generic。
+            (
+                r#"{"message":"backup job completed without errors at 03:00"}"#,
+                "generic",
+            ),
+            // 中英混合 CPU。
+            (r#"{"message":"CPU loadavg 飙升, 处理器过热"}"#, "cpu"),
+            (r#"{"message":"内存 swap 已满, mem usage 99%"}"#, "memory"),
+            (r#"{"message":"磁盘 no space left on device"}"#, "disk"),
+            (r#"{"message":"inode usage 98% on /var"}"#, "inode"),
+        ];
+        for (payload, expected) in cases {
+            let view = triage_view(&triage(payload));
+            assert_eq!(view["category"], expected, "payload: {payload}");
+            let suggestions = view["suggestions"].as_array().unwrap();
+            assert!(!suggestions.is_empty(), "payload: {payload}");
+            for item in suggestions {
+                let command = item["command"].as_str().unwrap();
+                assert_eq!(
+                    assess_command(command),
+                    CommandRisk::ReadOnly,
+                    "suggestion not read-only: {command}"
+                );
+                assert!(!command.contains('>'));
+                assert!(!command.contains("sudo"));
+                assert!(!command.contains("$("));
+            }
+        }
+    }
 }

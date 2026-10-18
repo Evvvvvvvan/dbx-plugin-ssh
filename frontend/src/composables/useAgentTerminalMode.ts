@@ -1,7 +1,6 @@
 import { computed, ref, watch, type Ref } from "vue";
 import {
   SSH_AGENT_MODES_STORE_KEY,
-  agentPromptCommandReadOnly,
   approvalRemainingSecs,
   buildAgentResolveBody,
   clearSessionBoundAgentPrompts,
@@ -54,7 +53,6 @@ const agentModeHint = computed(() => t(
 // 绝对期限，到 0 仅出队队首并标记 expired（后端超时同样拒绝）；排队中已到期的
 // 挑战会在露出为队首的首次 tick 即被跳过出队。
 const agentPromptHead = computed(() => agentPromptQueue.value[0]);
-const agentPromptCommandIsReadOnly = computed(() => agentPromptHead.value ? agentPromptCommandReadOnly(agentPromptHead.value) : false);
 
 watch(agentPromptHead, (head) => {
   stopAgentPromptTimer();
@@ -180,7 +178,6 @@ async function applyAgentMode(mode: AgentTerminalMode) {
     agentModeBusy,
     agentModeHint,
     agentPromptHead,
-    agentPromptCommandIsReadOnly,
     clearAgentPrompts,
     stopAgentPromptTimer,
     dismissAgentPrompt,

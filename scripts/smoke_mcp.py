@@ -55,21 +55,23 @@ Spawns the sidecar with --mcp and verifies, against the real process:
 
 With --host (plus --username/--password, or the DBX_SSH_SMOKE_PASSWORD
 environment variable) a live section additionally runs a real round-trip
-against an SSH server: ssh_test_connection, a browse-before-exec SFTP
-probe (sftp_pwd / sftp_list_dir lazily establish the connection — the
-local_ubuntu coverage regression), ssh_exec, the full SFTP file family
-(write→read→stat→exists→mkdir→copy→rename→chmod→move→disk_usage→remove),
-an ssh_run_bg → ssh_task_status round-trip, ssh_metrics, and an
-sftp_upload → sftp_download loop compared byte-for-byte. Round 7 adds the
-live enum/assertion tail that the offline schema-check probes cannot
-reach past the connection gate: sftp_chmod's mode semantics (invalid
-values list the legal octal forms and leave the file untouched), the
-ssh_multi_exec mode enum (invalid AND wrong-case values fail fast with
-the full legal list before any dial), ssh_exec_sudo's authFlowMode
-(uppercase variants normalize, unrecognized values fall back to the
-default flow as the schema description documents), and a live pipelining
-check (two requests of different ids sent back-to-back — sftp_pwd +
-ssh_metrics — must come back 1:1 with payloads matching their own ids).
+against an SSH server: a browse-before-exec SFTP probe (sftp_list_dir
+lazily establishes the connection — the local_ubuntu coverage
+regression), ssh_exec, the SFTP file family
+(write→read→stat→verify + shell-equivalent mutations: since #203 the
+change face (mkdir/copy/rename/chmod/move/remove/disk_usage) runs via
+ssh_exec shell commands, the same way an agent would), an ssh_run_bg →
+ssh_task_status round-trip, a read-only collection probe (uptime via
+ssh_exec — ssh_metrics left the MCP face), and an sftp_upload →
+sftp_download loop compared byte-for-byte. Round 7 adds the live
+enum/assertion tail that the offline schema-check probes cannot reach
+past the connection gate: the ssh_multi_exec mode enum (invalid AND
+wrong-case values fail fast with the full legal list before any dial),
+ssh_exec_sudo's authFlowMode (uppercase variants normalize,
+unrecognized values fall back to the default flow as the schema
+description documents), and a live pipelining check (two requests of
+different ids sent back-to-back — sftp_stat + ssh_exec — must come back
+1:1 with payloads matching their own ids).
 The container
 from docs (linuxserver/openssh-server on 127.0.0.1:2222, user `sshuser`)
 is the intended target; credentials never live in this file.
@@ -101,31 +103,16 @@ EXPECTED_TOOLS = [
     "ssh_terminal_input",
     "ssh_run_bg",
     "ssh_task_status",
-    "ssh_metrics",
     "ssh_close",
-    "ssh_test_connection",
     "ssh_list_known_hosts",
     "ssh_list_connections",
     "ssh_remove_known_host",
-    "ssh_quick_sudo_profiles_list",
-    "ssh_quick_sudo_profiles_save",
-    "ssh_quick_sudo_profiles_delete",
     "sftp_list_dir",
     "sftp_stat",
-    "sftp_exists",
-    "sftp_pwd",
     "sftp_read_file",
     "sftp_write_file",
-    "sftp_mkdir",
-    "sftp_remove",
-    "sftp_rename",
-    "sftp_chmod",
-    "sftp_copy",
-    "sftp_move",
-    "sftp_disk_usage",
     "sftp_upload",
     "sftp_download",
-    "ssh_alert_triage",
 ]
 
 # Tools that target a connection: the selector anyOf (connectionId |
@@ -137,21 +124,10 @@ CONNECTION_BOUND_TOOLS = [
     "ssh_exec_sudo",
     "ssh_run_bg",
     "ssh_task_status",
-    "ssh_metrics",
-    "ssh_test_connection",
     "sftp_list_dir",
     "sftp_stat",
-    "sftp_exists",
-    "sftp_pwd",
     "sftp_read_file",
     "sftp_write_file",
-    "sftp_mkdir",
-    "sftp_remove",
-    "sftp_rename",
-    "sftp_chmod",
-    "sftp_copy",
-    "sftp_move",
-    "sftp_disk_usage",
     "sftp_upload",
     "sftp_download",
 ]
@@ -206,8 +182,12 @@ def sftp_file_family(proc: subprocess.Popen, next_id: list, connection: dict) ->
     file_a, file_b = f"{base}/probe.txt", f"{base}/probe-renamed.txt"
     payload = f"smoke-family-{uuid.uuid4().hex}"
     # write_file requires an existing parent (no implicit mkdir), so the
-    # directory comes first — also the mkdir arm's live coverage.
-    call_tool(proc, next_id, "sftp_mkdir", {**connection, "path": base})
+    # directory comes first. Since #203 the mutation face (mkdir/copy/
+    # rename/chmod/remove/disk_usage) lives on the shell via ssh_exec — the
+    # same route an agent takes — so the family exercises both faces.
+    call_tool(proc, next_id, "ssh_exec", {
+        **connection, "command": f"mkdir -p '{base}'",
+    })
     written = call_tool(proc, next_id, "sftp_write_file", {
         **connection, "path": file_a, "content": payload,
     })
@@ -219,51 +199,35 @@ def sftp_file_family(proc: subprocess.Popen, next_id: list, connection: dict) ->
 
     stat = call_tool(proc, next_id, "sftp_stat", {**connection, "path": file_a})
     assert stat["size"] == len(payload.encode()), stat
-    assert call_tool(proc, next_id, "sftp_exists", {
-        **connection, "path": file_a,
-    })["exists"] is True
-    assert call_tool(proc, next_id, "sftp_exists", {
+    # sftp_exists 已随 #203 工具瘦身移出 MCP 面（sftp_stat 是严格超集）；
+    # 「不存在」现在表现为 sftp_stat 的 JSON-RPC error（status 2 =
+    # SSH_FX_NO_SUCH_FILE），绝不静默误报。
+    assert "status 2" in call_tool_error(proc, next_id, "sftp_stat", {
         **connection, "path": f"{base}/no-such-probe",
-    })["exists"] is False
-
-    call_tool(proc, next_id, "sftp_mkdir", {**connection, "path": f"{base}/sub"})
-    # copy/move take from (string or array) plus toDir; the target name is
-    # derived from the source.
-    call_tool(proc, next_id, "sftp_copy", {
-        **connection, "from": file_a, "toDir": f"{base}/sub",
     })
-    copy_target = call_tool(proc, next_id, "sftp_exists", {
+
+    call_tool(proc, next_id, "ssh_exec", {
+        **connection, "command": f"mkdir '{base}/sub' && cp -a '{file_a}' '{base}/sub/probe.txt'",
+    })
+    copy_target = call_tool(proc, next_id, "sftp_stat", {
         **connection, "path": f"{base}/sub/probe.txt",
     })
-    assert copy_target["exists"] is True, copy_target
-    call_tool(proc, next_id, "sftp_rename", {
-        **connection, "sourcePath": file_a, "targetPath": file_b,
-    })
-    call_tool(proc, next_id, "sftp_chmod", {
-        **connection, "path": file_b, "mode": 0o600,
+    assert copy_target["size"] == len(payload.encode()), copy_target
+    call_tool(proc, next_id, "ssh_exec", {
+        **connection, "command": f"mv '{file_a}' '{file_b}' && chmod 600 '{file_b}'",
     })
     mode = call_tool(proc, next_id, "sftp_stat", {**connection, "path": file_b})
     assert mode["permissions"] == "0600", mode
-    # The octal-digit number form (600, all digits 0-7) must land on the
-    # same permission bits as the raw-bit form above (LLM variant).
-    call_tool(proc, next_id, "sftp_chmod", {
-        **connection, "path": file_b, "mode": 600,
+    call_tool(proc, next_id, "ssh_exec", {
+        **connection, "command": f"mv '{base}/sub/probe.txt' '{base}/probe-copy.txt' && df -kP /tmp",
     })
-    mode = call_tool(proc, next_id, "sftp_stat", {**connection, "path": file_b})
-    assert mode["permissions"] == "0600", mode
-    call_tool(proc, next_id, "sftp_move", {
-        **connection, "from": f"{base}/sub/probe.txt", "toDir": base,
+    call_tool(proc, next_id, "ssh_exec", {
+        **connection, "command": f"rm -f '{file_b}' '{base}/probe-copy.txt' && rm -rf '{base}'",
     })
-    usage = call_tool(proc, next_id, "sftp_disk_usage", {**connection, "path": "/tmp"})
-    assert usage["totalBytes"] > 0 and usage["availableBytes"] >= 0, usage
-
-    call_tool(proc, next_id, "sftp_remove", {**connection, "path": file_b})
-    call_tool(proc, next_id, "sftp_remove", {**connection, "path": f"{base}/probe.txt"})
-    call_tool(proc, next_id, "sftp_remove", {
-        **connection, "path": base, "recursive": True,
+    assert "status 2" in call_tool_error(proc, next_id, "sftp_stat", {
+        **connection, "path": base,
     })
-    assert call_tool(proc, next_id, "sftp_exists", {**connection, "path": base})["exists"] is False
-    print("sftp file family round-trip ok")
+    print("sftp file family round-trip ok (sftp face + shell mutation face)")
 
 
 def live_round_trip(proc: subprocess.Popen, args, id_base: int) -> None:
@@ -277,21 +241,11 @@ def live_round_trip(proc: subprocess.Popen, args, id_base: int) -> None:
         "username": args.username, "password": args.password,
     }
 
-    # Standalone MCP mode TOFU-trusts unknown host keys, so a first-time
-    # connection succeeds without a prior manual confirmation.
-    pong_test = call_tool(proc, next_id, "ssh_test_connection", dict(connection))
-    assert pong_test["ok"] is True, pong_test
-    assert pong_test["latencyMs"] >= 0, pong_test
-    print("ssh_test_connection ok")
-
     # Browse before exec: the SFTP tools must dial lazily on first use
     # (local_ubuntu coverage regression - the browse family used to demand
-    # a pre-established pool entry).
-    home = call_tool(proc, next_id, "sftp_pwd", dict(connection))["home"]
-    assert home.startswith("/"), home
-    listing = call_tool(proc, next_id, "sftp_list_dir", {
-        **connection, "path": home,
-    })
+    # a pre-established pool entry). sftp_test_connection/sftp_pwd 已随 #203
+    # 工具瘦身移出 MCP 面，lazy-dial 探针改用 sftp_list_dir。
+    listing = call_tool(proc, next_id, "sftp_list_dir", {**connection, "path": "."})
     assert isinstance(listing["entries"], list), listing
     print("sftp browse-first ok")
 
@@ -357,8 +311,12 @@ def live_round_trip(proc: subprocess.Popen, args, id_base: int) -> None:
     assert "confirmDestructive" in refused_live, refused_live
     print("live destructive-command gate ok")
 
-    metrics = call_tool(proc, next_id, "ssh_metrics", dict(connection))
-    assert metrics["hostname"] and metrics["cpu"]["cores"] > 0, metrics
+    # ssh_metrics left the MCP face (#203): read-only collection goes
+    # through ssh_exec exactly as an agent would.
+    uptime = call_tool(proc, next_id, "ssh_exec", {
+        **connection, "command": "uptime",
+    })
+    assert uptime["exitCode"] == 0 and uptime["output"].strip(), uptime
 
     sftp_file_family(proc, next_id, connection)
 
@@ -393,8 +351,8 @@ def live_round_trip(proc: subprocess.Popen, args, id_base: int) -> None:
         assert "Local path already exists" in refused, refused
     finally:
         try:
-            call_tool(proc, next_id, "sftp_remove", {
-                **connection, "path": remote_path,
+            call_tool(proc, next_id, "ssh_exec", {
+                **connection, "command": f"rm -f '{remote_path}'",
             })
         except AssertionError as cleanup_error:
             print(f"cleanup warning: {cleanup_error}")
@@ -404,15 +362,14 @@ def live_round_trip(proc: subprocess.Popen, args, id_base: int) -> None:
     live_enum_section(proc, next_id, connection)
     live_pipelining_section(proc, next_id, connection)
     call_tool(proc, next_id, "ssh_close", dict(connection))
-    print("live round-trip ok (test/browse/exec/background/family/metrics/transfer)")
+    print("live round-trip ok (browse/exec/background/family/transfer)")
 
 
 def live_enum_section(proc: subprocess.Popen, next_id: list, connection: dict) -> None:
     """Round 7 (§3.3 registration): enum parameter error quality asserted on
     a live server — the offline schema-check probes cannot reach past the
-    connection gate. Three representative tools:
-    - sftp_chmod mode semantics: invalid values list the legal octal forms
-      and leave the target's permission bits untouched;
+    connection gate. Representative tools (sftp_chmod left the MCP face in
+    #203; its LLM-variant semantics went with it):
     - ssh_multi_exec mode enum: invalid AND wrong-case values fail with the
       full legal list (schema enum is lowercase — implementation matches)
       before any dial, so the refusal is side-effect free;
@@ -420,41 +377,6 @@ def live_enum_section(proc: subprocess.Popen, next_id: list, connection: dict) -
       unrecognized values fall back to the default flow instead of
       erroring — deliberate §3.3 degradation, documented in the schema
       description since round 7."""
-    probe = f"/tmp/smoke-mcp-enum-{uuid.uuid4().hex[:8]}.txt"
-    call_tool(proc, next_id, "sftp_write_file", {
-        **connection, "path": probe, "content": "enum-probe",
-    })
-    baseline = call_tool(proc, next_id, "sftp_stat", {
-        **connection, "path": probe,
-    })["permissions"]
-    try:
-        # (mode value, error fragments that must appear)
-        chmod_rejects = [
-            ("999", ["mode must be an octal value up to 7777", "644"]),
-            ("-384", ["mode must be an octal value up to 7777"]),
-            ("rw-r--r--", ["mode must be an octal value up to 7777"]),
-        ]
-        for mode_value, expected in chmod_rejects:
-            message = call_tool_error(proc, next_id, "sftp_chmod", {
-                **connection, "path": probe, "mode": mode_value,
-            })
-            for fragment in expected:
-                assert fragment in message, f"chmod mode={mode_value!r}: {message}"
-        still = call_tool(proc, next_id, "sftp_stat", {
-            **connection, "path": probe,
-        })["permissions"]
-        assert still == baseline, f"invalid chmod mutated bits: {baseline} → {still}"
-        # Legal 0o-prefixed variant must still land (positive control).
-        call_tool(proc, next_id, "sftp_chmod", {
-            **connection, "path": probe, "mode": "0o640",
-        })
-        assert call_tool(proc, next_id, "sftp_stat", {
-            **connection, "path": probe,
-        })["permissions"] == "0640"
-        print("sftp_chmod mode semantics ok (invalid rejected, no side effect)")
-    finally:
-        call_tool(proc, next_id, "sftp_remove", {**connection, "path": probe})
-
     # The multi_exec mode check runs before target resolution/dialing, so
     # an unsaved reference never leaks into these refusals.
     for mode_value in ("wrong", "PARALLEL", "Sequential"):
@@ -486,19 +408,21 @@ def live_enum_section(proc: subprocess.Popen, next_id: list, connection: dict) -
 def live_pipelining_section(proc: subprocess.Popen, next_id: list, connection: dict) -> None:
     """Round 7: live pipelining — the offline round-5 robustness section
     proves request/response 1:1 on a synthetic stream; here two REAL tools
-    of different ids are written back-to-back without waiting (sftp_pwd +
-    ssh_metrics, both cheap on an established connection) and the responses
+    of different ids are written back-to-back without waiting (sftp_stat +
+    ssh_exec, both cheap on an established connection) and the responses
     must arrive as a 1:1 id match with each payload belonging to its own
     request (the concurrent face under a live SSH connection)."""
     pwd_id, metrics_id = next_id[0] + 1, next_id[0] + 2
     next_id[0] = metrics_id
     send(proc, {
         "jsonrpc": "2.0", "id": pwd_id, "method": "tools/call",
-        "params": {"name": "sftp_pwd", "arguments": dict(connection)},
+        "params": {"name": "sftp_stat", "arguments": {**connection, "path": "."}},
     })
     send(proc, {
         "jsonrpc": "2.0", "id": metrics_id, "method": "tools/call",
-        "params": {"name": "ssh_metrics", "arguments": dict(connection)},
+        "params": {"name": "ssh_exec", "arguments": {
+            **connection, "command": "echo pipeline-ok",
+        }},
     })
     assert proc.stdout is not None
     first = json.loads(proc.stdout.readline())
@@ -510,9 +434,9 @@ def live_pipelining_section(proc: subprocess.Popen, next_id: list, connection: d
     for message in (first, second):
         assert "error" not in message, message
         assert not message["result"].get("isError", False), message
-    assert "home" in json.loads(by_id[pwd_id]["result"]["content"][0]["text"])
-    metrics = json.loads(by_id[metrics_id]["result"]["content"][0]["text"])
-    assert metrics.get("hostname") and metrics["cpu"]["cores"] > 0, metrics
+    assert "size" in json.loads(by_id[pwd_id]["result"]["content"][0]["text"])
+    executed = json.loads(by_id[metrics_id]["result"]["content"][0]["text"])
+    assert executed["exitCode"] == 0 and "pipeline-ok" in executed["output"], executed
     print("live pipelining ok (2 in-flight requests, 1:1 id ↔ payload match)")
 
 
@@ -574,18 +498,16 @@ def main() -> None:
                 assert isinstance(annotations.get(hint), bool), f"{name} lacks boolean {hint}"
             assert isinstance(annotations.get("title"), str) and annotations["title"], \
                 f"{name} lacks title"
-        for destructive_tool in ("ssh_exec", "ssh_exec_sudo", "ssh_multi_exec", "sftp_remove",
-                                 "ssh_run_bg", "sftp_write_file", "ssh_remove_known_host"):
+        for destructive_tool in ("ssh_exec", "ssh_exec_sudo", "ssh_multi_exec",
+                                 "ssh_run_bg", "sftp_write_file", "sftp_upload",
+                                 "sftp_download", "ssh_remove_known_host"):
             assert by_name[destructive_tool]["annotations"]["destructiveHint"] is True, \
                 f"{destructive_tool} must advertise destructiveHint"
-        for read_only_tool in ("ssh_list_connections", "ssh_list_known_hosts", "ssh_metrics",
-                               "ssh_alert_triage", "sftp_list_dir", "sftp_stat", "sftp_exists",
-                               "sftp_pwd", "sftp_read_file", "sftp_disk_usage"):
+        for read_only_tool in ("ssh_list_connections", "ssh_list_known_hosts",
+                               "sftp_list_dir", "sftp_stat", "sftp_read_file"):
             annotations = by_name[read_only_tool]["annotations"]
             assert annotations["readOnlyHint"] is True and annotations["destructiveHint"] is False, \
                 f"{read_only_tool} must advertise readOnlyHint"
-        assert by_name["ssh_alert_triage"]["annotations"]["openWorldHint"] is False, \
-            "ssh_alert_triage runs fully offline"
         print("annotations ok: all tools carry hints + title")
         print(f"tools/list ok: {len(names)} tools")
 
@@ -601,26 +523,6 @@ def main() -> None:
         assert "password" in error, f"unexpected error: {error}"
         print("parameter validation ok")
 
-        # ssh_metrics sections projection: an unknown section name must be
-        # rejected BEFORE any dialing (no credentials in the call at all).
-        send(proc, {
-            "jsonrpc": "2.0", "id": 31, "method": "tools/call",
-            "params": {"name": "ssh_metrics", "arguments": {
-                "host": "203.0.113.1", "username": "u", "sections": ["memry"],
-            }},
-        })
-        error = recv(proc, 31)["error"]["message"]
-        assert "Unknown section: 'memry'" in error and "topMemory" in error, f"unexpected error: {error}"
-        send(proc, {
-            "jsonrpc": "2.0", "id": 32, "method": "tools/call",
-            "params": {"name": "ssh_metrics", "arguments": {
-                "host": "203.0.113.1", "username": "u", "sections": [],
-            }},
-        })
-        error = recv(proc, 32)["error"]["message"]
-        assert "at least one section" in error, f"unexpected error: {error}"
-        print("metrics sections pre-dial validation ok")
-
         # A connection-free tool round-trips through the real sidecar path.
         send(proc, {
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
@@ -632,125 +534,13 @@ def main() -> None:
         assert isinstance(parsed["knownHosts"], list)
         print("tools/call round-trip ok")
 
-        # Alert triage (IMPL_PLAN_SSH_APPROVAL_AUDIT_ALERT §2.4): offline,
-        # connection-free — normalize + classify + whitelisted-only playbook.
-        send(proc, {
-            "jsonrpc": "2.0", "id": 95, "method": "tools/call",
-            "params": {"name": "ssh_alert_triage", "arguments": {
-                "payload": json.dumps({
-                    "alertId": "smoke-1", "title": "CPU 使用率过高",
-                    "severity": "critical", "source": "prometheus",
-                    "message": "node-1 cpu_usage above 0.9",
-                }),
-            }},
-        })
-        result = recv(proc, 95)["result"]
-        assert not result.get("isError", False), f"triage failed: {result}"
-        triage = json.loads(result["content"][0]["text"])
-        assert triage["normalized"]["alertId"] == "smoke-1", triage
-        assert triage["category"] == "cpu", triage
-        assert triage["suggestions"], triage
-        assert all("sudo" not in item["command"] for item in triage["suggestions"]), triage
-        assert all(item["purposeKey"] for item in triage["suggestions"]), triage
-
-        # Intent recognition across categories: the intent surface must
-        # classify cpu / memory / disk plus network / oom / service /
-        # generic and bilingual mixed phrasing (bilingual keyword scoring),
-        # each suggestion staying whitelist-safe.
-        for intent_title, expected_category in (
-            ("memory usage above 90 percent / 内存占用过高", "memory"),
-            ("磁盘剩余空间不足", "disk"),
-            ("network eth0 packet loss 10%, 网卡丢包", "network"),
-            ("Out of memory: oom-kill killed process 4321", "oom"),
-            ("systemd unit nginx.service restart failed", "service"),
-            ("backup job completed without errors at 03:00", "generic"),
-            ("CPU loadavg 飙升, 处理器过热", "cpu"),
-        ):
-            send(proc, {
-                "jsonrpc": "2.0", "id": 96, "method": "tools/call",
-                "params": {"name": "ssh_alert_triage", "arguments": {
-                    "payload": json.dumps({
-                        "alertId": f"smoke-{expected_category}",
-                        "title": intent_title,
-                        "severity": "warning", "source": "prometheus",
-                        "message": intent_title,
-                    }),
-                }},
-            })
-            result = recv(proc, 96)["result"]
-            assert not result.get("isError", False), f"triage failed: {result}"
-            intent = json.loads(result["content"][0]["text"])
-            assert intent["category"] == expected_category, intent
-            assert intent["suggestions"], intent
-        print("ssh_alert_triage intent recognition ok (cpu/memory/disk/network/oom/service/generic)")
-        print("ssh_alert_triage offline round-trip ok")
-
-        # Docker family target:"local" (0.7.1-beta.10): the daemon on the
-        # machine the sidecar runs on — Docker Desktop, OrbStack, rootless.
-        # Offline-safe: shape assertions only, because a dev box may or may
-        # not have a local docker CLI / running daemon.
-        send(proc, {
-            "jsonrpc": "2.0", "id": 9100, "method": "tools/call",
-            "params": {"name": "docker_list", "arguments": {"target": "local"}},
-        })
-        local_list = recv(proc, 9100)
-        assert not local_list.get("error"), f"docker_list target=local failed: {local_list}"
-        local_result = local_list["result"]
-        assert not local_result.get("isError", False), f"local list errored: {local_result}"
-        local_payload = json.loads(local_result["content"][0]["text"])
-        assert isinstance(local_payload.get("available"), bool), local_payload
-        assert isinstance(local_payload.get("needsSudo"), bool), local_payload
-        assert isinstance(local_payload.get("containers"), list), local_payload
-        print("docker_list target=local shape ok")
-
-        # The schema must advertise the local selector next to the SSH ones.
-        docker_schema_any_of = by_name["docker_list"]["inputSchema"]["anyOf"]
-        assert {"required": ["target"]} in docker_schema_any_of, docker_schema_any_of
-        print("docker_list target selector schema ok")
-
-        # Unknown target values must fail before any process/connection I/O.
-        send(proc, {
-            "jsonrpc": "2.0", "id": 9101, "method": "tools/call",
-            "params": {"name": "docker_list", "arguments": {"target": "bogus"}},
-        })
-        target_error = recv(proc, 9101)["error"]["message"]
-        assert "Unsupported docker target" in target_error, target_error
-        print("docker target validation ok")
-
-        # Global Quick Sudo profiles: save/list/delete round-trip with a
-        # runtime-assembled test secret; responses must never echo it.
-        secret = f"smoke-{uuid.uuid4().hex}"
-        profile_name = f"smoke-{uuid.uuid4().hex[:8]}"
-        send(proc, {
-            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
-            "params": {"name": "ssh_quick_sudo_profiles_save", "arguments": {
-                "name": profile_name,
-                "sudoPassword": secret,
-                "totpSecret": "JBSWY3DPEHPK3PXP",
-                "authFlowMode": "password_plus_otp",
-                "sudoUsePty": True,
-            }},
-        })
-        saved = recv(proc, 5)["result"]
-        assert not saved.get("isError", False), f"save failed: {saved}"
-        saved_profile = json.loads(saved["content"][0]["text"])
-        profile_id = saved_profile["profile"]["id"]
-        assert saved_profile["created"] is True, saved_profile
-        assert saved_profile["profile"]["sudoPasswordSet"] is True, saved_profile
-        assert secret not in saved["content"][0]["text"], "save echoed the secret"
-
-        send(proc, {
-            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
-            "params": {"name": "ssh_quick_sudo_profiles_list", "arguments": {}},
-        })
-        listed = recv(proc, 6)["result"]
-        listed_text = listed["content"][0]["text"]
-        assert secret not in listed_text, "list echoed the secret"
-        listed_profiles = json.loads(listed_text)["profiles"]
-        assert any(profile.get("sudoPasswordSet") is True for profile in listed_profiles), listed_text
-
-        # ssh_exec_sudo schema exposes quickSudoProfile; an unknown reference
-        # must fail fast with a clear error (before any connection attempt).
+        # Docker panel moved off the MCP face (#203): container inspection
+        # goes through ssh_exec (`docker ps` is in the read-only whitelist).
+        # Global Quick Sudo profile management moved to the workbench UI;
+        # the MCP face no longer carries the list/save/delete tools (#203
+        # tool slimming). What must keep working on this surface: the
+        # ssh_exec_sudo quickSudoProfile parameter (schema-advertised) and
+        # its fail-fast error.
         schema_properties = next(
             tool["inputSchema"]["properties"] for tool in tools if tool["name"] == "ssh_exec_sudo"
         )
@@ -764,14 +554,7 @@ def main() -> None:
         })
         missing_profile = recv(proc, 7)["error"]["message"]
         assert "not found" in missing_profile, f"unexpected error: {missing_profile}"
-
-        send(proc, {
-            "jsonrpc": "2.0", "id": 8, "method": "tools/call",
-            "params": {"name": "ssh_quick_sudo_profiles_delete", "arguments": {"id": profile_id}},
-        })
-        removed = recv(proc, 8)["result"]
-        assert json.loads(removed["content"][0]["text"])["removed"] is True, removed
-        print("quick sudo profiles round-trip ok")
+        print("quick sudo profile reference surface ok")
 
         # Agent terminal routing is embedded-bridge only: stdio mode must
         # refuse runInTerminal before any connection I/O (ids skip into the
@@ -787,8 +570,7 @@ def main() -> None:
         # Connection addressing usability: EVERY connection-bound tool must
         # advertise connectionName plus the selector anyOf (id | name |
         # endpoint), or strict hosts refuse the call before the sidecar can
-        # resolve the saved connection (the ssh_test_connection gap found
-        # during the local_ubuntu MCP coverage pass).
+        # resolve the saved connection (the local_ubuntu MCP coverage gap).
         for tool_name in CONNECTION_BOUND_TOOLS:
             tool_input = next(tool["inputSchema"] for tool in tools if tool["name"] == tool_name)
             assert "connectionName" in tool_input.get("properties", {}), (
@@ -818,8 +600,8 @@ def main() -> None:
         # "missing host" — the caller needs the recovery order spelled out.
         send(proc, {
             "jsonrpc": "2.0", "id": 22, "method": "tools/call",
-            "params": {"name": "ssh_test_connection", "arguments": {
-                "connectionName": "no-such-connection",
+            "params": {"name": "ssh_exec", "arguments": {
+                "connectionName": "no-such-connection", "command": "true",
             }},
         })
         unresolved = recv(proc, 22)["error"]["message"]
@@ -1164,7 +946,7 @@ def agentic_workflow_section(args: argparse.Namespace) -> None:
         send(proc, {"jsonrpc": "2.0", "id": next_id[0], "method": "tools/list"})
         tools = recv(proc, next_id[0])["result"]["tools"]
         names = {tool["name"] for tool in tools}
-        assert {"ssh_exec", "ssh_list_connections", "ssh_alert_triage",
+        assert {"ssh_exec", "ssh_list_connections",
                 "ssh_list_known_hosts"} <= names, names
         exec_schema = next(t["inputSchema"] for t in tools if t["name"] == "ssh_exec")
         assert "connectionName" in exec_schema["properties"], exec_schema
@@ -1192,22 +974,9 @@ def agentic_workflow_section(args: argparse.Namespace) -> None:
         assert "password" in step5.lower(), step5
 
         # Step 6: local verification tools close the loop with successes —
-        # known_hosts round-trips, and the triage playbook returns
-        # whitelist-safe commands the agent could execute via ssh_exec next.
+        # known_hosts and the (app-less) connection discovery round-trip.
         known = call_tool(proc, next_id, "ssh_list_known_hosts", {})
         assert isinstance(known["knownHosts"], list), known
-        triage = call_tool(proc, next_id, "ssh_alert_triage", {
-            "payload": json.dumps({
-                "alertId": "agent-1", "severity": "critical",
-                "message": "network eth0 packet loss 10%, 网卡丢包",
-            }),
-        })
-        assert triage["category"] == "network", triage
-        assert triage["suggestions"], triage
-        assert all(
-            "sudo" not in item["command"] and ">" not in item["command"]
-            for item in triage["suggestions"]
-        ), triage
     finally:
         if proc.stdin:
             proc.stdin.close()
@@ -1413,7 +1182,7 @@ def protocol_robustness_section(args: argparse.Namespace) -> None:
         next_id[0] += 1
         send(proc, {
             "jsonrpc": "2.0", "id": next_id[0], "method": "tools/call",
-            "params": {"name": "ssh_alert_triage", "arguments": {"payload": giant}},
+            "params": {"name": "ssh_list_known_hosts", "arguments": {"padding": giant}},
         })
         started = time.monotonic()
         # 预算 120s：8 MiB 行的解析回包在慢 CI runner（darwin-x64 实测）可能
@@ -1431,9 +1200,7 @@ def protocol_robustness_section(args: argparse.Namespace) -> None:
             {"jsonrpc": "2.0", "id": 2003, "method": "tools/call",
              "params": {"name": "ssh_list_known_hosts", "arguments": {}}},
             {"jsonrpc": "2.0", "id": 2004, "method": "tools/call",
-             "params": {"name": "ssh_alert_triage", "arguments": {"payload": json.dumps({
-                 "alertId": "pipe-1", "title": "CPU 负载过高",
-             })}}},
+             "params": {"name": "ssh_list_known_hosts", "arguments": {"extra": 1}}},
         ]
         for request in pipeline:
             raw((json.dumps(request) + "\n").encode())

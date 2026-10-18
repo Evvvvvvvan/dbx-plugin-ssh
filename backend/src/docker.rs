@@ -14,13 +14,11 @@
 use std::path::Path;
 use std::time::Duration;
 
-use russh::client::Handle;
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::audit_log;
 use crate::exec;
-use crate::ssh::SshClient;
 
 /// Wait cap for the container list collector (one `docker ps` round-trip).
 pub const LIST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -677,101 +675,9 @@ pub fn sudo_fallback_error(error: String) -> String {
     )
 }
 
-// —— Handle-plane collectors (MCP tool path) ——————————————
-
-/// `docker_list`: list_script round-trip on a fresh exec channel, then
-/// the two graceful repairs in order —
-/// 1. **Windows fallback**: output without the probe marker means the
-///    remote default shell garbled the heredoc (cmd/PowerShell); retry
-///    once with [`win_list_script`].
-/// 2. **Quick Sudo elevation**: found-but-denied probe with resolvable
-///    Quick Sudo credentials retries the same body under
-///    `sudo -S sh -c '<body>'` (password on stdin, script as argv). Any
-///    elevation failure degrades to the plain payload so the panel keeps
-///    its needsSudo hint instead of erroring the read-only call.
-pub async fn collect_list(
-    handle: &Handle<SshClient>,
-    sudo_auth: Option<&exec::SudoAuth>,
-    engine: &EngineConfig,
-) -> Result<Value, String> {
-    let outcome = exec::exec_plain(handle, &list_script(engine), LIST_TIMEOUT, &[]).await?;
-    let mut output = outcome.output;
-    if needs_windows_fallback(&output) {
-        let windows = exec::exec_plain(handle, &win_list_script(engine), LIST_TIMEOUT, &[]).await?;
-        if !needs_windows_fallback(&windows.output) {
-            output = windows.output;
-        }
-    }
-    let plain_payload = list_payload(&output);
-    if plain_payload["available"] == true || plain_payload["needsSudo"] != true {
-        return Ok(plain_payload);
-    }
-    let Some(auth) = sudo_auth else {
-        return Ok(plain_payload);
-    };
-    let elevated =
-        exec::exec_with_sudo(handle, auth, &list_body(engine), LIST_TIMEOUT, false, &[]).await?;
-    let elevated_payload = list_payload(&elevated.output);
-    // Only trust the elevated run when its probe actually cleared the
-    // socket denial; a garbled or refused sudo attempt keeps the hint.
-    if elevated_payload["available"] == true {
-        Ok(elevated_payload)
-    } else {
-        Ok(plain_payload)
-    }
-}
-
-/// `docker_action` for the MCP plane: plain run first; on the daemon
-/// permission signature only, retries through the Quick Sudo pipeline
-/// (`exec_with_sudo` pipes the password over stdin, never the command
-/// line, and answers TOTP follow-up prompts). `sudo_auth: None` (no
-/// resolvable credentials) skips the fallback and returns the guidance.
-/// The elevation rerun uses the same full text (endpoint export included)
-/// so the elevated daemon target matches the plain attempt.
-pub async fn perform_action(
-    handle: &Handle<SshClient>,
-    sudo_auth: Option<&exec::SudoAuth>,
-    use_pty: bool,
-    engine: &EngineConfig,
-    container_id: &str,
-    action: DockerAction,
-) -> Result<Value, String> {
-    let command = exec_command(engine, action, container_id);
-    let outcome = exec::exec_plain(handle, &command, ACTION_TIMEOUT, &[]).await?;
-    if outcome.exit_code == 0 {
-        return Ok(json!({ "success": true, "output": outcome.output }));
-    }
-    if is_daemon_permission_failure(outcome.exit_code, &outcome.output) {
-        let Some(auth) = sudo_auth else {
-            return Err(sudo_fallback_error(format!(
-                "{} {}: {}",
-                engine.cli,
-                action.as_str(),
-                outcome.output
-            )));
-        };
-        return match exec::exec_with_sudo(handle, auth, &command, ACTION_TIMEOUT, use_pty, &[])
-            .await
-        {
-            Ok(sudo_outcome) => Ok(json!({ "success": true, "output": sudo_outcome.output })),
-            Err(error) => Err(sudo_fallback_error(error)),
-        };
-    }
-    Err(format!(
-        "{} {} failed (exit {}): {}",
-        engine.cli,
-        action.as_str(),
-        outcome.exit_code,
-        outcome.output
-    ))
-}
-
-// —— Local-machine plane (workbench/MCP `target: "local"`) ———————————————
-
-/// Target selector for the docker family: the default `ssh` keeps the
-/// historic session/connection semantics, `local` runs against the docker
-/// daemon on the machine the sidecar runs on (Docker Desktop, OrbStack,
-/// rootless installs). Unknown values fail before any process is spawned.
+/// Where the docker family resolves its daemon: the SSH connection the
+/// call is addressed to, or the local daemon on the machine the sidecar
+/// runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DockerTarget {
     Ssh,

@@ -162,7 +162,7 @@ import {
 import { COMMAND_HISTORY_LIMIT, mergeShellHistory, parseShellHistoryText, persistableCommandHistoryBuckets, pushCommandHistory, sanitizeCommandHistoryBuckets, sanitizeCommandHistoryLimit, trimCommandHistoryBuckets } from "./lib/commandHistory";
 import { EnterLineTracker, acceptCommandWithContinuation, canCaptureEnterLine, echoConfirmsLine, extractDesyncedCommand, extractEchoedCommand } from "./lib/terminalEnterCapture";
 import { applyLineEditControlChar } from "./lib/terminalLineModel";
-import { loadGhostTabAccept, matchesGhostFullAccept, matchesGhostWordAccept, saveGhostTabAccept } from "./lib/ghostAcceptKey";
+import { loadGhostTabAccept, matchesGhostFullAccept, matchesGhostWordAccept, resolveCtrlFRoute, saveGhostTabAccept } from "./lib/ghostAcceptKey";
 import { isPasswordPromptLine, loadPromptHintsDismissed, loadPromptHintsEnabled, savePromptHintsDismissed, savePromptHintsEnabled, shouldShowPromptHints } from "./lib/terminalPromptHints";
 import { readWorkbenchUiMirror, writeWorkbenchUiMirror } from "./lib/workbenchUiMirror";
 // 终端交互提示守卫（issue #150 及其反馈扩展）：远端询问输入/要求选择（MFA/
@@ -622,6 +622,8 @@ const suggestionMaxCharsState = ref(64);
 // ghost 接受键（Warp 多键模型）：→ / Ctrl+F / Ctrl+E 整段、Ctrl+→ 逐词恒可用
 // （lib/ghostAcceptKey.ts 匹配矩阵）；唯一可配置项是「Tab 接受建议」开关
 // （Warp Tab key behavior），pluginStore 权威 + 内存态供按键分支与键帽回显。
+// issue #108a 起 Ctrl+F 只在 ghost 建议可见待接受时作接受键，无 ghost 归终端
+// 搜索（iTerm2 同位，resolveCtrlFRoute 判定）；→ / Ctrl+E 行为不变。
 const ghostTabAccept = ref(loadGhostTabAccept());
 // 键位胶囊（Warp accept-autosuggestion-hint 同位）的下拉菜单与展示标签。
 const ghostKeycapMenuOpen = ref(false);
@@ -2388,6 +2390,18 @@ function handleTerminalKey(event: KeyboardEvent) {
     // 用过即散：接受 ghost 命中引导条教的键位（→ / Ctrl+F / Ctrl+E），此后不再教。
     dismissPromptHints();
     acceptGhostSuggestion();
+    return consume();
+  }
+  // Ctrl+F 终端搜索（issue #108a，iTerm2 同位）：ghost 建议可见待接受时上方
+  // 分支已把 Ctrl+F 消费为整段接受（Warp 键位模型不变）；无 ghost 才轮到
+  // 搜索。传输占用（trz/zmodem 协议拥有输入流）时放行——与 resolveTerminalInputRoute
+  // 同判，不打断传输（Ctrl+F 的 0x06 由传输 filter/远端自行解释）。
+  if (
+    event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey &&
+    event.key.toLowerCase() === "f" &&
+    resolveCtrlFRoute({ ghostVisible: !!ghostMatch.value, transferBusy: terminalTransferBusy.value }) === "search"
+  ) {
+    openTerminalSearch();
     return consume();
   }
   // 命令建议浮层开启时优先消费导航/回填键；Tab 仅在延伸/显式选中时回填，

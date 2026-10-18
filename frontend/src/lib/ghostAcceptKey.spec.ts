@@ -2,7 +2,7 @@
 // ghost 接受键单测（Warp 多键模型）：Tab 开关持久化 + 整段/逐词匹配矩阵。
 import { beforeEach, describe, expect, it } from "vitest";
 import { PLUGIN_STORE_KEYS } from "./pluginStore";
-import { loadGhostTabAccept, matchesGhostFullAccept, matchesGhostWordAccept, saveGhostTabAccept } from "./ghostAcceptKey";
+import { loadGhostTabAccept, matchesGhostFullAccept, matchesGhostWordAccept, resolveCtrlFRoute, saveGhostTabAccept } from "./ghostAcceptKey";
 
 const NO_MOD = { ctrlKey: false, metaKey: false, altKey: false, shiftKey: false };
 
@@ -47,5 +47,20 @@ describe("ghostAcceptKey (Warp Autosuggestions 键位模型)", () => {
     expect(matchesGhostWordAccept("ArrowRight", { ...NO_MOD, altKey: true })).toBe(false);
     expect(matchesGhostWordAccept("ArrowRight", NO_MOD)).toBe(false);
     expect(matchesGhostWordAccept("Tab", { ...NO_MOD, ctrlKey: true })).toBe(false);
+  });
+});
+
+describe("resolveCtrlFRoute (issue #108a，iTerm2 同位)", () => {
+  it("routes Ctrl+F to ghost accept while a suggestion is visible and pending", () => {
+    expect(resolveCtrlFRoute({ ghostVisible: true, transferBusy: false })).toBe("ghost-accept");
+  });
+
+  it("routes Ctrl+F to terminal search when no ghost is pending", () => {
+    expect(resolveCtrlFRoute({ ghostVisible: false, transferBusy: false })).toBe("search");
+  });
+
+  it("always passes Ctrl+F through while a trz/zmodem transfer owns the input stream", () => {
+    expect(resolveCtrlFRoute({ ghostVisible: false, transferBusy: true })).toBe("passthrough");
+    expect(resolveCtrlFRoute({ ghostVisible: true, transferBusy: true })).toBe("passthrough");
   });
 });

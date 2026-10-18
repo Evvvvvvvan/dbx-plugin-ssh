@@ -55,3 +55,17 @@ export function matchesGhostWordAccept(eventKey: string, modifiers: GhostKeyModi
   const { ctrlKey, metaKey, altKey } = modifiers;
   return eventKey === "ArrowRight" && ctrlKey && !metaKey && !altKey;
 }
+
+// —— Ctrl+F 归属路由（issue #108a，iTerm2 同位）——
+// Ctrl+F 在远端 readline 是 forward-char，同时是 ghost 三键整段接受之一；
+// 无 ghost 待接受时它作为纯 forward-char 的价值远低于终端搜索。归属判定
+// 收敛为纯函数：ghost 可见 → 接受键；传输占用（trz/zmodem 拥有输入流，
+// 与 resolveTerminalInputRoute 同判）→ 一律放行不打断协议协商；其余 →
+// 打开终端搜索。裸 → 与 Ctrl+E 不参与本判定（始终是接受键，行为不变）。
+
+export type CtrlFRoute = "ghost-accept" | "search" | "passthrough";
+
+export function resolveCtrlFRoute(options: { ghostVisible: boolean; transferBusy: boolean }): CtrlFRoute {
+  if (options.transferBusy) return "passthrough";
+  return options.ghostVisible ? "ghost-accept" : "search";
+}

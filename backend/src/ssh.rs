@@ -14679,6 +14679,78 @@ matrix-ed25519";
         );
     }
 
+    // ===== issue #108：堡垒机 MFA（keyboard-interactive）行为锁定 =====
+    //
+    // 登录期 keyboard-interactive 由 `authenticate_keyboard_interactive` 驱动：
+    // 最多 KEYBOARD_INTERACTIVE_MAX_ROUNDS 轮，每轮逐 prompt 分类应答（密码 /
+    // OTP / 组合，见 exec.rs `keyboard_interactive_answers` 的既有测试）；分类
+    // 不出的 prompt 用 challenge 上下文兜底，仍为空的答案弹结构化一次性输入
+    // 对话框（`request_keyboard_interactive_answer`），绝不是在 PTY 里瞎敲。
+    // 以下三个纯助手是该链路的用户可见面——逐字锁定（堡垒机排障依赖这些文案
+    // 的稳定性，且 sanitize 保证服务器可控文本进不了 UI 注入面）。
+
+    #[test]
+    fn keyboard_interactive_round_budget_is_bounded() {
+        // 防御性锁定：服务器循环重问时必须有确定性失败，而不是无限轮询；
+        // 静默改动这个预算会改变堡垒机（koko MFA 多轮）的登录语义。
+        assert_eq!(KEYBOARD_INTERACTIVE_MAX_ROUNDS, 4);
+    }
+
+    #[test]
+    fn keyboard_interactive_guidance_explains_unanswered_and_rejected() {
+        // 没有回答：指引配置 TOTP 种子 / OTP 提示词（Quick Sudo 2FA 设置）。
+        let unanswered = keyboard_interactive_guidance(&["\"[OTP Code]: \"".to_string()], false);
+        assert!(unanswered.contains("the server asked for"), "{unanswered}");
+        assert!(unanswered.contains("nothing was answered"), "{unanswered}");
+        assert!(unanswered.contains("TOTP secret"), "{unanswered}");
+
+        // 回答被拒：不再引导去配置（已配置但服务器拒收），只报拒绝事实。
+        let rejected = keyboard_interactive_guidance(&["\"Password: \"".to_string()], true);
+        assert!(
+            rejected.contains("rejected the submitted answer"),
+            "{rejected}"
+        );
+        assert!(!rejected.contains("TOTP secret"), "{rejected}");
+
+        // 空提问列表：不追加任何子句（连接错误保持精简）。
+        assert_eq!(keyboard_interactive_guidance(&[], false), "");
+    }
+
+    #[test]
+    fn keyboard_interactive_manual_challenge_dedupes_and_sanitizes() {
+        // 服务器可控文本：ANSI 转义剥离（着色 prompt 还原成纯文本，转义序列
+        // 进不了对话框）、重复部分去重（koko 的 instructions 与 prompt 常语义
+        // 重复）、空输入为空串。
+        let challenge = keyboard_interactive_manual_challenge(
+            "Please Enter MFA Code.",
+            "\u{1b}[1m[OTP Code]: \u{1b}[0m",
+        );
+        assert!(challenge.contains("Please Enter MFA Code."), "{challenge}");
+        // normalize 会对每段 trim，行尾空格被剥掉是既有归一化语义。
+        assert!(challenge.contains("[OTP Code]:"), "{challenge}");
+        assert!(!challenge.contains('\u{1b}'), "{challenge}");
+
+        let deduped = keyboard_interactive_manual_challenge("Same line.", "Same line.");
+        assert_eq!(deduped, "Same line.");
+        assert_eq!(keyboard_interactive_manual_challenge("  ", "\t"), "");
+    }
+
+    #[test]
+    fn challenge_display_text_dedupes_seen_wording() {
+        let mut seen: Vec<String> = Vec::new();
+        let first = challenge_display_text("Please Enter MFA Code.", &seen);
+        assert_eq!(first.as_deref(), Some("Please Enter MFA Code."));
+        seen.push(first.expect("first display"));
+        // 同一段文案第二次出现（instructions 与 prompt 重复）不再上屏。
+        assert_eq!(
+            challenge_display_text("Please Enter MFA Code.", &seen),
+            None
+        );
+        // 空文案与纯控制字符文案都不产生展示片段。
+        assert_eq!(challenge_display_text("", &[]), None);
+        assert_eq!(challenge_display_text("\u{1b}\u{7}", &[]), None);
+    }
+
     #[tokio::test]
     async fn agent_exec_guard_reports_unknown_sessions() {
         let data_dir = tempfile::tempdir().expect("tempdir");

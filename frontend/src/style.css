@@ -494,6 +494,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .docker-float > header { display: flex; min-height: 34px; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--border); padding: 3px 4px 3px 12px; }
 .docker-float h2 { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; font-weight: 600; }
 .docker-float > .docker-panel { flex: 1 1 auto; min-height: 0; }
+/* 左缘拖拽手柄（issue #170）：骑在左缘上的 7px 竖条，向左拖 = 变宽
+   （纯计算 lib/dockerPanelWidth，300..720 钳制 + pluginStore 持久化）。
+   命中区左右各外扩 3px，落在浮层圆角外不遮挡内容；拖拽中光标全程列向。 */
+.docker-float-resize { position: absolute; z-index: 7; top: 0; bottom: 0; left: -3px; width: 7px; cursor: col-resize; touch-action: none; }
+.docker-float-resize:hover, .docker-float.resize-active .docker-float-resize { background: color-mix(in srgb, var(--primary) 35%, transparent); }
 .sftp-pane.drag-active { background: color-mix(in srgb, var(--primary) 4%, var(--background)); }
 
 /* SFTP 面板主体：左侧 tree/quick 双 tab 侧栏（可收起为窄条）+ 右侧文件区。

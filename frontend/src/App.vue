@@ -367,6 +367,7 @@ import GpuNpuMonitor from "./components/GpuNpuMonitor.vue";
 import FolderPickerDialog from "./components/FolderPickerDialog.vue";
 import SideNavPanel from "./components/SideNavPanel.vue";
 import DockerPanel from "./components/DockerPanel.vue";
+import { dockerPanelWidthStyle, DOCKER_PANEL_WIDTH_DEFAULT, DOCKER_PANEL_WIDTH_STORE_KEY, dockerPanelWidthAfterDrag, persistDockerPanelWidth, sanitizeDockerPanelWidth } from "./lib/dockerPanelWidth";
 import DockerWhaleLogo from "./components/DockerWhaleLogo.vue";
 import { Switch } from "./components/ui/switch";
 import { defaultPatternFor, newCustomEditorId, resolveEditorForFile, sanitizeEditorConfig, type CustomEditor, type EditorConfig, type KnownEditor, type ResolvedEditor } from "./lib/editorRules";
@@ -5146,6 +5147,42 @@ const forwardsOpen = ref(false);
 // 覆盖终端一角，不占分栏宽度；关闭即卸载并停轮询。面板本体仍由 DockerPanel
 // 自治（会话解析/轮询/动作/引擎设置都在组件内）。
 const dockerPanelOpen = ref(false);
+// 面板宽度（issue #170）：左缘拖拽手柄调宽（300..720，lib/dockerPanelWidth
+// 纯计算），pluginStore 持久化、启动水合；内联宽度保留 calc 容器守卫。
+function loadDockerPanelWidth(): number {
+  try {
+    return sanitizeDockerPanelWidth(pluginStore.getItem(DOCKER_PANEL_WIDTH_STORE_KEY)) ?? DOCKER_PANEL_WIDTH_DEFAULT;
+  } catch {
+    return DOCKER_PANEL_WIDTH_DEFAULT;
+  }
+}
+const dockerPanelWidth = ref(loadDockerPanelWidth());
+const dockerPanelResizing = ref(false);
+function startDockerPanelResize(event: PointerEvent) {
+  event.preventDefault();
+  const startX = event.clientX;
+  const startWidth = dockerPanelWidth.value;
+  dockerPanelResizing.value = true;
+  const handle = event.currentTarget as HTMLElement;
+  const move = (next: PointerEvent) => {
+    // 浮层锚右缘、左缘拖拽：向左拖 = 变宽（纯计算在 lib，钳制在内）。
+    dockerPanelWidth.value = dockerPanelWidthAfterDrag({ startWidth, startX, currentX: next.clientX });
+  };
+  const release = () => {
+    handle.removeEventListener("pointermove", move);
+    handle.removeEventListener("pointerup", release);
+    handle.removeEventListener("pointercancel", release);
+    if (handle.hasPointerCapture(event.pointerId)) {
+      try { handle.releasePointerCapture(event.pointerId); } catch { /* 已被隐式释放 */ }
+    }
+    dockerPanelResizing.value = false;
+    persistDockerPanelWidth(dockerPanelWidth.value);
+  };
+  handle.setPointerCapture(event.pointerId);
+  handle.addEventListener("pointermove", move);
+  handle.addEventListener("pointerup", release);
+  handle.addEventListener("pointercancel", release);
+}
 
 // 关键词高亮：规则表 CRUD 收口在 composables/useHighlightRules（渲染引擎在下方）。
 const {
@@ -9573,7 +9610,8 @@ watch(historyScope, () => {
              关闭即卸载停轮询。与指标/录制浮条同角族（同开时后挂者置顶，语义同
              recordings）。内嵌引擎设置 Popover 与确认/日志 Dialog 仍 portal 到
              body。宽度按容器表自然宽给足，窄屏收 100%-16px。 -->
-        <section v-if="dockerPanelOpen" class="docker-float">
+        <section v-if="dockerPanelOpen" class="docker-float" :class="{ 'resize-active': dockerPanelResizing }" :style="{ width: dockerPanelWidthStyle(dockerPanelWidth) }">
+          <div class="docker-float-resize" role="separator" aria-orientation="vertical" :aria-valuenow="dockerPanelWidth" :title="t('docker.dockerResizeHint')" @pointerdown="startDockerPanelResize" />
           <header>
             <h2>{{ t("docker.toolbarTitle") }}</h2>
             <button class="icon-button" :title="t('close')" :aria-label="t('close')" @click="dockerPanelOpen = false"><X /></button>

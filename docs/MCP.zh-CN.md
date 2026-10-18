@@ -130,7 +130,8 @@ stdio 分发循环对敌意输入保持"进程不崩、连接不挂、后续请�
 > `sftp_copy` / `sftp_move`（shell `mkdir`/`rm`/`mv`/`chmod`/`cp` 语义重复，
 > 走 `ssh_exec`，灾难确认门在 exec 路径上等价生效）。前端工作台的对应
 > sidecar RPC 方法**全部保留**，UI 不受影响；`tools/list` 从 ≈100k 字符降到
-> ≈49k，在 Claude Code 的 ≈50k 落盘阈值之内。
+> 实测 43,842 字符（二轮描述精简后，见 PROTOCOL「MCP 工具面」节），桥包装
+> 文本 ≈39.5k，在 Claude Code 的 ≈50k 落盘阈值之内。
 
 ### 本地传输路径约束（sftp_upload / sftp_download）
 

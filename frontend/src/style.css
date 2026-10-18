@@ -727,12 +727,24 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .spinning { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* 布局方向偏好（issue #187）的纵向覆盖类：与窄屏断点同形的堆叠规则，
+   但不依赖视口——「始终上下」在宽屏同样生效。终端恒在上（.panes--reversed
+   的 row-reverse 被压成 column，左右换位对纵向无意义）。 */
+.panes--vertical, .panes--vertical.panes--reversed { flex-direction: column; }
+.panes--vertical .terminal-pane { width: 100%; height: 52%; flex-basis: auto !important; flex-shrink: 0; }
+.panes--vertical .sftp-pane { width: 100%; height: 48%; }
+.panes--vertical .divider { width: 100%; height: 1px; flex-basis: 1px; cursor: row-resize; }
+.panes--vertical .divider::after { top: -3px; bottom: -3px; left: 0; right: 0; }
+.panes--vertical.panes--solo .terminal-pane { height: 100%; }
+
 @media (max-width: 900px) {
   .follow-directory-control > span { display: none; }
-  .panes, .panes--reversed { flex-direction: column; }
-  .terminal-pane { width: 100%; height: 52%; flex-basis: auto !important; flex-shrink: 0; }
-  .sftp-pane { width: 100%; height: 48%; }
-  .divider { width: 100%; height: 1px; flex-basis: 1px; cursor: row-resize; }
+  /* 窄屏纵向仅是「自动」模式的缺省：强制左右（.panes--horizontal）不受断点
+     影响（issue #187），:not() 提一档特异性压过下面的列布局规则。 */
+  .panes:not(.panes--horizontal), .panes--reversed:not(.panes--horizontal) { flex-direction: column; }
+  .panes:not(.panes--horizontal) .terminal-pane { width: 100%; height: 52%; flex-basis: auto !important; flex-shrink: 0; }
+  .panes:not(.panes--horizontal) .sftp-pane { width: 100%; height: 48%; }
+  .panes:not(.panes--horizontal) .divider { width: 100%; height: 1px; flex-basis: 1px; cursor: row-resize; }
   /* 纵向布局把手命中区向下/上扩展。 */
   .divider::after { top: -3px; bottom: -3px; left: 0; right: 0; }
   /* SFTP 面板收起时终端占满整个工作台（含窄屏纵向布局）。 */

@@ -1,3 +1,5 @@
+import { type PaneDirectionPref } from "./paneLayout";
+
 export type SshWorkbenchPaneOrder = "terminal-left" | "sftp-left";
 
 export function getSshWorkbenchSplitLayout(order: SshWorkbenchPaneOrder) {
@@ -75,6 +77,8 @@ const LAYOUT_SORT_COLUMNS = ["name", "size", "modified"] as const;
 
 export interface WorkbenchLayoutPrefs {
   paneOrder?: SshWorkbenchPaneOrder;
+  /** 布局方向偏好（issue #187）：auto/vertical/horizontal，缺省不覆盖。 */
+  paneDirection?: PaneDirectionPref;
   splitRatio?: number;
   sftpPaneOpen?: boolean;
   visibleColumns?: string[];
@@ -95,6 +99,7 @@ export function sanitizeWorkbenchLayoutPrefs(raw: unknown): WorkbenchLayoutPrefs
   const source = raw as Record<string, unknown>;
   const prefs: WorkbenchLayoutPrefs = {};
   if (source.paneOrder === "terminal-left" || source.paneOrder === "sftp-left") prefs.paneOrder = source.paneOrder;
+  if (source.paneDirection === "auto" || source.paneDirection === "vertical" || source.paneDirection === "horizontal") prefs.paneDirection = source.paneDirection;
   if (typeof source.splitRatio === "number" && Number.isFinite(source.splitRatio) && source.splitRatio >= 35 && source.splitRatio <= 80) prefs.splitRatio = source.splitRatio;
   if (typeof source.sftpPaneOpen === "boolean") prefs.sftpPaneOpen = source.sftpPaneOpen;
   if (Array.isArray(source.visibleColumns) && source.visibleColumns.every((column): column is string => typeof column === "string")) prefs.visibleColumns = source.visibleColumns;

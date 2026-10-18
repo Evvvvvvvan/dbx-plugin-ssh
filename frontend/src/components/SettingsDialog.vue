@@ -56,6 +56,7 @@ import {
   type TerminalRightClickMode,
 } from "../lib/terminalBehavior";
 import type { TerminalHotkeyBindings } from "../lib/terminalHotkeys";
+import type { PaneDirectionPref } from "../lib/paneLayout";
 import type { AiSettings } from "../lib/aiSettings";
 import { type ActionLinkMatcherToggles, type ActionLinksSettings } from "../lib/actionLinksMatcher";
 import { rdpExperimentalEnabled as parseRdpExperimentalEnabled } from "../lib/rdpExperimental";
@@ -444,6 +445,8 @@ const props = defineProps<{
   localShell: string;
   /** 终端行为偏好（对标 Tabby「Terminal」页）：权威态在 App，本组件只读 + 上抛增量。 */
   terminalBehavior: TerminalBehaviorSettings;
+  /** 分栏布局方向偏好（issue #187，权威态在 App）：只读 + 上抛改动。 */
+  paneDirection: PaneDirectionPref;
   /** ghost 接受键（批 4e/反馈迭代）：权威态在 App，本组件只读 + 上抛改动。 */
   ghostTabAccept: boolean;
   /** AI 助手设置（Warp AI 对齐批）：权威态在 App（pluginStore 单键 JSON），
@@ -559,6 +562,8 @@ const emit = defineEmits<{
   (e: "update:promptHintsEnabled", value: boolean): void;
   /** 行为设置局部增量：App 侧会归一化 + 持久化 + 即时落地到 xterm 选项。 */
   (e: "update-behavior", patch: Partial<TerminalBehaviorSettings>): void;
+  /** 分栏布局方向改动（issue #187）：App 侧持久化 + 重排终端。 */
+  (e: "update:paneDirection", value: PaneDirectionPref): void;
   /** 快捷键整表替换（编辑器内部管理增删改，只上抛最终结果）。 */
   (e: "update-hotkeys", bindings: TerminalHotkeyBindings): void;
   (e: "apply-font", payload: { family: string | null; size: number }): void;
@@ -2161,6 +2166,20 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
             <!-- 终端（对标 Tabby「Terminal」页）：渲染 / 键盘 / 鼠标 / 剪贴板 / 声音五组。
                  只上抛增量，归一化与落地在 App；每项默认值都复现改动前的行为。 -->
             <div v-show="settingsCategory === 'terminal'" class="settings-pane">
+            <!-- 分栏布局方向（issue #187）：终端与 SFTP 的排布三选；auto 沿用
+                 窄屏断点，强制上下/左右不受视口影响。 -->
+            <h3 class="settings-section-title">{{ t("workbenchLayout.sectionTitle") }}</h3>
+            <label class="settings-field">
+              <span>{{ t("workbenchLayout.direction") }}</span>
+              <Select :model-value="paneDirection" @update:model-value="(v) => emit('update:paneDirection', String(v) as PaneDirectionPref)">
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">{{ t("workbenchLayout.directionAuto") }}</SelectItem>
+                  <SelectItem value="vertical">{{ t("workbenchLayout.directionVertical") }}</SelectItem>
+                  <SelectItem value="horizontal">{{ t("workbenchLayout.directionHorizontal") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
             <h3 class="settings-section-title">{{ t("terminalBehavior.renderingSection") }}</h3>
             <label class="settings-field settings-switch-row">
               <Switch size="sm" :model-value="webglEnabled" @update:model-value="(value) => emit('update:webgl', value === true)" />

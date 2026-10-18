@@ -125,7 +125,7 @@ import { pickModalFocusTarget } from "./lib/modalFocus";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
 import { readClipboardText, writeClipboardText, type ClipboardDeps } from "./lib/clipboardBridge";
 import { friendlySftpError } from "./lib/sftpErrors";
-import { terminalFlexBasis } from "./lib/paneLayout";
+import { paneDirectionClass, resolvePaneDirection, sanitizePaneDirection, terminalFlexBasis, type PaneDirectionPref } from "./lib/paneLayout";
 import { isCountdownActive } from "./lib/recordingCountdown";
 import { type SftpTypeFilter } from "./lib/sftpFileFilters";
 import {
@@ -738,6 +738,10 @@ const hostKeyPrompt = ref<HostKeyPrompt>();
 const rememberHostKey = ref(true);
 const splitRatio = ref(58);
 const paneOrder = ref<SshWorkbenchPaneOrder>("terminal-left");
+// 布局方向偏好（issue #187）：auto 沿用 CSS 断点（窄屏上下/宽屏左右）；
+// vertical 始终上下（终端在上、SFTP 在下），horizontal 始终左右。持久化走
+// WORKBENCH_LAYOUT_KEY 布局偏好档（与 paneOrder 同层，writeWorkbenchState 写穿）。
+const paneDirection = ref<PaneDirectionPref>("auto");
 // SFTP 面板可见性：每个工作台即时开关（写入 workbenchState）；
 // 新工作台的初始值取全局"默认打开"偏好（pluginStore）。
 const sftpPaneOpen = ref(loadSftpPaneDefaultOpen());
@@ -1742,8 +1746,15 @@ const terminalBasis = computed(() => ({
 }));
 const orderedPaneClass = computed(() => [
   paneOrder.value === "sftp-left" ? "panes panes--reversed" : "panes",
+  paneDirectionClass(paneDirection.value),
   sftpPaneOpen.value ? "" : "panes--solo",
 ].filter(Boolean).join(" "));
+// 分栏当前生效轴向：auto 模式下跟随视口断点（与 style.css @media 同值），
+// 强制模式恒定。事件时机（拖拽/键盘）现读现用，不做响应式缓存——resize 不会
+// 触发重算，但下次事件自然取到新值。
+function currentPaneDirection(): "column" | "row" {
+  return resolvePaneDirection({ pref: paneDirection.value, viewportWidth: typeof window !== "undefined" ? window.innerWidth : undefined });
+}
 // 列表排序/搜索/列布局/虚拟滚动：收口在 composables/useSftpListLayout。
 const {
   sortedEntries,
@@ -1790,6 +1801,7 @@ function applyWorkbenchLayoutPrefs() {
   }
   if (!prefs) return;
   if (prefs.paneOrder) paneOrder.value = prefs.paneOrder;
+  if (prefs.paneDirection) paneDirection.value = sanitizePaneDirection(prefs.paneDirection);
   if (prefs.splitRatio !== undefined) splitRatio.value = prefs.splitRatio;
   // 面板开合记的是用户最近一次的手动切换；偏好里没有时维持设置页的
   // 「默认打开」偏好（sftpPaneOpen ref 的初始值即来自它）。
@@ -1882,6 +1894,7 @@ function writeWorkbenchState() {
   try {
     pluginStore.setItem(WORKBENCH_LAYOUT_KEY, JSON.stringify({
       paneOrder: paneOrder.value,
+      paneDirection: paneDirection.value,
       splitRatio: splitRatio.value,
       sftpPaneOpen: sftpPaneOpen.value,
       visibleColumns: visibleColumns.value,
@@ -6311,6 +6324,14 @@ function applyTerminalBehavior() {
 }
 
 /** 行为设置局部更新（设置页控件）：归一化 → 持久化 → 即时生效。 */
+// 布局方向偏好改动（issue #187）：轴向切换后终端/SFTP 尺寸变化，重排 xterm。
+// 持久化由 WORKBENCH_LAYOUT watch 统一写穿。
+function setPaneDirection(value: PaneDirectionPref) {
+  if (paneDirection.value === value) return;
+  paneDirection.value = value;
+  scheduleFit();
+}
+
 function updateTerminalBehavior(patch: Partial<TerminalBehaviorSettings>) {
   const next = sanitizeTerminalBehavior({ ...terminalBehavior.value, ...patch });
   const copyChanged = next.copyOnSelect !== terminalBehavior.value.copyOnSelect;
@@ -6334,12 +6355,20 @@ function startDividerDrag(event: PointerEvent) {
   const container = paneContainer.value;
   if (!container) return;
   const pointerId = event.pointerId;
+  // 纵向布局（强制上下或窄屏断点）把手沿 Y 轴拖拽：按下时定轴，拖动中不变。
+  const vertical = currentPaneDirection() === "column";
   const move = (next: PointerEvent) => {
     if (next.pointerId !== pointerId) return;
     const bounds = container.getBoundingClientRect();
-    const fromLeft = ((next.clientX - bounds.left) / bounds.width) * 100;
-    const terminalPercent = paneOrder.value === "terminal-left" ? fromLeft : 100 - fromLeft;
-    splitRatio.value = Math.max(35, Math.min(80, terminalPercent));
+    if (vertical) {
+      // splitRatio 是终端占比；纵向终端恒在上，把手下移 = 终端变高。
+      const fromTop = ((next.clientY - bounds.top) / bounds.height) * 100;
+      splitRatio.value = Math.max(35, Math.min(80, fromTop));
+    } else {
+      const fromLeft = ((next.clientX - bounds.left) / bounds.width) * 100;
+      const terminalPercent = paneOrder.value === "terminal-left" ? fromLeft : 100 - fromLeft;
+      splitRatio.value = Math.max(35, Math.min(80, terminalPercent));
+    }
     scheduleFit();
   };
   // pointercancel 触发时指针已被移出 active 集合：releasePointerCapture 对非
@@ -6361,24 +6390,35 @@ function startDividerDrag(event: PointerEvent) {
   container.addEventListener("pointercancel", release);
 }
 
-// 分栏把手键盘通道（pointer 拖拽对键盘用户不可达）：左右方向键把手 ±16px，
-// Shift 加速 ×3。`delta > 0` 统一表示「把手向右移」。
+// 分栏把手键盘通道（pointer 拖拽对键盘用户不可达）：横向布局左右方向键
+// ±16px，纵向布局上下方向键 ±16px，Shift 加速 ×3。`delta > 0` 表示「把手
+// 向右/向下移」（终端占比随之增大/减小由 nudgeSplitDivider 按轴解释）。
 const DIVIDER_KEY_STEP_PX = 16;
 function onDividerKeydown(event: KeyboardEvent, nudge: (deltaPx: number) => void) {
-  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  const vertical = currentPaneDirection() === "column";
+  const horizontalKeys = event.key === "ArrowLeft" || event.key === "ArrowRight";
+  const verticalKeys = event.key === "ArrowUp" || event.key === "ArrowDown";
+  if (vertical ? !verticalKeys : !horizontalKeys) return;
   event.preventDefault();
   const magnitude = event.shiftKey ? DIVIDER_KEY_STEP_PX * 3 : DIVIDER_KEY_STEP_PX;
-  nudge(event.key === "ArrowRight" ? magnitude : -magnitude);
+  const forward = vertical ? event.key === "ArrowDown" : event.key === "ArrowRight";
+  nudge(forward ? magnitude : -magnitude);
 }
 
 function nudgeSplitDivider(deltaPx: number) {
   const container = paneContainer.value;
   if (!container) return;
   const bounds = container.getBoundingClientRect();
-  if (!bounds.width) return;
-  // splitRatio 是终端占比：terminal-left 时把手右移 = 终端变宽；否则反向。
-  const sign = paneOrder.value === "terminal-left" ? 1 : -1;
-  splitRatio.value = Math.max(35, Math.min(80, splitRatio.value + (deltaPx / bounds.width) * 100 * sign));
+  // splitRatio 是终端占比：横向 terminal-left 时把手右移 = 终端变宽（sftp-left
+  // 反向）；纵向终端恒在上，把手下移 = 终端变高。
+  if (currentPaneDirection() === "column") {
+    if (!bounds.height) return;
+    splitRatio.value = Math.max(35, Math.min(80, splitRatio.value + (deltaPx / bounds.height) * 100));
+  } else {
+    if (!bounds.width) return;
+    const sign = paneOrder.value === "terminal-left" ? 1 : -1;
+    splitRatio.value = Math.max(35, Math.min(80, splitRatio.value + (deltaPx / bounds.width) * 100 * sign));
+  }
   scheduleFit();
   persistState();
 }
@@ -8209,7 +8249,7 @@ async function reattachProtocolSession(): Promise<boolean> {
   return true;
 }
 
-watch([splitRatio, paneOrder, sftpPaneOpen, followDirectory, sudoMode, visibleColumns, sftpShowHidden, sort], persistState, { deep: true });
+watch([splitRatio, paneOrder, paneDirection, sftpPaneOpen, followDirectory, sudoMode, visibleColumns, sftpShowHidden, sort], persistState, { deep: true });
 
 // SFTP 自动连接关闭时的惰性加载：面板从收起到打开的瞬间才补发首次列目录
 // （连接时已打开的面板不触发；已加载过或无会话也不触发，见 shouldLazyLoadSftpListing）。
@@ -9643,7 +9683,7 @@ watch(historyScope, () => {
         v-if="sftpPaneOpen && !isRdpConnection && !localUiMode"
         class="divider"
         role="separator"
-        aria-orientation="vertical"
+        :aria-orientation="currentPaneDirection() === 'column' ? 'horizontal' : 'vertical'"
         :aria-valuenow="Math.round(splitRatio)"
         aria-valuemin="35"
         aria-valuemax="80"
@@ -10296,6 +10336,8 @@ watch(historyScope, () => {
       :local-shell="localShellPref"
       @set-local-shell="setLocalShellPref"
       :terminal-behavior="terminalBehavior"
+      :pane-direction="paneDirection"
+      @update:pane-direction="setPaneDirection"
       :terminal-hotkeys="terminalHotkeys"
       :apple-platform="applePlatform"
       :action-links="actionLinksSettings"

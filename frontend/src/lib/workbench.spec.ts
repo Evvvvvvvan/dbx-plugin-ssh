@@ -154,6 +154,7 @@ describe("SSH workbench protocol helpers", () => {
     // 合法载荷逐字段收下。
     expect(sanitizeWorkbenchLayoutPrefs({
       paneOrder: "sftp-left",
+      paneDirection: "vertical",
       splitRatio: 62,
       sftpPaneOpen: true,
       visibleColumns: ["size", "modified"],
@@ -163,6 +164,7 @@ describe("SSH workbench protocol helpers", () => {
       sort: { column: "modified", direction: "desc" },
     })).toEqual({
       paneOrder: "sftp-left",
+      paneDirection: "vertical",
       splitRatio: 62,
       sftpPaneOpen: true,
       visibleColumns: ["size", "modified"],
@@ -174,11 +176,16 @@ describe("SSH workbench protocol helpers", () => {
     // 越界/非法字段逐个丢弃，其余保留；排序仅认三种列与两个方向。
     expect(sanitizeWorkbenchLayoutPrefs({
       paneOrder: "top-left",
+      paneDirection: "diagonal",
       splitRatio: 99,
       sort: { column: "owner", direction: "asc" },
       showHidden: "yes",
     })).toEqual({});
     expect(sanitizeWorkbenchLayoutPrefs({ sort: { column: "size", direction: "up" } })).toEqual({});
+    // 布局方向（issue #187）：三种合法值全收，其余丢弃。
+    expect(sanitizeWorkbenchLayoutPrefs({ paneDirection: "horizontal" })).toEqual({ paneDirection: "horizontal" });
+    expect(sanitizeWorkbenchLayoutPrefs({ paneDirection: "auto" })).toEqual({ paneDirection: "auto" });
+    expect(sanitizeWorkbenchLayoutPrefs({ paneDirection: 1 })).toEqual({});
   });
 
   it("resolves the directory-follow switch from the workbench state or the global preference", () => {

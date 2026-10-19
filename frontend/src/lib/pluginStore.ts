@@ -76,6 +76,11 @@ export const PLUGIN_STORE_KEYS: readonly string[] = [
   // 历史面板功能开关（issue #169）：关 = 面板整体不可唤起（↑ 与 Ctrl+R 归还
   // 远端 shell 原生历史/反向搜索）。SettingsDialog 开关行自治读写，默认开。
   "ssh-history-panel-enabled",
+  // 裸 ↑ 唤起独立开关（issue #108 反馈二）：默认开，叠加 Warp 式正向证据门
+  // （App 侧 integratedPromptIdle：仅 OSC 633 集成确认的空闲提示符可接管，
+  // 堡垒机等非集成会话 ↑ 恒透传）。SettingsDialog 开关行自治读写；漏登记
+  // = 真机写入落盘但水合不拉，重启静默回默认（issue #178 同款坑）。
+  "ssh-history-panel-arrow-up",
   // 历史显示条数（issue #192）：命令环上限（10..1000 钳制，默认 100）。App
   // 权威态（采集口/水合/合并穿参），SettingsDialog 数字行自治读写 + 上抛。
   // 漏登记 = 水合不拉，改完条数重启静默回 100。

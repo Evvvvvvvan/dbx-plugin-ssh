@@ -252,6 +252,17 @@ export function clampHistoryPanelIndex(index: number, length: number): number {
   return Math.min(Math.max(index, 0), length - 1);
 }
 
+/** 前缀过滤（Warp ↑ 前缀搜索同位，对标 fish/zsh 的 history-prefix-search）：
+ *  命令以给定前缀开头（大小写不敏感）才入选，保持历史顺序（旧→新，面板
+ *  底部即最新），超出上限保留最新一段。与搜索框的模糊子序列检索（上行
+ *  filterHistoryEntries）分工：裸 ↑ 打开时以已输入行为前缀种子走本函数，
+ *  Ctrl+R / 搜索框走模糊。 */
+export function filterHistoryEntriesByPrefix(commands: readonly string[], prefix: string, limit = HISTORY_PANEL_LIMIT): string[] {
+  const needle = prefix.toLowerCase();
+  const matches = commands.filter((command) => command.toLowerCase().startsWith(needle));
+  return matches.length > limit ? matches.slice(-limit) : [...matches];
+}
+
 /** 打开门的输入面：调用方逐项传入当前浮层/终端状态，保持纯函数可测。 */
 export interface HistoryPanelGates {
   completionOpen: boolean;
@@ -286,6 +297,29 @@ export function canOpenHistoryPanel(gates: HistoryPanelGates): boolean {
     !gates.transferBusy &&
     !gates.interactivePromptPending
   );
+}
+
+/** 裸 ↑ 唤起的独立开关（issue #108 反馈二）。与正向证据门（下函数）叠加：
+ *  用户显式关掉后 ↑ 恒透传；主开关关闭时整个面板不可用，此处恒 false。 */
+export function bareArrowUpInvokesHistoryPanel(options: {
+  masterEnabled: boolean;
+  arrowUpInvokeEnabled: boolean;
+  gateOpen: boolean;
+}): boolean {
+  return options.masterEnabled && options.arrowUpInvokeEnabled && options.gateOpen;
+}
+
+/** 裸 ↑ 的 Warp 式正向证据门（学习 Warp 的接管模型，issue #108 反馈二）：
+ *  仅当本数据流见过 shell 集成标记（OSC 633，bash/zsh 钩子注入成功）且当前
+ *  无命令在执行时，↑ 才可被面板接管。堡垒机等非集成会话（钩子打进去无效 →
+ *  无标记）、嵌套 ssh 未返回（E 帧后无 D 帧 → active 恒 true）、mysql/psql
+ *  等前台 REPL（同前）都拿不到证据 → ↑ 恒透传——不再靠「无反向信号」猜测
+ *  普通屏上的全屏程序。Warp 的同位行为：subshell 未 Warpify = 经典终端。 */
+export function integratedPromptIdleForArrowUp(options: {
+  integrationInstalled: boolean;
+  commandActive: boolean;
+}): boolean {
+  return options.integrationInstalled && !options.commandActive;
 }
 
 // —— 分桶档（scope = 连接 id；本地/串口终端固定桶）——三个历史存储键保持

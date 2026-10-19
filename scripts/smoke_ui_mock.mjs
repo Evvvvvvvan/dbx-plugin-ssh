@@ -268,10 +268,15 @@ try {
   // addInitScript），mock 宿主 storage 的兜底档正是 window.localStorage。
   // 值为分桶档（scope = connectionId）：历史按连接隔离，mock 页面的作用域
   // 是 mock 宿主注入的 "visual-connection"。
+  // 裸 ↑ 唤起（issue #108 反馈二）经 Warp 式正向证据门：仅在集成 shell 的
+  // 空闲提示符接管——mock 回放本就以 633;D+633;A 结尾（集成空闲态），本页
+  // 再种子开启独立开关，回归「开关开 + 证据在场 → ↑ 可用」路径；默认/无
+  // 集成/显式关三种锁定由下方 default-and-evidence-gate 段承担。
   console.log("==> history panel walkthrough");
   const historyPage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   historyPage.on("pageerror", (err) => pageError.push(String(err)));
   await historyPage.addInitScript(() => {
+    window.localStorage.setItem("ssh-history-panel-arrow-up", "1");
     window.localStorage.setItem(
       "ssh-command-history",
       JSON.stringify({
@@ -385,6 +390,87 @@ try {
   await historyPage.keyboard.press("Escape");
   const panelsAfterCtrlREsc = await historyPage.locator(".terminal-history-panel").count();
   check("Escape closes the Ctrl+R-opened panel", panelsAfterCtrlREsc === 0, `panels=${panelsAfterCtrlREsc}`);
+
+  // Warp ↑ 前缀搜索（对标官方文档「performs a prefix search based on input +
+  // keep typing to filter」）：输入 tail → ↑ 打开即只剩 tail 开头的条目，初始
+  // 高亮最新命中并回填；开着继续打字实时收窄（含零命中不关）；Esc 恢复原行。
+  await historyPage.keyboard.press("Control+u");
+  await historyPage.keyboard.type("tail");
+  // 打字会先弹命令建议浮层（↑ 归它导航，优先级高于历史面板）：Esc 收掉后再按 ↑。
+  await historyPage.keyboard.press("Escape");
+  await sleep(200);
+  await historyPage.keyboard.press("ArrowUp");
+  await expect(historyPage, ".terminal-history-panel", "history panel opens with a typed prefix");
+  const prefixRows = await historyPage.locator(".terminal-history-hit").count();
+  check("typed prefix filters the panel to tail-prefixed entries only", prefixRows === 1, `rows=${prefixRows}`);
+  await expectText(historyPage, ".terminal-history-hit", "tail -f /var/log/ui-mock.log", "prefix hit is the tail command");
+  const prefixLineFilled = await historyPage.evaluate(() => document.querySelector(".xterm-rows")?.textContent?.includes("tail -f /var/log/ui-mock.log") === true);
+  check("newest prefix match is filled into the input line on open", prefixLineFilled, "line check");
+  // 回填后行=完整命令：退格收窄仍命中（行模型退格同步 + 实时重过滤）。
+  await historyPage.keyboard.press("Backspace");
+  await historyPage.keyboard.press("Backspace");
+  const refinedRows = await historyPage.locator(".terminal-history-hit").count();
+  check("backspace keeps the live prefix filter in sync (refine on shrink)", refinedRows === 1, `rows=${refinedRows}`);
+  await historyPage.keyboard.type("zz");
+  const zeroRows = await historyPage.locator(".terminal-history-hit").count();
+  const zeroPanel = await historyPage.locator(".terminal-history-panel").count();
+  check("non-matching prefix empties the list without closing the panel", zeroRows === 0 && zeroPanel === 1, `rows=${zeroRows} panels=${zeroPanel}`);
+  await historyPage.keyboard.press("Escape");
+  const prefixPanelsAfterEsc = await historyPage.locator(".terminal-history-panel").count();
+  check("Escape closes the prefix-filtered panel and restores the line", prefixPanelsAfterEsc === 0, `panels=${prefixPanelsAfterEsc}`);
+  await historyPage.keyboard.press("Control+u");
+
+  // Warp 式正向证据门三态锁定（issue #108 反馈二，学习 Warp 接管模型）：
+  // ① 集成空闲页（默认开关开）：↑ 开面板，引导条教 ↑；
+  // ② 无集成页（?nointegration=1，堡垒机 koko 同态——钩子打进去无效）：
+  //    ↑ 恒透传远端，引导条不教 ↑，热键仍可开面板；
+  // ③ 显式关页（种子 arrow-up="0"，集成在场）：↑ 恒透传，用户偏好生效。
+  console.log("==> history panel default & evidence-gate walkthrough");
+  const gateVariants = [
+    { name: "integrated default", url: `${baseUrl}?render=dom`, toggle: null, arrowOpens: true, chipVisible: true },
+    { name: "no integration (bastion-like)", url: `${baseUrl}?render=dom&nointegration=1`, toggle: null, arrowOpens: false, chipVisible: false },
+    { name: "toggle explicitly off", url: `${baseUrl}?render=dom`, toggle: "0", arrowOpens: false, chipVisible: false },
+  ];
+  for (const variant of gateVariants) {
+    const gatePage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    gatePage.on("pageerror", (err) => pageError.push(String(err)));
+    if (variant.toggle !== null) {
+      await gatePage.addInitScript((value) => {
+        window.localStorage.setItem("ssh-history-panel-arrow-up", value);
+      }, variant.toggle);
+    }
+    await gatePage.goto(variant.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await sleep(2_500);
+    await gatePage.bringToFront();
+    await gatePage.click(".terminal-host");
+    try {
+      await gatePage.waitForSelector(".terminal-prompt-hints", { timeout: 5_000 });
+      const gateChip = await gatePage.locator(".terminal-prompt-hints kbd", { hasText: "↑" }).count();
+      check(`[${variant.name}] hint strip ↑ chip follows the evidence gate`, gateChip === (variant.chipVisible ? 1 : 0), `chips=${gateChip}`);
+    } catch {
+      failures.push(`[${variant.name}] hint strip missing`);
+      console.log(`  FAIL [${variant.name}] hint strip`);
+    }
+    await gatePage.keyboard.press("ArrowUp");
+    await sleep(400);
+    const gatePanelsAfterArrow = await gatePage.locator(".terminal-history-panel").count();
+    check(
+      `[${variant.name}] bare ArrowUp ${variant.arrowOpens ? "opens" : "does not open"} the panel`,
+      gatePanelsAfterArrow === (variant.arrowOpens ? 1 : 0),
+      `panels=${gatePanelsAfterArrow}`,
+    );
+    if (variant.arrowOpens) {
+      // Ctrl+R 是开↔关 toggle：先把 ↑ 开的面板收起，热键段才能断言「开」。
+      await gatePage.keyboard.press("Escape");
+      await sleep(200);
+    }
+    await gatePage.keyboard.press("Control+r");
+    await expect(gatePage, ".terminal-history-panel", `[${variant.name}] Ctrl+R still opens the panel`);
+    await gatePage.keyboard.press("Escape");
+    const gatePanelsAfterEsc = await gatePage.locator(".terminal-history-panel").count();
+    check(`[${variant.name}] Escape closes the panel`, gatePanelsAfterEsc === 0, `panels=${gatePanelsAfterEsc}`);
+    await gatePage.close();
+  }
 
   // 富元数据（批 4d，Warp command search）：mock 夹具 curl 命令 D 帧退出码 28
   // → 重开面板应渲染 ✗ 28 红徽标。
@@ -771,6 +857,12 @@ try {
   console.log("==> issue #150 interactive prompt guard");
   const guardPage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   guardPage.on("pageerror", (err) => pageError.push(String(err)));
+  // 裸 ↑ 开关种子开启（issue #108 反馈二起默认关）：本段要回归的是 #150
+  // 守卫本身——待答期 ↑ 不开面板（负断言）+ 普通提示符放行（对照）；默认关
+  // 会让负断言空转、对照恒失败。新默认行为由上方 default-off 段锁定。
+  await guardPage.addInitScript(() => {
+    localStorage.setItem("ssh-history-panel-arrow-up", "1");
+  });
   await guardPage.goto(`${baseUrl}?render=dom&noanim=1`, { waitUntil: "domcontentloaded", timeout: 30_000 });
   await sleep(2_500);
   await guardPage.bringToFront();
@@ -848,6 +940,8 @@ try {
         : `deploy step ${i} -- systemctl restart app-${i}.service`);
     }
     localStorage.setItem("ssh-command-history", JSON.stringify(lines));
+    // 裸 ↑ 开关开启（issue #108 反馈二起默认关）：本段以 ↑ 打开面板为前置。
+    localStorage.setItem("ssh-history-panel-arrow-up", "1");
   });
   await tallPage.goto(`${baseUrl}?render=dom&noanim=1`, { waitUntil: "domcontentloaded", timeout: 30_000 });
   await sleep(2_500);

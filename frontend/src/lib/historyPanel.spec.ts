@@ -4,8 +4,10 @@ import { describe, expect, it } from "vitest";
 import {
   HISTORY_PANEL_LIMIT,
   HISTORY_TIMES_LIMIT,
+  bareArrowUpInvokesHistoryPanel,
   canOpenHistoryPanel,
   chooseHistoryPanelPlacement,
+  integratedPromptIdleForArrowUp,
   clampHistoryPanelIndex,
   decorateHistoryEntries,
   persistableHistoryMetaBuckets,
@@ -15,6 +17,7 @@ import {
   sanitizeHistoryMetaBuckets,
   sanitizeHistoryTimesBuckets,
   filterHistoryEntries,
+  filterHistoryEntriesByPrefix,
   moveHistoryPanelIndex,
   pruneHistoryTimes,
   recordHistoryTime,
@@ -31,8 +34,26 @@ const HISTORY = [
   "echo hello",
 ];
 
-describe("filterHistoryEntries", () => {
-  it("empty query returns the newest entries capped at the limit, oldest on top (shell ↑ direction)", () => {
+describe("filterHistoryEntriesByPrefix（Warp ↑ 前缀搜索：已输入行做种子）", () => {
+  it("keeps only commands starting with the prefix, case-insensitive, in history order", () => {
+    expect(filterHistoryEntriesByPrefix(["cd /var", "ls -la", "cd ~/logs", "CD other"], "cd")).toEqual(["cd /var", "cd ~/logs", "CD other"]);
+    expect(filterHistoryEntriesByPrefix(HISTORY, "TAILY")).toEqual([]);
+  });
+
+  it("caps to the newest entries when matches overflow the limit", () => {
+    const flood = Array.from({ length: HISTORY_PANEL_LIMIT + 10 }, (_, i) => `cmd-${i}`);
+    const capped = filterHistoryEntriesByPrefix(flood, "cmd-");
+    expect(capped).toHaveLength(HISTORY_PANEL_LIMIT);
+    expect(capped[0]).toBe("cmd-10");
+    expect(capped[capped.length - 1]).toBe("cmd-59");
+  });
+
+  it("empty prefix degrades to the full view (newest kept)", () => {
+    expect(filterHistoryEntriesByPrefix(["a", "b"], "")).toEqual(["a", "b"]);
+  });
+});
+
+describe("filterHistoryEntries", () => {  it("empty query returns the newest entries capped at the limit, oldest on top (shell ↑ direction)", () => {
     const expected = [...HISTORY].reverse();
     expect(filterHistoryEntries(HISTORY, "")).toEqual(expected);
     expect(filterHistoryEntries(HISTORY, "   ")).toEqual(expected);
@@ -134,6 +155,35 @@ describe("canOpenHistoryPanel", () => {
 
   it("does not grab ↑ while an interactive prompt is pending (#150: MFA/选择场景 ↑ 留给远端)", () => {
     expect(canOpenHistoryPanel({ ...open, interactivePromptPending: true })).toBe(false);
+  });
+});
+
+describe("bareArrowUpInvokesHistoryPanel（issue #108 反馈二：裸 ↑ 三层门）", () => {
+  it("requires master switch, the dedicated invoke toggle and the idle gate all at once", () => {
+    expect(bareArrowUpInvokesHistoryPanel({ masterEnabled: true, arrowUpInvokeEnabled: true, gateOpen: true })).toBe(true);
+    expect(bareArrowUpInvokesHistoryPanel({ masterEnabled: false, arrowUpInvokeEnabled: true, gateOpen: true })).toBe(false);
+    expect(bareArrowUpInvokesHistoryPanel({ masterEnabled: true, arrowUpInvokeEnabled: false, gateOpen: true })).toBe(false);
+    expect(bareArrowUpInvokesHistoryPanel({ masterEnabled: true, arrowUpInvokeEnabled: true, gateOpen: false })).toBe(false);
+  });
+
+  it("gateOpen 参数由调用方叠入 Warp 式正向证据门（integratedPromptIdleForArrowUp）", () => {
+    // gateOpen=false 即非集成/命令执行中：↑ 恒透传（堡垒机场景的最终裁决）。
+    expect(bareArrowUpInvokesHistoryPanel({ masterEnabled: true, arrowUpInvokeEnabled: true, gateOpen: false })).toBe(false);
+  });
+});
+
+describe("integratedPromptIdleForArrowUp（Warp 式正向证据门：集成确认 + 空闲提示符）", () => {
+  it("claims ↑ only when the OSC 633 integration is installed and no command is active", () => {
+    expect(integratedPromptIdleForArrowUp({ integrationInstalled: true, commandActive: false })).toBe(true);
+  });
+
+  it("never claims without integration evidence (bastion koko: hook lands in a foreign program)", () => {
+    expect(integratedPromptIdleForArrowUp({ integrationInstalled: false, commandActive: false })).toBe(false);
+  });
+
+  it("never claims while a command runs (nested ssh / mysql REPL: E frame without D frame)", () => {
+    expect(integratedPromptIdleForArrowUp({ integrationInstalled: true, commandActive: true })).toBe(false);
+    expect(integratedPromptIdleForArrowUp({ integrationInstalled: false, commandActive: true })).toBe(false);
   });
 });
 

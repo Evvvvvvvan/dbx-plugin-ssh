@@ -750,7 +750,14 @@ const shellIntegrationCycle = [
   `${OSC_633}A${BEL}`,
   "user@server:~$ ",
 ].join("");
-const terminalTranscript = `Welcome to DBX SSH/SFTP visual fixture\r\n${shellIntegrationCycle}`;
+const terminalTranscript = `Welcome to DBX SSH/SFTP visual fixture\r\n${
+  // ?nointegration=1：从回放中剥掉 OSC 633/133 集成帧——模拟堡垒机 koko 等
+  // 非集成会话（bash/zsh 钩子打进去无效），供 issue #108 反馈二的裸 ↑ 正向
+  // 证据门走查（无集成证据 → ↑ 恒透传远端，面板只能走热键）。
+  fixtureParams.get("nointegration") === "1"
+    ? shellIntegrationCycle.replace(/\u001b\](?:633|133);[^\u0007\u001b]*\u0007/g, "")
+    : shellIntegrationCycle
+}`;
 
 // ?err=disconnect 注入入口：open 与 attach 完成后都调用一次；全局单发，
 // 重连（再次 open/attach）后不再复发，与真实传输断开的单次语义一致。

@@ -36,7 +36,8 @@ use crate::preferences;
 use crate::sftp_name;
 use crate::sftp_raw;
 use crate::ssh::{
-    classify_raw_kind, RawSftpClient, SshClient, SshRuntime, NO_TERMINAL_SESSION_MESSAGE,
+    classify_raw_kind, sftp_client_config, RawSftpClient, SshClient, SshRuntime,
+    NO_TERMINAL_SESSION_MESSAGE,
 };
 use crate::sudo_allowlist;
 use crate::sudo_profiles;
@@ -610,7 +611,7 @@ impl McpConnection {
             .await
             .map_err(|error| format!("Failed to start SFTP: {error}"))?;
         let sftp = Arc::new(AsyncMutex::new(
-            SftpSession::new(channel.into_stream())
+            SftpSession::new_with_config(channel.into_stream(), sftp_client_config(false))
                 .await
                 .map_err(|error| format!("Failed to start SFTP: {error}"))?,
         ));

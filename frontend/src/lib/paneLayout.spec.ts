@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { paneDirectionClass, resolvePaneDirection, sanitizePaneDirection, terminalFlexBasis, PANE_DIRECTION_NARROW_BREAKPOINT } from "./paneLayout";
+import { paneDirectionClass, paneSplitCssVar, resolvePaneDirection, sanitizePaneDirection, terminalFlexBasis, PANE_DIRECTION_NARROW_BREAKPOINT } from "./paneLayout";
 
 describe("terminalFlexBasis", () => {
   it("gives the terminal the full row when nothing else is open", () => {
@@ -8,6 +8,21 @@ describe("terminalFlexBasis", () => {
 
   it("keeps the user split ratio when only SFTP is open", () => {
     expect(terminalFlexBasis({ sftpOpen: true, splitRatio: 62 })).toBe("62%");
+  });
+});
+
+describe("paneSplitCssVar", () => {
+  it("emits the terminal height share when SFTP is open", () => {
+    expect(paneSplitCssVar({ sftpOpen: true, splitRatio: 62 })).toEqual({ "--pane-split": "62%" });
+  });
+
+  it("clamps the ratio into the 35-80 drag range", () => {
+    expect(paneSplitCssVar({ sftpOpen: true, splitRatio: 10 })).toEqual({ "--pane-split": "35%" });
+    expect(paneSplitCssVar({ sftpOpen: true, splitRatio: 95 })).toEqual({ "--pane-split": "80%" });
+  });
+
+  it("emits nothing when SFTP is collapsed (solo keeps its own full-height rules)", () => {
+    expect(paneSplitCssVar({ sftpOpen: false, splitRatio: 62 })).toBeUndefined();
   });
 });
 

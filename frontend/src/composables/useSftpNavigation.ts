@@ -8,10 +8,22 @@ import { resolveRemotePath, splitRemotePathSegments } from "../lib/remotePathInp
 // 列表条目的最小结构（App.vue 的 SftpEntry 为局部接口，按消费字段收敛）。
 type ListingEntry = { uri: string; name: string; kind: SftpEntryKind };
 
+/** #209 面板内软错误态：目录跟随/连接后自动首拉失败时的安静提示
+ *  （不弹全局横幅），由 sftp-pane 内的软提示条渲染；action 的 run 自含
+ *  「先清软态再重载」语义，重试一律走手动导航（再失败才落全局横幅）。 */
+export type SftpSoftError = {
+  path: string;
+  message: string;
+  /** 原始错误串：只进悬停 tooltip，不做大字展示。 */
+  detail: string;
+  action: { label: string; run: () => void };
+};
+
 /** SFTP 目录导航：loadDirectory 枢纽（epoch 竞态防护、sudo 跟随降级引导、
- * 选中/历史/用量联动刷新）、sudo 开关、路径栏跳转、主目录探测与目录跟随
- * 开关。选中/剪贴板/搜索/列布局等面板子域另行收口；目录树与路径历史的
- * 状态在 useSftpSidebar/useSftpPathHistory，经依赖注入衔接。 */
+ * #209 跟随/自动首拉失败的安静软提示、选中/历史/用量联动刷新）、sudo 开关、
+ * 路径栏跳转、主目录探测与目录跟随开关。选中/剪贴板/搜索/列布局等面板子域
+ * 另行收口；目录树与路径历史的状态在 useSftpSidebar/useSftpPathHistory，
+ * 经依赖注入衔接。 */
 export function useSftpNavigation(options: {
   t: (key: string, values?: Record<string, string | number>) => string;
   showNotice: (message: string, actions?: Array<{ label: string; run: () => void }>) => void;
@@ -68,12 +80,16 @@ async function refreshSftpHomePath() {
 
 const listEpoch = createRequestEpoch();
 
-async function loadDirectory(path = currentPath.value, fromTerminal = false) {
+// #209 安静失败态（跟随/自动首拉失败落这里，不出全局横幅；App.vue 渲染）。
+const sftpSoftError = ref<SftpSoftError | null>(null);
+
+async function loadDirectory(path = currentPath.value, fromTerminal = false, quiet = false) {
   if (!session.value) return;
   const normalized = normalizeRemotePath(path);
   const epochId = listEpoch.next();
   loadingFiles.value = true;
   if (!fromTerminal) { sftpError.value = ""; sftpErrorOpen.value = false; }
+  if (fromTerminal || quiet) sftpSoftError.value = null;
   try {
     const result = await window.dbxPlugin.invoke<{ entries: ListingEntry[] }>(sudoMode.value ? "sudo/listDir" : "sftp/list", {
       sessionId: session.value.sessionId,
@@ -94,20 +110,37 @@ async function loadDirectory(path = currentPath.value, fromTerminal = false) {
     rememberPathHistory(normalized);
     persistState();
     void refreshDiskUsage();
+    sftpSoftError.value = null;
   } catch (cause) {
     if (!listEpoch.isCurrent(epochId)) return;
     const message = cause instanceof Error ? cause.message : String(cause);
-    if (fromTerminal) {
-      // 跟随撞上登录用户权限墙（典型：终端 sudo su 后跟到 /root）：引导切
-      // sudo 模式并重试，而非裸失败提示。重试走手动导航语义——再失败落
-      // SFTP 错误横幅，不再循环弹引导。
+    if (fromTerminal || quiet) {
+      // #209 跟随触发/连接后自动首拉：失败只落面板内软提示条，不再弹全局
+      // 错误横幅。典型场景：终端停在堡垒机会话列表，跟随用的目标机路径在
+      // 堡垒机自身 fs 上不存在——全局横幅（8s 自动消失）徒增噪音。跟随时撞
+      // 登录用户权限墙（终端 sudo su 后跟到 /root）仍在软条内给出切 sudo
+      // 引导；普通重试按手动导航语义执行，再失败才落全局横幅。
+      const target = normalized;
       if (shouldOfferSudoRetryAfterFollowFailure({ fromTerminal, sudoMode: sudoMode.value, canWrite: canWrite.value, message })) {
-        const target = normalized;
-        showNotice(t("followDirectorySudoHint", { path: normalized }), [
-          { label: t("followDirectorySudoRetry"), run: () => void enableSudoModeAndReload(target) },
-        ]);
+        sftpSoftError.value = {
+          path: target,
+          message: t("followDirectorySudoHint", { path: target }),
+          detail: message,
+          action: {
+            label: t("followDirectorySudoRetry"),
+            run: () => { sftpSoftError.value = null; void enableSudoModeAndReload(target); },
+          },
+        };
       } else {
-        showNotice(t("followDirectoryFailed", { path: normalized, error: message }));
+        sftpSoftError.value = {
+          path: target,
+          message: t("sftpSoftError.loadFailed", { path: target }),
+          detail: message,
+          action: {
+            label: t("retry"),
+            run: () => { sftpSoftError.value = null; void loadDirectory(target); },
+          },
+        };
       }
     }
     else { sftpError.value = message; sftpErrorKey.value += 1; sftpErrorOpen.value = true; }
@@ -198,6 +231,7 @@ function submitPathInput() {
     loadHome,
     refreshSftpHomePath,
     loadDirectory,
+    sftpSoftError,
     toggleSudoMode,
     enableSudoModeAndReload,
     goParent,

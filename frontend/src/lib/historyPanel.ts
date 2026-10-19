@@ -288,6 +288,21 @@ export function canOpenHistoryPanel(gates: HistoryPanelGates): boolean {
   );
 }
 
+/**
+ * command-history 热键（默认含 Ctrl+R）在 gate 关闭时是否透传远端而非吞键
+ * （#108 反馈二顺带修复）：总开关关闭、alternate 屏（vim 的 Ctrl+R 是 redo，
+ * less/tmux copy-mode 同理）这两种场景透传；其余 gate 关闭场景维持吞键——
+ * 传输占用时放行 ^R 会污染 zmodem/trzsz 字节流，交互提示待答时会把控制
+ * 字符打进 OTP/密码输入，浮层开启时透传会让远端 reverse-i-search 与本地
+ * 浮层状态脱同步。
+ */
+export function commandHistoryHotkeyPassthrough(input: {
+  enabled: boolean;
+  alternateActive: boolean;
+}): boolean {
+  return !input.enabled || input.alternateActive;
+}
+
 // —— 分桶档（scope = 连接 id；本地/串口终端固定桶）——三个历史存储键保持
 // 单键值内分桶（宿主 storage 无列键、按连接动态键不可声明，同
 // ssh-docker-engine 先例）；旧版单映射档（裸数组）一次性迁入 legacyScope 桶。

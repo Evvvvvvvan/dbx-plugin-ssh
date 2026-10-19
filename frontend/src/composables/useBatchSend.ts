@@ -1,4 +1,4 @@
-import { onBeforeUnmount, ref, watch, type ComputedRef, type Ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch, type ComputedRef, type Ref } from "vue";
 import { pluginStore } from "../lib/pluginStore";
 import { randomUUID } from "../lib/uuid";
 import { browseCommandHistory } from "../lib/commandHistory";
@@ -8,14 +8,21 @@ import {
   deriveBatchCommandName,
   normalizeBatchTargets,
   normalizeLocalBatchTargets,
-  quickPickCommandById,
   selectBatchTargets,
+  shouldAutoDismissBatchSummary,
   summarizeBatchResults,
   toggleBatchTarget,
   type BatchSendSummary,
   type BatchSendTarget,
 } from "../lib/batchSend";
-import { persistQuickCommands, QUICK_COMMANDS_LIMIT, type QuickCommand } from "../lib/quickCommands";
+import {
+  filterQuickCommands,
+  groupQuickCommands,
+  persistQuickCommands,
+  QUICK_COMMANDS_LIMIT,
+  type QuickCommand,
+  type QuickCommandGroupView,
+} from "../lib/quickCommands";
 
 /** 批量发送命令条（Electerm quick-command bar 风格）：常驻贴在终端底部，回车
  * 即发送。目标来自 ssh/sessions/list（跨连接全部活跃会话），命令写入各会话
@@ -42,6 +49,8 @@ export function useBatchSend(options: {
 // 即发送。目标来自 ssh/sessions/list（跨连接全部活跃会话），命令写入各会话
 // 交互终端（PTY 键盘语义，输出回显在各自终端，对齐 tiny-rdm batch send）。
 const BATCH_BAR_OPEN_KEY = "ssh-batch-bar-open";
+// 全部成功的结果浮条自动收起时限：与普通通知 toast 一致（3.5s，错误横幅才是 8s）。
+const BATCH_RESULT_AUTO_DISMISS_MS = 3500;
 
 function loadBatchBarOpen(): boolean {
   try {
@@ -84,6 +93,15 @@ const batchHistoryBackup = ref("");
 // 过滤回声；sidecar 缺该方法（旧版二进制）时静默降级，只影响同步。
 const batchBarSourceId = randomUUID();
 let batchBroadcastTimer: number | undefined;
+// 结果浮条自动收起计时：仅全部成功时挂起；失败摘要常驻，重发/手动关闭/卸载即撤。
+let batchResultTimer: number | undefined;
+
+function clearBatchResultTimer() {
+  if (batchResultTimer !== undefined) {
+    window.clearTimeout(batchResultTimer);
+    batchResultTimer = undefined;
+  }
+}
 
 /** 命令条开关：持久化（pluginStore），打开时顺带刷新目标列表。 */
 function toggleBatchBar() {
@@ -97,6 +115,7 @@ function toggleBatchBar() {
     void refreshBatchTargets();
   } else {
     batchTargetsOpen.value = false;
+    batchQuickOpen.value = false;
     batchSaveMode.value = false;
   }
   broadcastBatchBarState(true);
@@ -198,19 +217,24 @@ function pickBatchTargets(mode: "all" | "connected") {
   batchSelected.value = selectBatchTargets(batchTargets.value, mode);
 }
 
-// 下拉切换命令：回填输入框（Electerm 语义），发送仍由回车/发送按钮触发。
-function onBatchQuickPick(value: unknown) {
-  batchQuickPickId.value = value == null ? "" : String(value);
-  applyBatchQuickPick();
-}
+// 快速命令弹层（与右上角面板同形态：搜索 + 可折叠分组 + 命令卡片）。搜索/
+// 分组只影响本弹层展示；组折叠态复用面板的 quickCollapsedGroups（App.vue 侧），
+// 两处折叠行为保持一致。
+const batchQuickOpen = ref(false);
+const batchQuickSearch = ref("");
+const filteredBatchQuickCommands = computed(() => filterQuickCommands(quickCommands.value, batchQuickSearch.value));
+const groupedBatchQuickCommands = computed<QuickCommandGroupView[]>(() => groupQuickCommands(filteredBatchQuickCommands.value));
+// 触发钮上的已选命令名（跨工作台同步来的 quickPickId 同样生效）。
+const batchQuickPickName = computed(() => quickCommands.value.find((item) => item.id === batchQuickPickId.value)?.name ?? "");
 
-function applyBatchQuickPick() {
-  const command = quickPickCommandById(quickCommands.value, batchQuickPickId.value);
-  if (command) {
-    batchDraft.value = command;
-    batchHistoryIndex.value = -1;
-    broadcastBatchBarState(true);
-  }
+/** 弹层选中命令卡片：回填批量输入框（Electerm 语义），发送仍由回车/发送按钮触发。 */
+function pickBatchQuick(item: QuickCommand) {
+  batchQuickPickId.value = item.id;
+  batchDraft.value = item.command;
+  batchHistoryIndex.value = -1;
+  batchHistoryBackup.value = "";
+  batchQuickOpen.value = false;
+  broadcastBatchBarState(true);
 }
 
 // 命令条 ↑↓ 浏览历史（与命令弹窗同一份 commandHistory，弹窗/命令条互相可见）。
@@ -241,6 +265,7 @@ async function sendBatchCommand() {
   batchSending.value = true;
   batchError.value = "";
   batchSummary.value = undefined;
+  clearBatchResultTimer();
   try {
     // 目标按通道分流：SSH 走 sidecar 批量写入；本地终端复用输入队列（同一
     // 序号框架，保持与键入一致的顺序语义），命令补 \r 回车与键入等价。
@@ -275,6 +300,12 @@ async function sendBatchCommand() {
       results.push({ sessionId, success: true });
     }
     batchSummary.value = summarizeBatchResults(results);
+    // 全部成功：浮条短暂可见后自动收起（对齐 useTrzsz 成功态语义）；
+    // 有失败行不自动收，逐行错误留给用户排查，仍可手动关闭。
+    if (batchSummary.value && shouldAutoDismissBatchSummary(batchSummary.value)) {
+      clearBatchResultTimer();
+      batchResultTimer = window.setTimeout(dismissBatchResult, BATCH_RESULT_AUTO_DISMISS_MS);
+    }
     if (batchSummary.value.sent) {
       // 发送成功即清空输入与下拉选中（对齐原弹窗语义），命令入历史供 ↑↓ 回选。
       pushTerminalCommandHistory(command);
@@ -292,6 +323,7 @@ async function sendBatchCommand() {
 }
 
 function dismissBatchResult() {
+  clearBatchResultTimer();
   batchSummary.value = undefined;
   batchError.value = "";
 }
@@ -302,6 +334,7 @@ function dismissBatchResult() {
 function openBatchBarSave() {
   const command = batchDraft.value.trim();
   if (!command || quickCommands.value.length >= QUICK_COMMANDS_LIMIT) return;
+  batchQuickOpen.value = false;
   batchSaveMode.value = true;
   batchSaveName.value = deriveBatchCommandName(command);
 }
@@ -334,12 +367,14 @@ watch(connected, (value) => {
     void refreshBatchTargets();
   } else if (!value) {
     batchTargetsOpen.value = false;
+    batchQuickOpen.value = false;
     batchSaveMode.value = false;
   }
 });
 
 onBeforeUnmount(() => {
   if (batchBroadcastTimer !== undefined) window.clearTimeout(batchBroadcastTimer);
+  clearBatchResultTimer();
 });
 
   return {
@@ -359,6 +394,11 @@ onBeforeUnmount(() => {
     batchHistoryIndex,
     batchHistoryBackup,
     batchBarSourceId,
+    batchQuickOpen,
+    batchQuickSearch,
+    filteredBatchQuickCommands,
+    groupedBatchQuickCommands,
+    batchQuickPickName,
     toggleBatchBar,
     broadcastBatchBarState,
     applyRemoteBatchBarState,
@@ -366,8 +406,7 @@ onBeforeUnmount(() => {
     toggleBatchTargetsPopover,
     toggleBatchTargetId,
     pickBatchTargets,
-    onBatchQuickPick,
-    applyBatchQuickPick,
+    pickBatchQuick,
     browseBatchHistoryUp,
     browseBatchHistoryDown,
     batchSessionLabel,

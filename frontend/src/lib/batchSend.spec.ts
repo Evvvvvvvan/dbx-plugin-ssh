@@ -7,6 +7,7 @@ import {
   normalizeLocalBatchTargets,
   quickPickCommandById,
   selectBatchTargets,
+  shouldAutoDismissBatchSummary,
   summarizeBatchResults,
   toggleBatchTarget,
   type BatchSendTarget,
@@ -140,6 +141,17 @@ describe("summarizeBatchResults", () => {
   it("treats malformed payloads as zero counts", () => {
     expect(summarizeBatchResults(undefined)).toEqual({ rows: [], sent: 0, failed: 0 });
     expect(summarizeBatchResults("nope" as unknown as unknown[]).failed).toBe(0);
+  });
+});
+
+describe("shouldAutoDismissBatchSummary", () => {
+  it("auto-dismisses full success but keeps partial failures for triage", () => {
+    // 全部成功：短暂提示后自动收起（用户报障「已发送到 N 个会话不会自动关闭」）。
+    expect(shouldAutoDismissBatchSummary({ rows: [{ sessionId: "s-1", success: true }], sent: 1, failed: 0 })).toBe(true);
+    // 部分失败：逐行错误需要时间排查，常驻直到手动关闭。
+    expect(shouldAutoDismissBatchSummary({ rows: [{ sessionId: "s-1", success: true }, { sessionId: "s-2", success: false, error: "x" }], sent: 1, failed: 1 })).toBe(false);
+    // 空汇总（正常路径不会出现）：不触发自动收起。
+    expect(shouldAutoDismissBatchSummary({ rows: [], sent: 0, failed: 0 })).toBe(false);
   });
 });
 

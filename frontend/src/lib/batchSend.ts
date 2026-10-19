@@ -186,6 +186,14 @@ export function summarizeBatchResults(raw: unknown): BatchSendSummary {
   };
 }
 
+/**
+ * 结果浮条自动收起策略：全部成功才自动收起（短暂确认即可）；有失败行常驻，
+ * 逐行错误与「N 成功 / M 失败」摘要要留给用户排查，只保留手动关闭。
+ */
+export function shouldAutoDismissBatchSummary(summary: BatchSendSummary): boolean {
+  return summary.sent > 0 && summary.failed === 0;
+}
+
 /** 命令条保存快速命令时的默认名称：压平空白后截断（超长以省略号收尾）。
  * 按 code point 截断——UTF-16 code unit 直切会把 emoji 代理对劈成乱码。 */
 export function deriveBatchCommandName(command: string, maxLength = 30): string {

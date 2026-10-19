@@ -798,6 +798,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .batch-bar-send { color: var(--success); }
 /* 底部条上的 popover 向上展开：定位由 reka side="top" 负责，这里只管尺寸布局。 */
 .batch-targets-popover { display: flex; width: min(380px, calc(100vw - 32px)); max-height: min(320px, 60vh); flex-direction: column; gap: 6px; overflow: auto; padding: 8px; }
+/* 快速命令弹层：与右上角面板同形态（搜索 + 可折叠分组 + 卡片），内部行样式
+   复用面板的 quick-search、quick-group 与 quick-card 全局类。 */
+.batch-quick-popover { display: flex; width: min(300px, calc(100vw - 32px)); max-height: min(320px, 60vh); flex-direction: column; gap: 2px; overflow: auto; padding: 8px; }
+.batch-quick-popover .quick-card { cursor: pointer; text-align: left; width: 100%; }
+.batch-quick-popover .quick-card:hover { background: color-mix(in srgb, var(--muted) 45%, transparent); }
 .batch-bar-status { position: absolute; z-index: 5; right: 8px; bottom: 48px; left: 8px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: color-mix(in srgb, var(--background) 94%, transparent); box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent); font-size: 11px; }
 .batch-bar-status p { margin: 0; }
 .batch-bar-status .icon-button { flex: 0 0 auto; margin-left: auto; }

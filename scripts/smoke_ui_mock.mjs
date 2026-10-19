@@ -194,6 +194,15 @@ try {
   await page.fill(".quick-command-editor textarea", "echo ui-mock-batch");
   await page.click(".quick-command-editor-actions .primary-button");
   await expectText(page, ".quick-manage-list li", "ui-mock cmd", "quick command settings row");
+  // 再建一条带新分组的命令（issue #201 分组视图）：编辑器内“新建分组…”走
+  // __new__ 选项 + 组名输入，保存后批量条快速弹层应出现同款分组头。
+  await page.locator(".quick-manage-actions .link-button", { hasText: "New snippet" }).click();
+  await page.fill(".quick-command-editor input", "ui-mock grouped cmd");
+  await page.fill(".quick-command-editor textarea", "echo grouped-batch");
+  await page.selectOption(".quick-group-editor-select", "__new__");
+  await page.fill(".quick-group-editor input", "ui-mock group");
+  await page.click(".quick-command-editor-actions .primary-button");
+  await expectText(page, ".quick-manage-list li", "ui-mock grouped cmd", "grouped quick command settings row");
   await page.locator(".settings-modal header button.icon-button").first().click();
   await page.locator(".settings-nav-item").first().waitFor({ state: "hidden", timeout: 10_000 });
 
@@ -216,9 +225,12 @@ try {
   // 夹具返回 "Production SSH"），user@host 只在旧宿主/未命名连接时兜底。
   await expectText(page, ".batch-target-row", "Production SSH", "target row connection name");
   await expectText(page, ".batch-target-row", "Current", "current-session badge");
-  // 快速命令下拉已迁到 reka Select（Phase 3）：点开触发钮，再点选项。
+  // 快速命令弹层（2026-10 与右上角面板同形态：搜索 + 可折叠分组 + 命令卡片）：
+  // 点开触发钮，确认搜索框与分组头渲染，再点命令卡片回填输入框。
   await page.click(".batch-bar-quick");
-  await page.click('[data-slot="select-item"]:has-text("ui-mock cmd")');
+  await expect(page, ".batch-quick-popover .quick-search input", "batch quick search input");
+  await expectText(page, ".batch-quick-popover .quick-group-name", "ui-mock group", "batch quick group head");
+  await page.click('.batch-quick-popover .quick-card:has-text("ui-mock cmd")');
   const draft = await page.inputValue(".batch-bar-input");
   await check("quick pick fills the command draft", draft === "echo ui-mock-batch", `draft="${draft}"`);
   await page.screenshot({ path: `${SHOT_DIR}/03-batch-send.png`, fullPage: false });
@@ -495,10 +507,13 @@ try {
   await page.locator(".settings-nav-item").first().waitFor({ state: "visible", timeout: 15_000 });
   await page.getByRole("tab", { name: "Quick commands", exact: true }).click();
   // 删除确认已迁应用内弹窗（沙箱 iframe 无 allow-modals，window.confirm 恒
-  // false）：点删除 → 弹窗内确认按钮 → 等弹窗收口后再关设置。
-  await page.click('.quick-manage-list li button[title="Delete"]');
-  await page.locator(".small-modal footer .danger-button").click();
-  await page.locator(".small-modal").waitFor({ state: "hidden", timeout: 5_000 });
+  // false）：点删除 → 弹窗内确认按钮 → 等弹窗收口后再关设置。走查创建了多条
+  // 快速命令（含分组示例），循环删到清空再断言空态。
+  while (await page.locator('.quick-manage-list li button[title="Delete"]').count()) {
+    await page.locator('.quick-manage-list li button[title="Delete"]').first().click();
+    await page.locator(".small-modal footer .danger-button").click();
+    await page.locator(".small-modal").waitFor({ state: "hidden", timeout: 5_000 });
+  }
   await page.locator(".settings-modal header button.icon-button").first().click();
   await page.locator(".settings-nav-item").first().waitFor({ state: "hidden", timeout: 10_000 });
   await page.click(QUICK_BTN);

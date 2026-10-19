@@ -7320,7 +7320,11 @@ const {
   batchDraft,
   batchError,
   batchSummary,
-  batchQuickPickId,
+  batchQuickOpen,
+  batchQuickSearch,
+  filteredBatchQuickCommands,
+  groupedBatchQuickCommands,
+  batchQuickPickName,
   batchSaveMode,
   batchSaveName,
   batchSaving,
@@ -7334,8 +7338,7 @@ const {
   toggleBatchTargetsPopover,
   toggleBatchTargetId,
   pickBatchTargets,
-  onBatchQuickPick,
-  applyBatchQuickPick,
+  pickBatchQuick,
   browseBatchHistoryUp,
   browseBatchHistoryDown,
   batchSessionLabel,
@@ -9733,14 +9736,53 @@ watch(historyScope, () => {
               </PopoverContent>
             </Popover>
           </div>
-          <Select v-if="!batchSaveMode && quickCommands.length" :model-value="batchQuickPickId" @update:model-value="onBatchQuickPick">
-            <SelectTrigger size="xs" class="batch-bar-quick" :title="t('batchSendQuickPick')">
-              <SelectValue :placeholder="t('batchSendQuickPick')" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem v-for="item in quickCommands" :key="item.id" :value="item.id">{{ item.name }}</SelectItem>
-            </SelectContent>
-          </Select>
+          <!-- 快速命令弹层：与右上角面板同形态（搜索 + 可折叠分组 + 命令卡片，
+               复用面板样式类与折叠态），点击卡片即回填批量输入框（发送仍由
+               回车/发送按钮触发）。无真实分组时保持平铺，避免单条未分组的噪声组头。 -->
+          <Popover v-if="!batchSaveMode && quickCommands.length" :open="batchQuickOpen" @update:open="(open) => { if (!open) batchQuickOpen = false; }">
+            <PopoverAnchor as-child>
+              <button class="batch-bar-quick batch-bar-targets" :title="t('batchSendQuickPick')" :aria-label="t('batchSendQuickPick')" @click.stop="batchQuickOpen = !batchQuickOpen">
+                <Braces />
+                <span>{{ batchQuickPickName || t("batchSendQuickPick") }}</span>
+              </button>
+            </PopoverAnchor>
+            <PopoverContent class="popover batch-quick-popover" side="top" align="start" :side-offset="6">
+              <div class="quick-search">
+                <Search />
+                <input v-model="batchQuickSearch" :placeholder="t('quickCommandsSearch')" spellcheck="false" />
+              </div>
+              <div v-if="!filteredBatchQuickCommands.length" class="empty compact">{{ t("quickCommandsNoMatch") }}</div>
+              <template v-else-if="quickHasRealGroups">
+                <section v-for="group in groupedBatchQuickCommands" :key="group.id || '__ungrouped__'" class="quick-group">
+                  <button class="quick-group-head" :aria-expanded="!quickCollapsedGroups.includes(group.id)" @click="toggleQuickGroupCollapse(group.id)">
+                    <ChevronDown v-if="!quickCollapsedGroups.includes(group.id)" class="quick-group-chevron" />
+                    <ChevronRight v-else class="quick-group-chevron" />
+                    <span class="quick-group-name">{{ quickGroupName(group) }}</span>
+                    <span class="quick-group-count">{{ group.commands.length }}</span>
+                  </button>
+                  <template v-if="!quickCollapsedGroups.includes(group.id)">
+                    <button v-for="item in group.commands" :key="item.id" class="quick-command-row quick-card" :title="item.command" :aria-label="item.command" @click="pickBatchQuick(item)">
+                      <Braces class="quick-card-icon" />
+                      <span class="quick-card-text">
+                        <strong>{{ item.name }}</strong>
+                        <span class="mono">{{ item.command }}</span>
+                      </span>
+                    </button>
+                  </template>
+                </section>
+              </template>
+              <button v-for="item in filteredBatchQuickCommands" v-else :key="item.id" class="quick-command-row quick-card" :title="item.command" :aria-label="item.command" @click="pickBatchQuick(item)">
+                <Braces class="quick-card-icon" />
+                <span class="quick-card-text">
+                  <strong>{{ item.name }}</strong>
+                  <span class="mono">{{ item.command }}</span>
+                </span>
+              </button>
+              <footer class="quick-command-footer quick-command-footer--readonly">
+                <span class="quick-command-limit">{{ quickCommandGroupSummary }}</span>
+              </footer>
+            </PopoverContent>
+          </Popover>
           <input
             v-if="batchSaveMode"
             v-model="batchSaveName"

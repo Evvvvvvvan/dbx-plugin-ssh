@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createTerminalInputQueue, terminalInputChannel } from "./terminalInputQueue";
+import { createTerminalInputQueue, TerminalInputTimeoutError, terminalInputChannel } from "./terminalInputQueue";
 
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -70,6 +70,68 @@ describe("terminal input queue", () => {
     await settle();
 
     expect(sent).toEqual(["a", "c"]);
+  });
+
+  it("bounds a stalled browser bridge send so the queue reports the transport loss", async () => {
+    vi.useFakeTimers();
+    try {
+      const errors: unknown[] = [];
+      const queue = createTerminalInputQueue({
+        sendTimeoutMs: 100,
+        send: () => new Promise<void>(() => {}),
+        onError: (cause) => errors.push(cause),
+      });
+
+      queue.enqueue("session-1", new TextEncoder().encode("c"));
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toBeInstanceOf(TerminalInputTimeoutError);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores a stalled send error after the queue has moved to a new generation", async () => {
+    vi.useFakeTimers();
+    try {
+      const onError = vi.fn();
+      const queue = createTerminalInputQueue({
+        sendTimeoutMs: 100,
+        send: () => new Promise<void>(() => {}),
+        onError,
+      });
+
+      queue.enqueue("old-session", new TextEncoder().encode("c"));
+      await Promise.resolve();
+      await Promise.resolve();
+      queue.reset();
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(onError).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("allows callers to leave non-watched sessions without a bridge timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const onError = vi.fn();
+      const queue = createTerminalInputQueue({
+        sendTimeoutMs: (sessionId) => (sessionId === "ssh-session" ? 100 : 0),
+        send: () => new Promise<void>(() => {}),
+        onError,
+      });
+
+      queue.enqueue("local-session", new TextEncoder().encode("c"));
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(onError).not.toHaveBeenCalled();
+      queue.reset();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("prepends the stream tag on tagged channels without changing ordering", async () => {

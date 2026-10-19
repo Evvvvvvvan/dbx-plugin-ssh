@@ -108,9 +108,10 @@ import {
 } from "./lib/terminalInteraction";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
 import { createOutputGate } from "./lib/terminalBackpressure";
-import { createTerminalInputQueue, terminalInputChannel } from "./lib/terminalInputQueue";
+import { createTerminalInputQueue, terminalInputChannel, TerminalInputTimeoutError } from "./lib/terminalInputQueue";
 import { SERIAL_STREAM_STDIN, isKnownStreamTag, supportsBinaryInput } from "./lib/serialTerminalFrames";
 import { describeReconnectRestoredNotice, isConnectionInactiveError, isSessionGoneError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS } from "./lib/terminalReconnect";
+import { TERMINAL_TRANSPORT_PROBE_TIMEOUT_MS, useTerminalTransportWatch } from "./composables/useTerminalTransportWatch";
 import { classifyConnectError, connectErrorKey } from "./lib/connectError";
 import { decideConnectRetry, isDuplicatedTransportUnavailableError } from "./lib/connectRetry";
 import { reopenHostConnection } from "./lib/hostReopen";
@@ -1519,6 +1520,9 @@ if (typeof window !== "undefined") {
 }
 
 const terminalInputQueue = createTerminalInputQueue({
+  // Only SSH sends use the reconnect watcher below. A stalled local PTY or
+  // Telnet send must not be mislabeled as an exited local process or SSH loss.
+  sendTimeoutMs: (sessionId) => (sessionId === session.value?.sessionId ? 8_000 : 0),
   send: (sessionId, payload) => {
     terminalDiag.sends += 1;
     // 通道按会话身份选择（telnet: 前缀 / 本地会话 / SSH，见
@@ -1528,9 +1532,15 @@ const terminalInputQueue = createTerminalInputQueue({
   },
   onError: (cause) => {
     terminalDiag.errors += 1;
+    terminalInputQueue.reset();
     // 本地会话的输入错误（进程退出/会话被回收）直接落退出态，不走 SSH 重连梯子。
     if (isLocalMode.value) {
       markLocalExited(null);
+      return;
+    }
+    const sshSessionId = session.value?.sessionId;
+    if (!isTelnetMode.value && sshSessionId && (cause instanceof TerminalInputTimeoutError || isSessionGoneError(cause))) {
+      terminalTransportWatch.reportUnavailable(sshSessionId);
       return;
     }
     showError(cause, "terminal");
@@ -3320,6 +3330,9 @@ function sendTerminalBytes(data: Uint8Array) {
     terminalInputQueue.enqueue(`telnet:${telnetSession.value.sessionId}`, normalizeTerminalInputBytes(data));
     return;
   }
+  // Ignore typing while an SSH session is reconnecting. Keeping bytes in a
+  // stale session queue can replay partial commands after the browser returns.
+  if (!localSession.value && terminalState.value !== "connected") return;
   const sessionId = localSession.value?.sessionId ?? session.value?.sessionId;
   if (!sessionId) return;
   terminalInputQueue.enqueue(sessionId, normalizeTerminalInputBytes(data));
@@ -3814,6 +3827,9 @@ function drainTerminalFrames() {
       } else {
         terminalState.value = "disconnected";
         terminalError.value = state === "ssh-transport-disconnected" ? t("transportDisconnected") : state || t("disconnected");
+        if (state === "ssh-transport-disconnected" && session.value?.sessionId) {
+          terminalTransportWatch.reportUnavailable(session.value.sessionId);
+        }
       }
     } else {
       consumeFrameViaZmodem(frame.data);
@@ -3901,6 +3917,19 @@ const {
   isDisposed: () => disposed,
   openSession,
   requestHostReopenConnection,
+});
+const terminalTransportWatch = useTerminalTransportWatch({
+  t,
+  terminalState,
+  terminalError,
+  session,
+  resetInputQueue: () => terminalInputQueue.reset(),
+  probeTransport: (sessionId) => window.dbxPlugin.invoke<ReplayResult>(
+    "ssh/terminal/replay",
+    { sessionId, afterSequence: lastSequence },
+    { timeoutMs: TERMINAL_TRANSPORT_PROBE_TIMEOUT_MS },
+  ),
+  attachSession,
 });
 // 连接卡片四态与手动重连入口：收口在 composables/useConnectCard（会话主干
 // openSession/closeSession/宿主重开留守 App.vue，经 options 注入）。
@@ -4056,6 +4085,7 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
   terminalState.value = "connecting";
   terminalError.value = "";
   reconnectPending.value = false;
+  terminalInputQueue.reset();
   resetCommandMarker();
   connectCancelled.value = false;
   connectSucceeded.value = false;
@@ -4192,6 +4222,7 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
 
 async function attachSession(sessionId: string, retryReference: string = initialState().sessionId || "") {
   terminalState.value = "connecting";
+  terminalInputQueue.reset();
   connectCancelled.value = false;
   // attach（tab 恢复）不播成功过渡动画，直接进终端。
   connectSucceeded.value = false;

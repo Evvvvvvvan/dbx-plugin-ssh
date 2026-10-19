@@ -10,6 +10,9 @@
 export interface TerminalInputQueueOptions {
   send(sessionId: string, payload: Uint8Array): Promise<void> | void;
   onError?(cause: unknown): void;
+  /** Bound a stalled host bridge send so one dropped browser connection cannot
+   * keep every later keystroke chained behind a promise that never settles. */
+  sendTimeoutMs?: number | ((sessionId: string) => number | undefined);
   /**
    * 串口 B1 通道（`serial/terminal/in/{id}`）专用：设置后负载带 1 字节流
    * 标签前缀（TerminalFrame 形状：标签 + 大端 u64 序号 + 数据），标签取值
@@ -22,6 +25,13 @@ export interface TerminalInputQueueOptions {
 export interface TerminalInputQueue {
   enqueue(sessionId: string, data: Uint8Array): number;
   reset(): void;
+}
+
+export class TerminalInputTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Terminal input bridge did not respond within ${timeoutMs} ms`);
+    this.name = "TerminalInputTimeoutError";
+  }
 }
 
 /**
@@ -46,6 +56,35 @@ export function createTerminalInputQueue(options: TerminalInputQueueOptions): Te
   let generation = 0;
   let tail = Promise.resolve();
 
+  function sendWithTimeout(sessionId: string, payload: Uint8Array): Promise<void> {
+    const timeoutOption = options.sendTimeoutMs;
+    const timeoutMs = typeof timeoutOption === "function" ? timeoutOption(sessionId) : timeoutOption;
+    if (!timeoutMs || timeoutMs <= 0) return Promise.resolve(options.send(sessionId, payload));
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        settled = true;
+        reject(new TerminalInputTimeoutError(timeoutMs));
+      }, timeoutMs);
+      Promise.resolve()
+        .then(() => options.send(sessionId, payload))
+        .then(
+          () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve();
+          },
+          (cause: unknown) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(cause);
+          },
+        );
+    });
+  }
+
   function enqueue(sessionId: string, data: Uint8Array) {
     const sequence = ++nextSequence;
     const itemGeneration = generation;
@@ -65,12 +104,15 @@ export function createTerminalInputQueue(options: TerminalInputQueueOptions): Te
     tail = tail
       .then(async () => {
         // Input queued before a session reset must not leak into the next
-        // session. An already-running send cannot be cancelled, so new input
-        // remains behind it and is sent only after the old frame settles.
+        // session. reset() also detaches the next generation from an old send
+        // that may never settle after a browser-to-host network loss.
         if (itemGeneration !== generation) return;
-        await options.send(sessionId, payload);
+        await sendWithTimeout(sessionId, payload);
       })
       .catch((cause) => {
+        // A send from the previous session generation may time out after a
+        // reconnect reset. Its error must not disconnect the new session.
+        if (itemGeneration !== generation) return;
         try {
           options.onError?.(cause);
         } catch {
@@ -85,6 +127,9 @@ export function createTerminalInputQueue(options: TerminalInputQueueOptions): Te
     reset() {
       generation += 1;
       nextSequence = 0;
+      // A send already in progress cannot be cancelled, but new-session input
+      // must not wait for that old bridge promise to settle.
+      tail = Promise.resolve();
     },
   };
 }

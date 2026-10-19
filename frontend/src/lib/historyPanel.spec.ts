@@ -7,6 +7,7 @@ import {
   canOpenHistoryPanel,
   chooseHistoryPanelPlacement,
   clampHistoryPanelIndex,
+  commandHistoryHotkeyPassthrough,
   decorateHistoryEntries,
   persistableHistoryMetaBuckets,
   pruneHistoryTimesBuckets,
@@ -134,6 +135,21 @@ describe("canOpenHistoryPanel", () => {
 
   it("does not grab ↑ while an interactive prompt is pending (#150: MFA/选择场景 ↑ 留给远端)", () => {
     expect(canOpenHistoryPanel({ ...open, interactivePromptPending: true })).toBe(false);
+  });
+});
+
+describe("commandHistoryHotkeyPassthrough", () => {
+  it("passes through when the master switch is off (#169: Ctrl+R 留给 readline 反向搜索)", () => {
+    expect(commandHistoryHotkeyPassthrough({ enabled: false, alternateActive: false })).toBe(true);
+  });
+
+  it("passes through on the alternate screen (#108 反馈二: vim 的 Ctrl+R 是 redo，不吞键)", () => {
+    expect(commandHistoryHotkeyPassthrough({ enabled: true, alternateActive: true })).toBe(true);
+    expect(commandHistoryHotkeyPassthrough({ enabled: false, alternateActive: true })).toBe(true);
+  });
+
+  it("keeps swallowing with the panel enabled on the normal screen（传输占用/OTP 待答等 gate 关闭场景不透传 ^R）", () => {
+    expect(commandHistoryHotkeyPassthrough({ enabled: true, alternateActive: false })).toBe(false);
   });
 });
 

@@ -348,6 +348,7 @@ import TerminalPromptHints from "./components/TerminalPromptHints.vue";
 import {
   canOpenHistoryPanel,
   clampHistoryPanelIndex,
+  commandHistoryHotkeyPassthrough,
   decorateHistoryEntries,
   filterHistoryEntries,
   moveHistoryPanelIndex,
@@ -2501,9 +2502,11 @@ function handleTerminalKey(event: KeyboardEvent) {
       // ↑ 裸键之外的补充唤起（可配置键位，默认含 Ctrl+R——Warp Command Search
       // 的默认键 workspace:show_command_search）：同一 gate，开↔关 toggle；
       // 热键入口聚焦搜索框（批 3d）——热键用户要的就是 Warp Ctrl+R 式搜索流。
-      // 功能开关关闭（issue #169）时不 consume：Ctrl+R 原样透传远端 shell，
-      // readline 原生反向搜索照常可用。
-      if (!historyPanelEnabled.value) return true;
+      // 总开关关闭（issue #169）或 alternate 屏（vim 的 Ctrl+R 是 redo，less/
+      // tmux copy-mode 同理，#108 反馈二顺带修复）时不 consume：原样透传远端；
+      // 其余 gate 关闭场景维持吞键（传输占用放行 ^R 会污染 zmodem/trzsz
+      // 字节流，交互提示待答会把控制字符打进 OTP 输入）。
+      if (commandHistoryHotkeyPassthrough({ enabled: historyPanelEnabled.value, alternateActive: terminal?.buffer.active.type === "alternate" })) return true;
       if (historyPanelOpen.value) closeHistoryPanel();
       else if (historyPanelGateOpen()) openHistoryPanel(true);
       return consume();

@@ -4288,7 +4288,9 @@ async function afterSessionConnected() {
   if (followDirectory.value) await setDirectoryTracking(true);
   if (sftpAutoConnect.value) {
     void refreshSftpHomePath();
-    await Promise.all([loadDirectory(currentPath.value), restoreTransfers()]);
+    // #209 自动首拉走安静失败模式：失败落面板内软提示条，不弹全局错误横幅
+    // （服务端停在堡垒机列表等场景的失败对用户是噪音）。
+    await Promise.all([loadDirectory(currentPath.value, false, true), restoreTransfers()]);
     // 侧栏 tree tab 可见时补拉根节点（首连/重连后缓存仍为空的场景）。
     ensureSideTreeRoot();
   } else {
@@ -4332,6 +4334,8 @@ async function closeSession(updateStatus = true) {
   resetCommandMarker();
   // 新会话的 SFTP 目录视为未加载：自动连接关闭时，重连后手动打开面板会重新补载。
   sftpListingLoaded.value = false;
+  // #209：面板内软错误条（跟随/自动首拉失败态）不跨会话存留。
+  sftpSoftError.value = null;
   // 外部编辑器监听挂在会话上：断开前先停掉（后端 ssh/session/close 兜底）。
   // M15 多文件：清空整个 watch 注册表与逐文件确认队列。
   if (sessionId) {
@@ -5923,6 +5927,7 @@ const {
   loadHome,
   refreshSftpHomePath,
   loadDirectory,
+  sftpSoftError,
   toggleSudoMode,
   enableSudoModeAndReload,
   goParent,
@@ -10019,6 +10024,15 @@ watch(historyScope, () => {
             <button class="danger" :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @click="batchDeleteOpen = true"><Trash2 />{{ t("sftpBatch.delete") }}</button>
             <button @click="clearRowSelection"><X />{{ t("sftpBatch.clear") }}</button>
           </div>
+          <!-- #209 目录跟随/连接后自动首拉失败的安静态：不弹全局错误横幅，
+               在面板内给一条低调的软提示（原始错误进悬停 tooltip）+ 重试按钮。
+               重试按手动导航语义执行（再失败才落全局横幅），成功或任一后续
+               手动导航成功即清除；断开会话时一并清除。 -->
+          <div v-if="sftpSoftError" class="sftp-soft-error" role="status" :title="sftpSoftError.detail">
+            <TriangleAlert class="sftp-soft-error-icon" />
+            <span class="sftp-soft-error-text">{{ sftpSoftError.message }}</span>
+            <button class="sftp-soft-error-action" @click="sftpSoftError.action.run()">{{ sftpSoftError.action.label }}</button>
+          </div>
           <div class="file-table">
             <!-- 行右键（文件操作）与空白处右键（新建/刷新）共用同一 ContextMenu 根：
                  行处理器 showFileMenu 先行设置负载，容器处理器按事件目标兜空白区；
@@ -10890,6 +10904,13 @@ watch(historyScope, () => {
 .sftp-batch-bar button:hover:not(:disabled) { background: var(--accent); }
 .sftp-batch-bar button.danger { color: var(--destructive); }
 .sftp-batch-bar button svg { width: 12px; height: 12px; }
+/* #209 面板内软错误条：目录跟随/自动首拉失败的安静提示（替代全局错误横幅）。
+   低调灰字 + 警示图标贴条展示；重试按钮沿用 notice-action 的轻量描边样式。 */
+.sftp-soft-error { display: flex; align-items: center; gap: 6px; border-bottom: 1px solid var(--border); padding: 4px 8px; background: color-mix(in srgb, var(--warning) 7%, var(--background)); color: var(--muted-foreground); font-size: 11px; }
+.sftp-soft-error-icon { width: 12px; height: 12px; flex: 0 0 12px; color: var(--warning); }
+.sftp-soft-error-text { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sftp-soft-error-action { flex: 0 0 auto; display: inline-flex; height: 20px; align-items: center; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--primary); font-size: 11px; white-space: nowrap; cursor: pointer; }
+.sftp-soft-error-action:hover:not(:disabled) { background: var(--accent); }
 .sftp-batch-bar .batch-progress { flex: 0 0 auto; overflow: visible; font-variant-numeric: tabular-nums; }
 .batch-progress-bar { flex: 0 1 140px; height: 6px; min-width: 80px; accent-color: var(--primary); }
 .batch-progress-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }

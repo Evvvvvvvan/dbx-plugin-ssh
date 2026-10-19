@@ -168,6 +168,9 @@ export const messages = {
     followDirectoryFailed: "Could not follow {path}: {error}",
     followDirectorySudoHint: "Could not follow {path}: the login user lacks permission. Switch to sudo mode to browse it.",
     followDirectorySudoRetry: "Switch to sudo mode and retry",
+    sftpSoftError: {
+      loadFailed: "Could not load this path (the session may still be on a bastion host listing): {path}",
+    },
     directoryTrackingUnavailable: "The remote shell did not confirm directory tracking. Tracking was disabled and the terminal remains usable.",
     directoryTrackingUnsupported: "Directory tracking is not supported by this remote shell. It is available for Bash and Zsh, but not Windows PowerShell, CMD, Fish, or other shells.",
     terminalCopy: "Copy",
@@ -728,6 +731,9 @@ export const messages = {
     followDirectoryFailed: "No se pudo seguir {path}: {error}",
     followDirectorySudoHint: "No se pudo seguir {path}: el usuario conectado no tiene permisos. Cambie al modo sudo para explorarlo.",
     followDirectorySudoRetry: "Cambiar a modo sudo y reintentar",
+    sftpSoftError: {
+      loadFailed: "No se pudo cargar esta ruta (la sesión puede seguir en el listado del host bastión): {path}",
+    },
     directoryTrackingUnavailable: "El shell remoto no confirmó el seguimiento del directorio. Se desactivó y el terminal sigue disponible.",
     directoryTrackingUnsupported: "Este shell remoto no admite el seguimiento de directorio. Está disponible para Bash y Zsh, pero no para Windows PowerShell, CMD, Fish u otros shells.",
     terminalCopy: "Copiar",
@@ -1281,6 +1287,9 @@ export const messages = {
     followDirectoryFailed: "Impossibile seguire {path}: {error}",
     followDirectorySudoHint: "Impossibile seguire {path}: l'utente connesso non ha i permessi. Passare alla modalità sudo per esplorarlo.",
     followDirectorySudoRetry: "Passa alla modalità sudo e riprova",
+    sftpSoftError: {
+      loadFailed: "Impossibile caricare questo percorso (la sessione potrebbe trovarsi ancora nell'elenco del bastion host): {path}",
+    },
     directoryTrackingUnavailable: "La shell remota non ha confermato il monitoraggio della directory. È stato disattivato e il terminale resta utilizzabile.",
     directoryTrackingUnsupported: "Il monitoraggio della directory non è supportato da questa shell remota. È disponibile per Bash e Zsh, ma non per Windows PowerShell, CMD, Fish o altre shell.",
     terminalCopy: "Copia",
@@ -1834,6 +1843,9 @@ export const messages = {
     followDirectoryFailed: "{path} に追従できませんでした: {error}",
     followDirectorySudoHint: "{path} に追従できませんでした: ログインユーザーに権限がありません。sudo モードに切り替えると閲覧できます。",
     followDirectorySudoRetry: "sudo モードに切り替えて再試行",
+    sftpSoftError: {
+      loadFailed: "このパスを読み込めませんでした（セッションがまだ踏み台ホストのリストにいる可能性があります）：{path}",
+    },
     directoryTrackingUnavailable: "リモートシェルがディレクトリ追従を確認しなかったため無効にしました。ターミナルは引き続き使用できます。",
     directoryTrackingUnsupported: "このリモートシェルはディレクトリ追従に対応していません。Bash と Zsh のみ対応し、Windows PowerShell、CMD、Fish などでは使用できません。",
     terminalCopy: "コピー",
@@ -2387,6 +2399,9 @@ export const messages = {
     followDirectoryFailed: "Não foi possível seguir {path}: {error}",
     followDirectorySudoHint: "Não foi possível seguir {path}: o usuário conectado não tem permissão. Alterne para o modo sudo para navegá-lo.",
     followDirectorySudoRetry: "Alternar para o modo sudo e tentar novamente",
+    sftpSoftError: {
+      loadFailed: "Não foi possível carregar este caminho (a sessão pode ainda estar na listagem do host bastion): {path}",
+    },
     directoryTrackingUnavailable: "O shell remoto não confirmou o acompanhamento de diretório. Ele foi desativado e o terminal continua disponível.",
     directoryTrackingUnsupported: "Este shell remoto não oferece acompanhamento de diretório. O recurso funciona com Bash e Zsh, mas não com Windows PowerShell, CMD, Fish ou outros shells.",
     terminalCopy: "Copiar",
@@ -2940,6 +2955,9 @@ export const messages = {
     followDirectoryFailed: "无法跟随到 {path}：{error}",
     followDirectorySudoHint: "无法跟随到 {path}：登录用户权限不足。可切换 sudo 模式浏览该目录。",
     followDirectorySudoRetry: "切换 sudo 模式并重试",
+    sftpSoftError: {
+      loadFailed: "无法加载该路径（当前连接可能停在堡垒机列表）：{path}",
+    },
     directoryTrackingUnavailable: "远程 Shell 未确认目录跟随，已自动关闭，终端仍可正常使用。",
     directoryTrackingUnsupported: "当前远程 Shell 不支持目录跟随。该功能仅支持 Bash 和 Zsh，Windows PowerShell、CMD、Fish 等终端无法启用。",
     terminalCopy: "复制",
@@ -3500,6 +3518,9 @@ export const messages = {
     followDirectoryFailed: "無法跟隨至 {path}：{error}",
     followDirectorySudoHint: "無法跟隨至 {path}：登入使用者權限不足。可切換 sudo 模式瀏覽該目錄。",
     followDirectorySudoRetry: "切換 sudo 模式並重試",
+    sftpSoftError: {
+      loadFailed: "無法載入該路徑（目前連線可能停在堡壘機清單）：{path}",
+    },
     directoryTrackingUnavailable: "遠端 Shell 未確認目錄跟隨，已自動關閉，終端仍可正常使用。",
     directoryTrackingUnsupported: "目前遠端 Shell 不支援目錄跟隨。此功能僅支援 Bash 和 Zsh，Windows PowerShell、CMD、Fish 等終端無法啟用。",
     terminalCopy: "複製",

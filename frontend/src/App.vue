@@ -127,7 +127,7 @@ import { pickModalFocusTarget } from "./lib/modalFocus";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
 import { readClipboardText, writeClipboardText, type ClipboardDeps } from "./lib/clipboardBridge";
 import { friendlySftpError } from "./lib/sftpErrors";
-import { paneDirectionClass, resolvePaneDirection, sanitizePaneDirection, terminalFlexBasis, type PaneDirectionPref } from "./lib/paneLayout";
+import { paneDirectionClass, paneSplitCssVar, resolvePaneDirection, sanitizePaneDirection, terminalFlexBasis, type PaneDirectionPref } from "./lib/paneLayout";
 import { isCountdownActive } from "./lib/recordingCountdown";
 import { type SftpTypeFilter } from "./lib/sftpFileFilters";
 import {
@@ -1774,6 +1774,10 @@ const toolbarStyle = computed(() => toolbarTintStyle(connection.value.color, app
 const terminalBasis = computed(() => ({
   flexBasis: terminalFlexBasis({ sftpOpen: sftpPaneOpen.value, splitRatio: splitRatio.value }),
 }));
+// 纵向分栏（issue #207）：「始终上下」/ 窄屏断点的两栏高度改由容器上的
+// --pane-split 变量消费 splitRatio（拖拽/键盘微调唯一数据源），CSS 不再钉死。
+// solo（SFTP 收起）不设变量，回落既有 solo 全屏规则。
+const paneSplitStyle = computed(() => paneSplitCssVar({ sftpOpen: sftpPaneOpen.value, splitRatio: splitRatio.value }));
 const orderedPaneClass = computed(() => [
   paneOrder.value === "sftp-left" ? "panes panes--reversed" : "panes",
   paneDirectionClass(paneDirection.value),
@@ -1785,6 +1789,11 @@ const orderedPaneClass = computed(() => [
 function currentPaneDirection(): "column" | "row" {
   return resolvePaneDirection({ pref: paneDirection.value, viewportWidth: typeof window !== "undefined" ? window.innerWidth : undefined });
 }
+// 把手提示按轴向：纵向拖的是高度、横向拖的是宽度（与 onDividerKeydown 的
+// 方向键映射一致）；跟随 currentPaneDirection 的断点/强制模式。
+const dividerResizeHint = computed(() =>
+  currentPaneDirection() === "column" ? t("dividerResizeHintHeight") : t("dividerResizeHint"),
+);
 // 列表排序/搜索/列布局/虚拟滚动：收口在 composables/useSftpListLayout。
 const {
   sortedEntries,
@@ -9144,7 +9153,7 @@ watch(historyScope, () => {
       <ToastViewport class="error-viewport" />
     </ToastProvider>
 
-    <section ref="paneContainer" :class="orderedPaneClass">
+    <section ref="paneContainer" :class="orderedPaneClass" :style="paneSplitStyle">
       <ContextMenu :open="terminalMenuOpen" @update:open="(open) => { if (!open) terminalMenuOpen = false; }">
         <ContextMenuTrigger as-child>
       <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed, 'gutter-visible': gutterPaneVisible, 'wallpaper-active': wallpaperActive, ...transferBusyPaneClass(terminalTransferBusy) }" :style="[terminalBasis, gutterPaneStyle]" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave="onTerminalDragLeave" @drop.prevent="onTerminalDrop($event)">
@@ -9861,7 +9870,7 @@ watch(historyScope, () => {
         :aria-valuenow="Math.round(splitRatio)"
         aria-valuemin="35"
         aria-valuemax="80"
-        :title="t('dividerResizeHint')"
+        :title="dividerResizeHint"
         tabindex="0"
         @pointerdown="startDividerDrag"
         @keydown="onDividerKeydown($event, nudgeSplitDivider)"

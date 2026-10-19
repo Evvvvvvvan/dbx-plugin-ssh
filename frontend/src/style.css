@@ -739,10 +739,15 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 
 /* 布局方向偏好（issue #187）的纵向覆盖类：与窄屏断点同形的堆叠规则，
    但不依赖视口——「始终上下」在宽屏同样生效。终端恒在上（.panes--reversed
-   的 row-reverse 被压成 column，左右换位对纵向无意义）。 */
+   的 row-reverse 被压成 column，左右换位对纵向无意义）。
+   高度消费容器上的 --pane-split（issue #207，App.vue 由 splitRatio 写入），
+   拖拽/键盘微调即时生效；flex-basis:auto !important 压过横向同款内联
+   flexBasis。变量缺失（历史缓存/未绑定）回落 52%。 */
 .panes--vertical, .panes--vertical.panes--reversed { flex-direction: column; }
-.panes--vertical .terminal-pane { width: 100%; height: 52%; flex-basis: auto !important; flex-shrink: 0; }
-.panes--vertical .sftp-pane { width: 100%; height: 48%; }
+.panes--vertical .terminal-pane { width: 100%; height: var(--pane-split, 52%); flex-basis: auto !important; flex-shrink: 0; }
+/* SFTP 面板 flex:1 撑满终端（--pane-split）与 1px 把手之外的余量，
+   min-height:0 防内容把面板撑出容器。 */
+.panes--vertical .sftp-pane { width: 100%; height: auto; flex: 1 1 auto; min-height: 0; }
 .panes--vertical .divider { width: 100%; height: 1px; flex-basis: 1px; cursor: row-resize; }
 .panes--vertical .divider::after { top: -3px; bottom: -3px; left: 0; right: 0; }
 .panes--vertical.panes--solo .terminal-pane { height: 100%; }
@@ -750,10 +755,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 @media (max-width: 900px) {
   .follow-directory-control > span { display: none; }
   /* 窄屏纵向仅是「自动」模式的缺省：强制左右（.panes--horizontal）不受断点
-     影响（issue #187），:not() 提一档特异性压过下面的列布局规则。 */
+     影响（issue #187），:not() 提一档特异性压过下面的列布局规则。高度消费
+     --pane-split（issue #207），与 .panes--vertical 同源同回落。 */
   .panes:not(.panes--horizontal), .panes--reversed:not(.panes--horizontal) { flex-direction: column; }
-  .panes:not(.panes--horizontal) .terminal-pane { width: 100%; height: 52%; flex-basis: auto !important; flex-shrink: 0; }
-  .panes:not(.panes--horizontal) .sftp-pane { width: 100%; height: 48%; }
+  .panes:not(.panes--horizontal) .terminal-pane { width: 100%; height: var(--pane-split, 52%); flex-basis: auto !important; flex-shrink: 0; }
+  .panes:not(.panes--horizontal) .sftp-pane { width: 100%; height: auto; flex: 1 1 auto; min-height: 0; }
   .panes:not(.panes--horizontal) .divider { width: 100%; height: 1px; flex-basis: 1px; cursor: row-resize; }
   /* 纵向布局把手命中区向下/上扩展。 */
   .divider::after { top: -3px; bottom: -3px; left: 0; right: 0; }

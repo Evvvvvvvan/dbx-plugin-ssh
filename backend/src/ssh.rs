@@ -4151,22 +4151,11 @@ impl SshRuntime {
             .await
             .map_err(|error| format!("Failed to start SFTP: {error}"))?;
         let compat = crate::preferences::sftp_compat_mode(&self.data_dir);
-        let sftp = Arc::new(AsyncMutex::new(if compat {
-            SftpSession::new_with_config(
-                channel.into_stream(),
-                SftpConfig {
-                    max_concurrent_reads: 1,
-                    max_concurrent_writes: 1,
-                    ..SftpConfig::default()
-                },
-            )
-            .await
-            .map_err(sftp_error)?
-        } else {
-            SftpSession::new(channel.into_stream())
+        let sftp = Arc::new(AsyncMutex::new(
+            SftpSession::new_with_config(channel.into_stream(), sftp_client_config(compat))
                 .await
-                .map_err(sftp_error)?
-        }));
+                .map_err(sftp_error)?,
+        ));
         *current = Some(sftp.clone());
         Ok(sftp.clone())
     }
@@ -12305,6 +12294,31 @@ pub fn connection_id_param(params: &Value) -> Result<&str, String> {
         .ok_or("Missing connectionId".to_string())
 }
 
+/// SFTP 客户端每请求超时（秒）。russh-sftp 3.0.1 的 `request_timeout_secs`
+/// 默认 10 秒且按单个请求计：慢链路/经跳板时单个写请求确认超 10 秒即整体
+/// 失败，大文件上传被误杀（#206），统一放宽到 60 秒。
+const SFTP_REQUEST_TIMEOUT_SECS: u64 = 60;
+
+/// SFTP 客户端配置（纯函数，供单测）。`compat` 为老旧服务器兼容模式
+/// （M14-B）：请求/响应不做流水线并发（读写各 1 路）；非 compat 沿用
+/// crate 默认并发。两种模式都放宽每请求超时（见 [`SFTP_REQUEST_TIMEOUT_SECS`]）。
+pub(crate) fn sftp_client_config(compat: bool) -> SftpConfig {
+    SftpConfig {
+        max_concurrent_reads: if compat {
+            1
+        } else {
+            SftpConfig::default().max_concurrent_reads
+        },
+        max_concurrent_writes: if compat {
+            1
+        } else {
+            SftpConfig::default().max_concurrent_writes
+        },
+        request_timeout_secs: SFTP_REQUEST_TIMEOUT_SECS,
+        ..SftpConfig::default()
+    }
+}
+
 fn sftp_error(error: impl std::fmt::Display) -> String {
     format!("SFTP operation failed: {error}")
 }
@@ -16643,5 +16657,30 @@ matrix-ed25519";
                 .block_on(runtime_ref.local_target("conn-local-1"))
                 .is_none());
         }
+    }
+
+    #[test]
+    fn sftp_client_config_compat_serializes_pipelines_and_widens_timeout() {
+        // compat（M14-B）：请求/响应不做流水线并发（读写各 1 路）。
+        let config = sftp_client_config(true);
+        assert_eq!(config.max_concurrent_reads, 1);
+        assert_eq!(config.max_concurrent_writes, 1);
+        // #206：russh-sftp 默认 10s 单请求超时在慢链路/跳板下误杀大文件上传。
+        assert_eq!(config.request_timeout_secs, 60);
+    }
+
+    #[test]
+    fn sftp_client_config_non_compat_keeps_default_pipeline_concurrency() {
+        // 非 compat 保持 crate 默认流水线并发，只放宽每请求超时（#206）。
+        let config = sftp_client_config(false);
+        assert_eq!(
+            config.max_concurrent_reads,
+            SftpConfig::default().max_concurrent_reads
+        );
+        assert_eq!(
+            config.max_concurrent_writes,
+            SftpConfig::default().max_concurrent_writes
+        );
+        assert_eq!(config.request_timeout_secs, 60);
     }
 }

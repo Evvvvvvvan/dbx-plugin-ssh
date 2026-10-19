@@ -55,7 +55,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
-use crate::ssh::{SshClient, SshRuntime};
+use crate::ssh::{sftp_client_config, SshClient, SshRuntime};
 
 /// Machine-readable error codes prefixed onto RPC error strings. The host
 /// maps these onto `TaskError` kinds / reserved `error_code` vocabulary
@@ -943,7 +943,7 @@ async fn ssh_upload_script(handle: &Handle<SshClient>, bytes: &[u8]) -> Result<S
         .request_subsystem(true, "sftp")
         .await
         .map_err(|error| format!("Failed to start SFTP: {error}"))?;
-    let sftp = SftpSession::new(channel.into_stream())
+    let sftp = SftpSession::new_with_config(channel.into_stream(), sftp_client_config(false))
         .await
         .map_err(|error| format!("Failed to initialize SFTP: {error}"))?;
     let upload = async {

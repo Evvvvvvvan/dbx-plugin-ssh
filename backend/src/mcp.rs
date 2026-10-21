@@ -3394,8 +3394,18 @@ where
     }
 }
 
-fn sftp_error(error: impl std::fmt::Display) -> String {
-    format!("SFTP operation failed: {error}")
+fn sftp_error(error: russh_sftp::client::error::Error) -> String {
+    // 错误串携带数字 SFTP 状态码（SSH_FX_*，draft-ietf-secsh-filexfer-02 §7）：
+    // sftp_raw::error_status 按 "status N" 解析，smoke_mcp 契约也按它断言
+    // （「不存在」= status 2）；russh-sftp 的 Display 只有文案（"No such
+    // file"），机读码必须在这里补回。
+    match &error {
+        russh_sftp::client::error::Error::Status(status) => format!(
+            "SFTP operation failed (status {}): {error}",
+            status.status_code as u32
+        ),
+        _ => format!("SFTP operation failed: {error}"),
+    }
 }
 
 fn connection_pool_id(arguments: &Value) -> String {
@@ -4510,6 +4520,27 @@ mod tests {
         // Unique data dir per call: settings persistence (limits AND the
         // §1.3 permission keys) must not leak across parallel tests.
         McpState::new(std::env::temp_dir().join(format!("dbx-mcp-test-{}", uuid::Uuid::new_v4())))
+    }
+
+    #[test]
+    fn sftp_error_carries_the_numeric_sftp_status_code() {
+        // 机读契约：SSH_FX_NO_SUCH_FILE(2) 必须以 "status 2" 出现在错误串里
+        // （sftp_raw::error_status 按 "status N" 解析，smoke_mcp live 契约按
+        // 它断言）；russh-sftp 的 Display 只有文案（"No such file"），数字码
+        // 只能在这里补回。
+        let error = russh_sftp::client::error::Error::Status(russh_sftp::protocol::Status {
+            id: 1,
+            status_code: russh_sftp::protocol::StatusCode::NoSuchFile,
+            error_message: "No such file".to_string(),
+            language_tag: "en".to_string(),
+        });
+        let message = sftp_error(error);
+        assert!(message.contains("status 2"), "{message}");
+        assert!(message.starts_with("SFTP operation failed"), "{message}");
+
+        // 非状态包错误（传输层超时等）保持原样，不伪造状态码。
+        let plain = sftp_error(russh_sftp::client::error::Error::Timeout);
+        assert_eq!(plain, "SFTP operation failed: Timeout");
     }
 
     /// tools/list 尺寸预算（#172 / #203）。计量口径必须写清，避免误读：

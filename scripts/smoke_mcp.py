@@ -204,7 +204,7 @@ def sftp_file_family(proc: subprocess.Popen, next_id: list, connection: dict) ->
     # SSH_FX_NO_SUCH_FILE），绝不静默误报。
     assert "status 2" in call_tool_error(proc, next_id, "sftp_stat", {
         **connection, "path": f"{base}/no-such-probe",
-    })
+    }), "sftp_stat on a missing path must carry the numeric SSH_FX_NO_SUCH_FILE (status 2)"
 
     call_tool(proc, next_id, "ssh_exec", {
         **connection, "command": f"mkdir '{base}/sub' && cp -a '{file_a}' '{base}/sub/probe.txt'",
@@ -226,7 +226,7 @@ def sftp_file_family(proc: subprocess.Popen, next_id: list, connection: dict) ->
     })
     assert "status 2" in call_tool_error(proc, next_id, "sftp_stat", {
         **connection, "path": base,
-    })
+    }), "sftp_stat on a removed directory must carry the numeric SSH_FX_NO_SUCH_FILE (status 2)"
     print("sftp file family round-trip ok (sftp face + shell mutation face)")
 
 

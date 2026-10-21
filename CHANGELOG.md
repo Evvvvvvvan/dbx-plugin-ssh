@@ -23,11 +23,15 @@ This file records user-facing changes for Terminal. Unless noted otherwise, vers
 - **多格式预览**（自 files 插件移植）：图片/Office/PDF/媒体/表格/Markdown 预览链路，sftp/read(offset) 1MiB 流式拼装（≤256MiB），进度/取消/断点续传；sudo 模式整链换 sudo/readFile。
   **Multi-format preview** (ported from the files plugin): image/Office/PDF/media/spreadsheet/Markdown pipelines stream via `sftp/read(offset)` in 1 MiB slices (≤256 MiB) with progress, cancel and resume; sudo mode switches the whole chain to sudo/readFile.
 
+- 新增默认开启的 Alt/Option 按词编辑：←/→ 跳词，Backspace/Delete 删除光标前/后的词；可在终端设置关闭。保留自定义热键、输入法和全屏程序按键，并在词编辑后暂停不可信的补全提示。
+  Add default-on Alt/Option word movement and deletion with a terminal settings opt-out; preserve custom hotkeys, composition and alternate-screen keys, and suppress stale suggestions after word edits.
+
 - **一批 issue 修复**：#214 预览选区高亮、#216 历史面板手动输入联动（打字收起/常驻过滤）、#217 堡垒机目标会话注册表清理、#218 连接过渡反馈、#219 字体控件覆盖态同步、#220 触摸板幽灵拖选守卫、#223 乱码定性文档、#224a 命令参数即时提示 v1、MCP SFTP 错误串回填数字状态码。
   **Issue sweep:** #214 preview selection highlight, #216 history-panel typing linkage, #217 bastion target-session registry cleanup, #218 connection transition feedback, #219 font control override sync, #220 touchpad ghost-drag guard, #223 garbled-text writeup, #224a flag hints v1, and MCP SFTP error strings carrying numeric status codes.
 
 - 完整实测与决策口径见 `docs/PERF_REPORT_SFTP_TURBO.zh-CN.md`（lzpack 微基准三档、真机 100MiB 端到端、跨平台 musl 双架构 check；Windows 构建由 CI windows job 覆盖）。
   Full measurements and decision rationale in `docs/PERF_REPORT_SFTP_TURBO.zh-CN.md`.
+
 ## [0.7.9-beta.2] — 2026-10-19
 
 > 预发布基线说明（延续 0.7.7 系列）：调度任务（task-provider）功能声明继续摘除——DBX 上游尚未发布宿主侧 task-provider 能力。sidecar `task/*` 实现与本地 Shell 连接类型保留，待上游发布后恢复。

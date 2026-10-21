@@ -147,6 +147,28 @@ try {
   await page.goto(`${baseUrl}?render=dom`, { waitUntil: "domcontentloaded", timeout: 30_000 });
   await sleep(2_500);
 
+  // Observe the actual sequenced PTY input, retaining mock ACKs and behavior.
+  await page.evaluate(() => {
+    const send = window.dbxPlugin.sendBinary.bind(window.dbxPlugin);
+    window.__wordEditingBytes = [];
+    window.dbxPlugin.sendBinary = async (channel, data) => {
+      if (channel.startsWith("ssh/terminal/in/")) {
+        const bytes = typeof data === "string" ? Uint8Array.from(atob(data), c => c.charCodeAt(0)) : data instanceof Uint8Array ? data : new Uint8Array(data);
+        window.__wordEditingBytes.push(new TextDecoder().decode(bytes.slice(8)));
+      }
+      return send(channel, data);
+    };
+  });
+  await page.locator(".terminal-host .xterm-helper-textarea").focus();
+  for (const [key, expected] of [["Alt+ArrowLeft", "\x1bb"], ["Alt+ArrowRight", "\x1bf"], ["Alt+Backspace", "\x1b\x7f"], ["Alt+Delete", "\x1bd"]]) {
+    await page.evaluate(() => { window.__wordEditingBytes = []; });
+    await page.keyboard.press(key);
+    await sleep(150);
+    const actual = await page.evaluate(() => window.__wordEditingBytes.join(""));
+    check(`${key} sends exactly one word command`, actual === expected, JSON.stringify(actual));
+  }
+  await page.keyboard.press("Control+c");
+
   async function openSettings() {
     await page.waitForFunction(
       () => {
@@ -293,6 +315,10 @@ try {
   const wordSeparator = page.locator(".settings-pane:visible label.settings-field", { hasText: "Word separators" }).locator("input.mono");
   check("word separators default matches Tabby", (await wordSeparator.inputValue()) === " ()[]{}\\'\"", JSON.stringify(await wordSeparator.inputValue()));
 
+  const wordEditing = page.locator(".settings-pane:visible label.settings-switch-row", { hasText: "Alt/Option word editing" }).locator("[role='switch']");
+  check("word editing defaults on", (await wordEditing.getAttribute("aria-checked")) === "true");
+  await wordEditing.click();
+
   const copyOnSelect = page.locator(".settings-pane:visible label.settings-switch-row", { hasText: "Copy on select" }).locator("[role='switch']");
   check("copy-on-select switch present", (await copyOnSelect.count()) === 1);
   check("copy-on-select default stays on (pre-existing behaviour)", (await copyOnSelect.first().getAttribute("aria-checked")) === "true");
@@ -366,6 +392,7 @@ try {
   await page.locator(".settings-pane:visible label.settings-field", { hasText: "Scrollback" }).locator("input[type='number']").dispatchEvent("change");
   await sleep(300);
   stored = await storedState();
+  check("word editing opt-out persisted", stored.behavior?.altWordEditing === false);
   check("right-click persisted", stored.behavior?.rightClick === "clipboard", JSON.stringify(stored.behavior?.rightClick));
   check("scrollback persisted", stored.behavior?.scrollbackLines === 5000, JSON.stringify(stored.behavior?.scrollbackLines));
   check("legacy select-copy mirror kept for downgrades", stored.behavior?.copyOnSelect === true);
@@ -374,6 +401,7 @@ try {
   await sleep(2_500);
   await openSettings();
   await openCategory(2);
+  check("word editing opt-out replayed", (await wordEditing.getAttribute("aria-checked")) === "false");
   const replayedRightClick = await page
     .locator(".settings-pane:visible input[name='terminal-right-click']")
     .evaluateAll((nodes) => nodes.map((n) => ({ value: n.value, checked: n.checked })));

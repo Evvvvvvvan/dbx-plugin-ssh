@@ -34,6 +34,7 @@ function setupHarness() {
   const term = fakeTerminal();
   const sent: string[] = [];
   const line = ref("");
+  const trusted = ref(true);
   const commandHistory = ref<string[]>(["git status"]);
   const commandRunning = ref(false);
 
@@ -41,6 +42,7 @@ function setupHarness() {
     terminal: () => term,
     sendTerminalBytes: (data) => sent.push(new TextDecoder().decode(data)),
     getPendingTerminalInput: () => line.value,
+    isInputLineTrusted: () => trusted.value,
     appendToPendingTerminalInput: (data) => { line.value += data; },
     commandRunning,
     terminalTransferBusy: ref(false),
@@ -83,7 +85,7 @@ function setupHarness() {
     }
   }
 
-  return { ghost, qc, sent, line, commandHistory, session, typePrefix };
+  return { ghost, qc, sent, line, trusted, commandHistory, session, typePrefix };
 }
 
 describe("useQuickCommands programmatic writes dismiss the ghost (issue #196)", () => {
@@ -136,6 +138,24 @@ describe("useQuickCommands programmatic writes dismiss the ghost (issue #196)", 
     qc.sendQuickCommand({ id: "1", name: "GS", command: "git status" });
 
     expect(sent).toEqual([]);
+    expect(ghost.ghostMatch.value).not.toBeNull();
+  });
+});
+
+
+describe("word editing suggestion suppression", () => {
+  it("does not revive a stale ghost on the next printable key", () => {
+    const { ghost, typePrefix, trusted, line } = setupHarness();
+    typePrefix("git st");
+    expect(ghost.ghostMatch.value).not.toBeNull();
+    trusted.value = false;
+    ghost.refreshGhostAfterInput("\x1bb");
+    typePrefix("a");
+    expect(ghost.ghostMatch.value).toBeNull();
+    trusted.value = true;
+    line.value = "";
+    ghost.refreshGhostAfterInput("\r");
+    typePrefix("git st");
     expect(ghost.ghostMatch.value).not.toBeNull();
   });
 });

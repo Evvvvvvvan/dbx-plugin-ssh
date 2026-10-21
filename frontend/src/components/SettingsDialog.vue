@@ -2285,6 +2285,11 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
             </label>
             <p class="muted settings-note">{{ t("terminalBehavior.altIsMetaHint") }}</p>
             <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="terminalBehavior.altWordEditing" @update:model-value="(v) => updateBehavior({ altWordEditing: v === true })" />
+              <span>{{ t("terminalBehavior.altWordEditing") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("terminalBehavior.altWordEditingHint") }}</p>
+            <label class="settings-field settings-switch-row">
               <Switch size="sm" :model-value="terminalBehavior.scrollOnInput" @update:model-value="(v) => updateBehavior({ scrollOnInput: v === true })" />
               <span>{{ t("terminalBehavior.scrollOnInput") }}</span>
             </label>

@@ -4,9 +4,8 @@
  *
  * Pure front-end: no sidecar involvement, so the whole object persists in one
  * pluginStore key (host host.storage → guarded localStorage → memory; see
- * pluginStore.ts). Every default deliberately reproduces the behavior this
- * plugin already had before the settings existed, so simply upgrading changes
- * nothing; the Tabby defaults are cited next to each field and any deliberate
+ * pluginStore.ts). Defaults preserve existing behavior except word editing,
+ * which is enabled on upgrade; the Tabby defaults are cited next to each field and any deliberate
  * divergence is called out in a comment.
  *
  * Platform notes that shape this module:
@@ -44,6 +43,8 @@ export interface TerminalBehaviorSettings {
   scrollbackLines: number;
   /** Send Alt as Meta. Tabby: false (maps to xterm's macOptionIsMeta). */
   altIsMeta: boolean;
+  /** Map Alt/Option arrows and deletion keys to shell word commands. */
+  altWordEditing: boolean;
   /** Scroll the viewport to the bottom on user input. Tabby: true. */
   scrollOnInput: boolean;
   /** Right-click semantics. Kept at "paste" to preserve this plugin's previous default. */
@@ -71,6 +72,7 @@ export interface TerminalBehaviorSettings {
 export const TERMINAL_BEHAVIOR_DEFAULTS: TerminalBehaviorSettings = {
   scrollbackLines: 25_000,
   altIsMeta: false,
+  altWordEditing: true,
   scrollOnInput: true,
   rightClick: "paste",
   pasteOnMiddleClick: false,
@@ -119,6 +121,7 @@ export function sanitizeTerminalBehavior(raw: unknown, legacySelectCopy?: boolea
   return {
     scrollbackLines: pickInteger(source.scrollbackLines, SCROLLBACK_MIN, SCROLLBACK_MAX, TERMINAL_BEHAVIOR_DEFAULTS.scrollbackLines),
     altIsMeta: pickBoolean(source.altIsMeta, TERMINAL_BEHAVIOR_DEFAULTS.altIsMeta),
+    altWordEditing: pickBoolean(source.altWordEditing, TERMINAL_BEHAVIOR_DEFAULTS.altWordEditing),
     scrollOnInput: pickBoolean(source.scrollOnInput, TERMINAL_BEHAVIOR_DEFAULTS.scrollOnInput),
     rightClick: pickEnum(source.rightClick, RIGHT_CLICK_MODES, TERMINAL_BEHAVIOR_DEFAULTS.rightClick),
     pasteOnMiddleClick: pickBoolean(source.pasteOnMiddleClick, TERMINAL_BEHAVIOR_DEFAULTS.pasteOnMiddleClick),
@@ -253,6 +256,7 @@ export function behaviorEquals(a: TerminalBehaviorSettings, b: TerminalBehaviorS
   return (
     a.scrollbackLines === b.scrollbackLines &&
     a.altIsMeta === b.altIsMeta &&
+    a.altWordEditing === b.altWordEditing &&
     a.scrollOnInput === b.scrollOnInput &&
     a.rightClick === b.rightClick &&
     a.pasteOnMiddleClick === b.pasteOnMiddleClick &&

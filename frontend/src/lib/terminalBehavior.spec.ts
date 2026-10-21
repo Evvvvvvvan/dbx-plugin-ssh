@@ -48,6 +48,16 @@ describe("TERMINAL_BEHAVIOR_DEFAULTS", () => {
 });
 
 describe("sanitizeTerminalBehavior", () => {
+  it("enables word editing on upgrade and persists an explicit opt-out", () => {
+    expect(sanitizeTerminalBehavior({ altIsMeta: false }).altWordEditing).toBe(true);
+    expect(sanitizeTerminalBehavior({ altWordEditing: "false" }).altWordEditing).toBe(true);
+    const data = new Map<string, string>();
+    const storage = { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => { data.set(key, value); } };
+    const disabled = settings({ altWordEditing: false });
+    persistTerminalBehavior(disabled, storage);
+    expect(loadTerminalBehavior(storage).altWordEditing).toBe(false);
+    expect(behaviorEquals(settings(), disabled)).toBe(false);
+  });
   it("非对象输入整体回落默认", () => {
     expect(sanitizeTerminalBehavior(undefined)).toEqual(TERMINAL_BEHAVIOR_DEFAULTS);
     expect(sanitizeTerminalBehavior(null)).toEqual(TERMINAL_BEHAVIOR_DEFAULTS);

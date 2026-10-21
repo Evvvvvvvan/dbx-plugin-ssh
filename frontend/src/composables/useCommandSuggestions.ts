@@ -29,6 +29,7 @@ export function useCommandSuggestions(options: {
   getTerminalHost: () => HTMLElement | null | undefined;
   sendTerminalBytes: (data: Uint8Array) => void;
   getPendingTerminalInput: () => string;
+  isInputLineTrusted?: () => boolean;
   setPendingTerminalInput: (value: string) => void;
   commandRunning: Ref<boolean>;
   isTerminalTransferBusy: () => boolean;
@@ -269,6 +270,7 @@ const completionController = new CompletionController({
   enabled: () =>
     loadCompletionEngine() !== "off" &&
     completionInputAllowed &&
+    options.isInputLineTrusted?.() !== false &&
     !isTerminalTransferBusy() &&
     !commandRunning.value,
   generators: completionGeneratorChannel,
@@ -379,6 +381,10 @@ function suggestionTypingChar(data: string): string | null {
  * 与 guard 抑制面一律关门。
  */
 function refreshSuggestionsAfterInput(data: string, lineBefore: string) {
+  if (options.isInputLineTrusted?.() === false) {
+    closeSuggestions();
+    return;
+  }
   // Warp 式 history 面板开启期间：建议/补全/ghost 浮层全部让位（同屏不叠
   // 两层浮层），面板按最新行缓冲实时过滤；面板关闭后的下一次键入恢复常规
   // 调度（guard 锁存暂停推进——面板期间 ↑↓/Enter 均被吞键，不会产生命令）。

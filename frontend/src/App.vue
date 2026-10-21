@@ -318,6 +318,7 @@ import {
   terminalOptionPatch,
   type TerminalAppearanceState,
 } from "./lib/terminalAppearance";
+import { terminalWordEditingInput, wordEditingLineUntrusted } from "./lib/terminalWordEditing";
 import { BUILTIN_TERMINAL_SCHEMES, schemeTone } from "./lib/terminalScheme";
 import {
   loadTerminalBehavior,
@@ -1019,8 +1020,10 @@ const {
   getTerminalHost: () => terminalHost.value,
   sendTerminalBytes,
   getPendingTerminalInput: () => pendingTerminalInput,
+  isInputLineTrusted: () => !wordEditedLineUntrusted,
   setPendingTerminalInput: (value) => {
     pendingTerminalInput = value;
+    wordEditedLineUntrusted = false;
     // 同 trackPendingInput：整行替换（回填/接受）也改变行空态。
     promptHintsLineEmpty.value = value === "";
     flagHintLine.value = value;
@@ -1361,6 +1364,7 @@ let replayInFlight = false;
 let replayNoProgress = 0;
 let commandMarkerTimer = 0;
 let pendingTerminalInput = "";
+let wordEditedLineUntrusted = false;
 let activeTerminalSessionId = "";
 const pendingTerminalFrames = new Map<number, { stream: number; data: Uint8Array }>();
 const directoryParser = new Osc7DirectoryParser();
@@ -2591,7 +2595,19 @@ function handleTerminalKey(event: KeyboardEvent) {
     return consume();
   const combo = keyComboFromEvent(event);
   if (!combo) return true;
-  switch (matchTerminalHotkey(terminalHotkeys.value, combo)) {
+  const hotkey = matchTerminalHotkey(terminalHotkeys.value, combo);
+  const wordInput = terminalWordEditingInput(event, {
+    enabled: terminalBehavior.value.altWordEditing,
+    alternateActive: terminal?.buffer.active.type === "alternate",
+    hotkeyMatched: hotkey != null,
+  });
+  if (wordInput !== undefined && terminal) {
+    // input() fires onData: keep transfer gates, AI routing, history tracking
+    // and the ordered PTY queue shared with native xterm keyboard input.
+    terminal.input(wordInput, true);
+    return consume();
+  }
+  switch (hotkey) {
     case "search":
       openTerminalSearch();
       return consume();
@@ -3295,6 +3311,7 @@ const enterLineTracker = new EnterLineTracker();
 let pendingContinuation = "";
 
 function trackPendingInput(data: string) {
+  wordEditedLineUntrusted = wordEditingLineUntrusted(wordEditedLineUntrusted, data);
   if (data.includes("\u001b")) {
     // ESC 序列块（↑ 召回 / Home / End / 方向键）：readline 会改写整行，键入
     // 模型自此失真——整块跳过模型记账（原行为不变），但改写事件必须记账，
@@ -3457,6 +3474,7 @@ const {
   terminal: () => terminal,
   sendTerminalBytes,
   getPendingTerminalInput: () => pendingTerminalInput,
+  isInputLineTrusted: () => !wordEditedLineUntrusted,
   appendToPendingTerminalInput: (data) => { pendingTerminalInput += data; },
   commandRunning, terminalTransferBusy, commandHistory, quickCommands,
   suggestionOpen, historyPanelOpen, completionController,
@@ -3627,6 +3645,7 @@ function resetCommandMarker() {
   commandMarker.cwd = "";
   commandMarker.startedAt = null;
   // 会话切换/断开：建议浮层与抑制门锁存一并复位（P1-1）；ghost 门同步复位。
+  wordEditedLineUntrusted = false;
   resetSuggestionsForSession();
   closeHistoryPanel();
   resetGhostSuggestion();

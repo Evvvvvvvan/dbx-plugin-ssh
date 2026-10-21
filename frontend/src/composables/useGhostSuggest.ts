@@ -14,6 +14,7 @@ export function useGhostSuggest(options: {
   terminal: () => Terminal | undefined;
   sendTerminalBytes: (data: Uint8Array) => void;
   getPendingTerminalInput: () => string;
+  isInputLineTrusted?: () => boolean;
   appendToPendingTerminalInput: (data: string) => void;
   commandRunning: Ref<boolean>;
   terminalTransferBusy: Ref<boolean>;
@@ -137,6 +138,10 @@ function syncGhostAnchorOnSettle() {
 }
 
 function updateGhostSuggestion() {
+  if (options.isInputLineTrusted?.() === false) {
+    hideGhostSuggestion();
+    return;
+  }
   // 历史建议浮层开着时不出 ghost（数据分工后浮层开着 = 无前缀命中，此判是
   // 竞态兜底）；结构化补全菜单**不再抑制** ghost——同屏共存（对标 Warp：菜单
   // 只占用 ↑↓/Tab/Esc，→ 恒归 ghost 接受，空间上菜单在光标行上/下、ghost 是

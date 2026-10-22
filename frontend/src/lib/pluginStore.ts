@@ -85,6 +85,9 @@ export const PLUGIN_STORE_KEYS: readonly string[] = [
   // 重启永远读不回（issue #178），补登记后恢复持久化。
   "ssh-terminal-prompt-hints-enabled",
   "ssh-terminal-prompt-hints-dismissed",
+  // 命令参数即时提示开关（issue #224 第 1 条，flagHints.ts 自治读写）：
+  // 漏登记 = 真机写入落盘但水合不拉，重启读不回（#178 白名单教训同款）。
+  "ssh-terminal-flag-hints-enabled",
   // 跨重启的布局/视图全局偏好（issue #178）：单键 JSON（paneOrder/splitRatio/
   // SFTP 面板开合/列显隐与列宽/显示隐藏文件/排序），writeWorkbenchState 写穿。
   "ssh-workbench-layout",

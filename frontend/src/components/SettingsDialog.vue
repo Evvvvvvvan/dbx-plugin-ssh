@@ -455,6 +455,7 @@ const props = defineProps<{
   aiBridgeReady: boolean;
   /** 空提示符快捷键引导条开关（权威态在 App）：只读 + 上抛改动。 */
   promptHintsEnabled: boolean;
+  flagHintEnabled: boolean;
   /** 终端快捷键绑定（对标 Tabby「Hotkeys」页）：权威态在 App。 */
   terminalHotkeys: TerminalHotkeyBindings;
   /** 是否 Apple 平台：决定快捷键修饰键的显示符号与默认键位口径。 */
@@ -560,6 +561,7 @@ const emit = defineEmits<{
   (e: "reset-ai-consent"): void;
   /** 空提示符快捷键引导条开关（权威态在 App；App 侧重开时会顺带清消散旗标）。 */
   (e: "update:promptHintsEnabled", value: boolean): void;
+  (e: "update:flagHintEnabled", value: boolean): void;
   /** 行为设置局部增量：App 侧会归一化 + 持久化 + 即时落地到 xterm 选项。 */
   (e: "update-behavior", patch: Partial<TerminalBehaviorSettings>): void;
   /** 分栏布局方向改动（issue #187）：App 侧持久化 + 重排终端。 */
@@ -2484,6 +2486,13 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               <span>{{ t("terminalHints.settingsLabel") }}</span>
             </label>
             <p class="muted settings-note">{{ t("terminalHints.settingsHint") }}</p>
+            <!-- 命令参数即时提示条开关（issue #224 第 1 条）：行尾键入
+                 -X/--flag 命中语料即在提示符上方浮释义；零按键纯展示。 -->
+            <label class="settings-field settings-switch-row">
+              <Switch :model-value="flagHintEnabled" size="sm" @update:model-value="emit('update:flagHintEnabled', Boolean($event))" />
+              <span>{{ t("flagHint.settingsLabel") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("flagHint.settingsHint") }}</p>
             </div>
 
 

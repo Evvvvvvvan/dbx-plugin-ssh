@@ -9,6 +9,25 @@ This file records user-facing changes for Terminal. Unless noted otherwise, vers
 - **定时任务支持本地 Shell 目标与脚本文件**。调度任务编辑器新增两处能力：任务连接可选「本地 Shell」（新连接类型 `io.dbx.ssh.local`——表单只有连接名与可选 Shell 绝对路径，无网络端点、无凭据），让定时/常驻命令直接运行在 DBX 所在机器上（进程级应用环境变量与工作目录，流式日志、取消、超时与 SSH 同契约；取消/超时按进程组 TERM→SIGKILL 清理，本地路径忽略 PTY 选项）；两个触发器均新增可选「脚本文件」字段（带本机文件选择器），与「命令」互斥、至少填一个——SSH 连接把脚本上传到远端 `mktemp` 临时文件以 bash（无则 sh）执行、run 结束必删临时文件，本地 Shell 直接执行该文件。本地化覆盖全部既有语言。
   **Scheduled tasks gain a local shell target and script files.** The task editor adds two capabilities: task connections may bind a "Local shell" target (new connection type `io.dbx.ssh.local` — the form carries only a display name and an optional absolute shell path, no network endpoint and no credentials) so scheduled and resident commands run on the machine running DBX itself (environment and working directory apply at the process level; streaming logs, cancel and timeout follow the same contract as SSH, with cancel/timeout tearing down the whole process group TERM→SIGKILL; the PTY field is ignored on local targets); and both triggers gain an optional "Script file" field (with a native file picker), mutually exclusive with "Command" and at least one required — SSH targets upload the script to a remote `mktemp` temp file, run it with bash (falling back to sh) and always remove the temp file afterwards, while local-shell targets execute the file directly. Localizations cover every shipped language.
 
+## [0.7.9-beta.3] — 2026-10-23
+
+> 预发布基线说明（延续 0.7.7 系列）：调度任务（task-provider）功能声明继续摘除——DBX 上游尚未发布宿主侧 task-provider 能力。sidecar `task/*` 实现与本地 Shell 连接类型保留，待上游发布后恢复。
+> **Pre-release note (carried over from the 0.7.7 line):** the scheduler task-provider contribution stays withheld — the DBX host has not shipped the task-provider capability yet. The sidecar `task/*` implementation and the Local shell connection type are kept; the declaration returns once upstream ships.
+
+- **SFTP 自适应传输引擎一期**。三块能力：①自研 lzpack 压缩包模式（`sftp/upload/start` 增 `mode:"lzpack"` 交付 `<目标名>.dbxz`；`sftp/download/start` 增 `expandLzpack:true` 还原原始文件）——压缩/解压全在本地（DBXZ v1 容器，LZ77 + RAW 回退），远端零依赖，shell-less 服务器完整可用，文件菜单新增「压缩上传为 .dbxz / 解压 .dbxz」两入口；②下载预取与裸包写流水线：普通单文件下载后台预读下一片（命中省一个整 RTT），latin-1 裸包上传改 8×32KiB 有界在途窗口统一收 ACK，高延迟链路吞吐显著提升；③传输性能模型：每连接上传/下载分离 EMA 带宽 + codec 实测吞吐回灌，显式压缩 start 时顾问预测（样本不足沉默、负收益仅日志提示不拦截），连接断开清理档案。
+  **Adaptive SFTP transfer engine, phase one.** Three blocks: (1) self-contained lzpack archive mode (`mode:"lzpack"` on upload delivers `<name>.dbxz`; `expandLzpack:true` on download restores the original file) — compression and decompression run entirely locally (DBXZ v1 container, LZ77 with RAW fallback), zero remote dependencies, fully usable on shell-less servers; the file menu gains "Upload as compressed (.dbxz)" and "Expand .dbxz" entries. (2) Download prefetch and raw-write pipelining: plain single-file downloads pre-read the next chunk in the background (a hit saves a full RTT), latin-1 raw uploads switch to a bounded 8×32 KiB in-flight window with batched ACKs, markedly better throughput on high-latency links. (3) Transfer performance model: per-connection upload/download EMA bandwidth plus measured codec throughput, an advisor prediction on explicit-compression starts (silent when under-sampled, log-only on negative gain — never blocks), and profile cleanup on disconnect.
+
+- **sudo PTY 车道修复**（`sudo_use_pty` 连接）：PTY 下 sudo/PAM 密码读取器冲掉预灌输入（termios TCSAFLUSH），原管道路径提示词永不渲染导致挂满超时；现走「可见提示词 + watcher 补答 + 输出剥提示词」，sudo 车道 SFTP 操作不再假死。
+  **sudo PTY lane fix** (for `sudo_use_pty` connections): under a PTY the sudo/PAM password reader flushes typed-ahead input (termios TCSAFLUSH), so the pipe-path silent prompt never rendered and every sudo-lane SFTP op ran to full timeout; now uses a visible prompt with watcher answering and prompt stripping from output.
+
+- **多格式预览**（自 files 插件移植）：图片/Office/PDF/媒体/表格/Markdown 预览链路，sftp/read(offset) 1MiB 流式拼装（≤256MiB），进度/取消/断点续传；sudo 模式整链换 sudo/readFile。
+  **Multi-format preview** (ported from the files plugin): image/Office/PDF/media/spreadsheet/Markdown pipelines stream via `sftp/read(offset)` in 1 MiB slices (≤256 MiB) with progress, cancel and resume; sudo mode switches the whole chain to sudo/readFile.
+
+- **一批 issue 修复**：#214 预览选区高亮、#216 历史面板手动输入联动（打字收起/常驻过滤）、#217 堡垒机目标会话注册表清理、#218 连接过渡反馈、#219 字体控件覆盖态同步、#220 触摸板幽灵拖选守卫、#223 乱码定性文档、#224a 命令参数即时提示 v1、MCP SFTP 错误串回填数字状态码。
+  **Issue sweep:** #214 preview selection highlight, #216 history-panel typing linkage, #217 bastion target-session registry cleanup, #218 connection transition feedback, #219 font control override sync, #220 touchpad ghost-drag guard, #223 garbled-text writeup, #224a flag hints v1, and MCP SFTP error strings carrying numeric status codes.
+
+- 完整实测与决策口径见 `docs/PERF_REPORT_SFTP_TURBO.zh-CN.md`（lzpack 微基准三档、真机 100MiB 端到端、跨平台 musl 双架构 check；Windows 构建由 CI windows job 覆盖）。
+  Full measurements and decision rationale in `docs/PERF_REPORT_SFTP_TURBO.zh-CN.md`.
 ## [0.7.9-beta.2] — 2026-10-19
 
 > 预发布基线说明（延续 0.7.7 系列）：调度任务（task-provider）功能声明继续摘除——DBX 上游尚未发布宿主侧 task-provider 能力。sidecar `task/*` 实现与本地 Shell 连接类型保留，待上游发布后恢复。

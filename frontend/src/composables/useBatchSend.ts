@@ -6,6 +6,7 @@ import {
   applyConnectionNames,
   batchTargetLabel,
   deriveBatchCommandName,
+  filterLiveBatchTargets,
   normalizeBatchTargets,
   normalizeLocalBatchTargets,
   selectBatchTargets,
@@ -169,7 +170,8 @@ async function refreshBatchTargets() {
   try {
     const response = await window.dbxPlugin.invoke<{ sessions: unknown }>("ssh/sessions/list");
     // 批量目标包含本地终端：同是"向 PTY 键盘写入"，发送阶段按通道分流。
-    let targets = normalizeBatchTargets(response.sessions);
+    // 死会话（关闭竞态滞留的 connected:false 行，issue #217）不进列表/计数。
+    let targets = filterLiveBatchTargets(normalizeBatchTargets(response.sessions));
     try {
       const local = await window.dbxPlugin.invoke<{ sessions?: unknown }>("local/session/list", {}, { timeoutMs: 5000 });
       targets = [...targets, ...normalizeLocalBatchTargets(local?.sessions)];

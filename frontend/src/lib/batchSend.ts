@@ -82,6 +82,17 @@ export function normalizeBatchTargets(raw: unknown): BatchSendTarget[] {
 }
 
 /**
+ * 目标列表/计数只保留活会话（issue #217）：关闭与列取的竞态可能让后端注册表
+ * 短暂滞留 `connected: false` 的死行，而批量写入是对 PTY 键盘打字——死会话既
+ * 列不出也写不进，留在面板里只会让「目标会话 (N/M)」对不上实际标签数。缺
+ * liveness 字段的行（旧 sidecar、本地终端目标）无从判定，一律保留，本地目标
+ * 由发送前的存活复核兜底。
+ */
+export function filterLiveBatchTargets(targets: BatchSendTarget[]): BatchSendTarget[] {
+  return targets.filter((target) => target.connected !== false);
+}
+
+/**
  * 归一 `local/session/list` 返回为批量目标：本地 shell 与 SSH 会话同一发送语义
  * （向 PTY 键盘写入），connectionId 留空、行标签用 `Local · <shell>`。
  */

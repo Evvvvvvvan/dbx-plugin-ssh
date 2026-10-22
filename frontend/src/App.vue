@@ -108,6 +108,7 @@ import {
 } from "./lib/terminalInteraction";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
 import { createOutputGate } from "./lib/terminalBackpressure";
+import { createGhostSelectionGuard } from "./lib/terminalGhostSelectionGuard";
 import { createTerminalInputQueue, terminalInputChannel, TerminalInputTimeoutError } from "./lib/terminalInputQueue";
 import { SERIAL_STREAM_STDIN, isKnownStreamTag, supportsBinaryInput } from "./lib/serialTerminalFrames";
 import { describeReconnectRestoredNotice, isConnectionInactiveError, isSessionGoneError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS } from "./lib/terminalReconnect";
@@ -1256,6 +1257,17 @@ let terminalWheelHandler: ((event: WheelEvent) => void) | undefined;
 // 点击定位光标（iTerm2 风格）：按下位置记忆 + 松开时判定“原地点击”。
 let terminalMouseDownHandler: ((event: MouseEvent) => void) | undefined;
 let terminalMouseUpHandler: ((event: MouseEvent) => void) | undefined;
+let terminalMouseMoveHandler: ((event: MouseEvent) => void) | undefined;
+let ghostSelectionGuardHostMouseDownHandler: (() => void) | undefined;
+let ghostSelectionGuardHostMouseMoveHandler: ((event: MouseEvent) => void) | undefined;
+// #220 触摸板幽灵拖选守卫：上游 SelectionService._handleMouseMove 武装后不
+// 检查 event.buttons——mouseup 被 IME 候选窗/触摸板手势吞掉后，无按键移动
+// 鼠标会持续扩展选区（直到 Esc/回车）。守卫在无按键移动且选区串持续变化时
+// 清一次选区（纯逻辑在 lib/terminalGhostSelectionGuard，单测锁定误清边界）。
+const ghostSelectionGuard = createGhostSelectionGuard({ clearSelection: () => terminal?.clearSelection() });
+function onWindowMouseUpGhostGuard() {
+  ghostSelectionGuard.onMouseUp();
+}
 let pasteConfirmResolver: ((accepted: boolean) => void) | undefined;
 // 通用应用内确认弹窗（SSH-H1）：原语在 lib/confirmDialog（SettingsDialog/
 // QuickCommandsSection 等子组件共用），此处只挂宿主渲染；模板/关框/Esc/
@@ -2334,6 +2346,19 @@ function createTerminal() {
   terminalHost.value.addEventListener("mousedown", terminalMouseDownHandler);
   terminalMouseUpHandler = (event) => handleTerminalMouseUp(event);
   terminalHost.value.addEventListener("mouseup", terminalMouseUpHandler);
+  // #220 守卫接线：mousedown/mouseup 只喂状态机（真实拖选不干预），mousemove
+  // 做无按键扩展判定——两拍窗口内选区串持续变化即清一次。监听挂终端宿主，
+  // 与既有 per-terminal 处理器同生命周期（onBeforeUnmount 成对摘除）。
+  ghostSelectionGuardHostMouseDownHandler = () => ghostSelectionGuard.onMouseDown();
+  terminalHost.value.addEventListener("mousedown", ghostSelectionGuardHostMouseDownHandler, true);
+  ghostSelectionGuardHostMouseMoveHandler = (event) => {
+    const verdict = ghostSelectionGuard.onMouseMove({
+      buttons: event.buttons,
+      selection: terminal?.hasSelection() ? terminal.getSelection() ?? null : null,
+    });
+    if (verdict === "cleared") terminal?.clearSelection();
+  };
+  terminalHost.value.addEventListener("mousemove", ghostSelectionGuardHostMouseMoveHandler);
   // 终端宿主尺寸变化（窗口缩放/命令条让位）时：fit 重排行数之外，还要
   // 重读建议浮层锚点——光标行/列的像素位置随行高与滚动变化，浮层开着时
   // 停在旧位置会错位或越过新边界（review 第二批：resize 主动重定位）。
@@ -8424,6 +8449,9 @@ onMounted(() => {
   folderUploadSupported.value = "webkitdirectory" in folderProbe;
   document.addEventListener("click", onDocumentClickCapture, true);
   document.addEventListener("mousedown", onDocumentMouseDownCapture, true);
+  // #220：window 捕获的 mouseup 兜底——mouseup 落在终端外（或被 IME 候选窗
+  // 吞掉后仍可能漏到 window）时也复位守卫状态机，避免把正常移动误判幽灵。
+  window.addEventListener("mouseup", onWindowMouseUpGhostGuard, true);
   document.addEventListener("keydown", onDocumentKeydown);
   document.addEventListener("focusin", trackStableFocus);
   document.addEventListener("mouseover", onTooltipOver);
@@ -8473,6 +8501,9 @@ onBeforeUnmount(() => {
     if (terminalWheelHandler) terminalHost.value.removeEventListener("wheel", terminalWheelHandler, true);
     if (terminalMouseDownHandler) terminalHost.value.removeEventListener("mousedown", terminalMouseDownHandler);
     if (terminalMouseUpHandler) terminalHost.value.removeEventListener("mouseup", terminalMouseUpHandler);
+    if (ghostSelectionGuardHostMouseDownHandler) terminalHost.value.removeEventListener("mousedown", ghostSelectionGuardHostMouseDownHandler, true);
+    if (ghostSelectionGuardHostMouseMoveHandler) terminalHost.value.removeEventListener("mousemove", ghostSelectionGuardHostMouseMoveHandler);
+    window.removeEventListener("mouseup", onWindowMouseUpGhostGuard, true);
   }
   document.removeEventListener("click", onDocumentClickCloseMenus);
   document.removeEventListener("click", onDocumentClickCapture, true);

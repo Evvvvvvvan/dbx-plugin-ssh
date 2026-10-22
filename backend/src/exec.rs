@@ -102,6 +102,38 @@ pub fn sanitize_sudo_command(command: &str) -> String {
     format!("sh -c '{escaped}'")
 }
 
+/// Prompt rendered by the PTY sudo lane. With a PTY the sudo/PAM password
+/// reader flushes typed-ahead input (termios TCSAFLUSH), so phase 1's pipe
+/// cannot be relied on and recovery rides prompt detection — which needs a
+/// prompt that actually renders and matches [`PASSWORD_PROMPT_PATTERNS`].
+/// The pipe path's `-p ''` renders nothing and left sudo blocked on the TTY
+/// until the exec deadline (every SFTP sudo op hung for its full timeout).
+pub(crate) const SUDO_PTY_PROMPT: &str = "[sudo] password: ";
+
+/// Builds the `sudo -S` command line: a silent prompt on the pipe path
+/// (password arrives via stdin before any prompt is watched), a detectable
+/// prompt on the PTY path (the watcher answers what it can see).
+fn sudo_command_line(use_pty: bool, command: &str) -> String {
+    let prompt_flag = if use_pty {
+        format!("-p '{}'", SUDO_PTY_PROMPT)
+    } else {
+        "-p ''".to_string()
+    };
+    format!("sudo -S {prompt_flag} {}", sanitize_sudo_command(command))
+}
+
+/// Removes the PTY lane's rendered prompt(s) from the head of exec output so
+/// downstream consumers (base64 reads, `echo 1` probes, ls/stat parsers) see
+/// only the command's own output. Retry rounds stack several prompts; only
+/// leading echoes are stripped.
+fn strip_sudo_pty_prompt(output: &str) -> &str {
+    let mut current = output;
+    while let Some(rest) = current.strip_prefix(SUDO_PTY_PROMPT) {
+        current = rest;
+    }
+    current
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // 变体名刻意与协议值一一对应（off / password_only / password_plus_otp /
 // password_then_otp），共享的 Password 前缀是契约不是冗余。
@@ -1057,7 +1089,7 @@ pub async fn exec_with_sudo_cancellable(
         return Ok(outcome);
     }
 
-    let command_line = format!("sudo -S -p '' {}", sanitize_sudo_command(command));
+    let command_line = sudo_command_line(use_pty, command);
     let mut channel = tokio::select! {
         biased;
         _ = wait_cancelled(cancel) => return Err(EXEC_CANCELLED_MESSAGE.to_string()),
@@ -1092,33 +1124,40 @@ pub async fn exec_with_sudo_cancellable(
         } => started?,
     }
 
-    // Phase 1: hand sudo the password, with the OTP code (when configured)
-    // queued right behind it - `sudo -S` and its PAM stack read the factors
-    // sequentially from stdin. The exec channel stays TTY-less: with a PTY
-    // each factor read flushes typed-ahead input (termios TCSAFLUSH in the
-    // password readers), so automated writes race an unknowable per-host
-    // timing; a plain pipe queues reliably no matter when the reads happen.
-    let mut payload = format!("{}\n", auth.password).into_bytes();
-    let mut otp_piped = false;
-    if let Some(code) = auth.totp_answer_logged() {
-        // Already-committed codes inside their replay window are skipped by
-        // the watcher path below instead.
-        let mut otp_line = code.into_bytes();
-        otp_line.push(b'\n');
-        payload.extend_from_slice(&otp_line);
-        otp_piped = true;
-    }
-    if let Err(error) = channel.data(payload.as_slice()).await {
-        return Err(abort_exec_channel(
-            &mut channel,
-            format!("Failed to write sudo password: {error}"),
-        )
-        .await);
-    }
+    // Phase 1 (pipe path only): hand sudo the password, with the OTP code
+    // (when configured) queued right behind it - `sudo -S` and its PAM stack
+    // read the factors sequentially from stdin. With a PTY nothing is
+    // pre-piped: the password reader flushes typed-ahead input (termios
+    // TCSAFLUSH in the password readers), so the write would be discarded
+    // (and echoed into the output stream before the flush) — the watcher
+    // below answers the rendered prompt instead.
+    let otp_piped = if !use_pty {
+        let mut payload = format!("{}\n", auth.password).into_bytes();
+        let mut otp_piped = false;
+        if let Some(code) = auth.totp_answer_logged() {
+            // Already-committed codes inside their replay window are skipped by
+            // the watcher path below instead.
+            let mut otp_line = code.into_bytes();
+            otp_line.push(b'\n');
+            payload.extend_from_slice(&otp_line);
+            otp_piped = true;
+        }
+        if let Err(error) = channel.data(payload.as_slice()).await {
+            return Err(abort_exec_channel(
+                &mut channel,
+                format!("Failed to write sudo password: {error}"),
+            )
+            .await);
+        }
+        otp_piped
+    } else {
+        false
+    };
 
-    // Phase 2: watch for follow-up prompts and collect output. Both factors
-    // were piped, so the watcher only answers hosts that re-prompt and
-    // reports sudo's authentication failures.
+    // Phase 2: watch for follow-up prompts and collect output. On the pipe
+    // path both factors were piped, so the watcher only answers hosts that
+    // re-prompt and reports sudo's authentication failures; on the PTY path
+    // it answers the rendered password/OTP prompts from scratch.
     let outcome = match run_to_completion(
         &mut channel,
         timeout,
@@ -1135,6 +1174,15 @@ pub async fn exec_with_sudo_cancellable(
             "sudo exited {}: {}",
             outcome.exit_code, outcome.output
         ));
+    }
+    if use_pty {
+        // The rendered prompt rode the merged PTY stream ahead of the
+        // command's own output; strip it so base64 reads, `echo 1` probes
+        // and ls/stat parsers see only the command output.
+        return Ok(ExecOutcome {
+            output: strip_sudo_pty_prompt(&outcome.output).to_string(),
+            exit_code: outcome.exit_code,
+        });
     }
     Ok(outcome)
 }
@@ -1208,7 +1256,14 @@ async fn run_to_completion(
     let mut exit_code: Option<i32> = None;
     let mut closed = false;
     let mut auth_rounds = 0_u32;
-    let mut password_answered = prompt_context.is_some();
+    // The pipe path pre-pipes the password before any prompt is watched
+    // (`password_answered` starts true); on the PTY path nothing is
+    // pre-piped — the flushed write never reached sudo — so the rendered
+    // prompt must be answered from scratch.
+    let mut password_answered = prompt_context
+        .as_ref()
+        .map(|(_, use_pty, _)| !use_pty)
+        .unwrap_or(false);
     let mut otp_answered = prompt_context
         .as_ref()
         .map(|(_, _, otp_piped)| *otp_piped)
@@ -3213,6 +3268,51 @@ C:/Program Files/Git   100955784  60314920  40640864      60% /
     #[test]
     fn shell_quotes_paths() {
         assert_eq!(shell_quote("/var/log/it's"), "'/var/log/it'\\''s'");
+    }
+
+    #[test]
+    fn sudo_command_line_keeps_silent_prompt_on_the_pipe_path() {
+        // 无 PTY 时密码经管道预灌，`-p ''` 避免提示词污染输出——既有契约。
+        assert_eq!(
+            sudo_command_line(false, "ls -la"),
+            "sudo -S -p '' sh -c 'ls -la'"
+        );
+    }
+
+    #[test]
+    fn sudo_command_line_renders_detectable_prompt_on_the_pty_path() {
+        // PTY 密码读取器会冲掉预灌输入（TCSAFLUSH），兜底只能靠提示词检测；
+        // 提示词必须真的渲染且能被 PASSWORD_PROMPT_PATTERS 命中——`-p ''`
+        // 会让 sudo 在 TTY 上等一个永远等不到的密码，直到 exec 超时。
+        let line = sudo_command_line(true, "ls -la");
+        assert!(!line.contains("-p ''"));
+        assert!(line.contains(SUDO_PTY_PROMPT));
+        assert!(line.starts_with("sudo -S -p '"));
+        assert!(line.ends_with("sh -c 'ls -la'"));
+        // 提示词必须命中内置密码提示匹配（watcher 分类的前提）。
+        let lowered = SUDO_PTY_PROMPT.to_lowercase();
+        assert!(PASSWORD_PROMPT_PATTERS.iter().any(|p| lowered.contains(p)));
+    }
+
+    #[test]
+    fn strip_sudo_pty_prompt_removes_only_leading_prompt_echoes() {
+        // 认证后命令输出从提示词同一行继续：单次提示词被剥掉。
+        assert_eq!(
+            strip_sudo_pty_prompt("[sudo] password: total 20\ndrwx"),
+            "total 20\ndrwx"
+        );
+        // 错误密码重试轮次会连续渲染多份提示词。
+        assert_eq!(
+            strip_sudo_pty_prompt("[sudo] password: [sudo] password: 1"),
+            "1"
+        );
+        // 时间戳有效时无提示词，输出原样。
+        assert_eq!(strip_sudo_pty_prompt("inner.txt\n"), "inner.txt\n");
+        // 命令自身输出中出现的同形文本不在头部，不剥。
+        assert_eq!(
+            strip_sudo_pty_prompt("ok\n[sudo] password: "),
+            "ok\n[sudo] password: "
+        );
     }
 
     #[test]

@@ -1474,6 +1474,61 @@ def main() -> None:
         report.run("sudo/removeAll .sudo-test", "sudo/removeAll", case_sudo_remove_all,
                    needs="sudo/mkdir .sudo-test")
 
+        # -- sudo PTY lane group ------------------------------------------------
+        # 连接级 sudo_use_pty=true 的回归：PTY 下 sudo 的 TTY 密码读取器会冲掉
+        # 预灌输入（TCSAFLUSH），修复后走「可见提示词 + watcher 补答 + 输出剥
+        # 提示词」。每条 exec 各自分配新 PTY，tty_tickets 使时间戳不跨通道，
+        # 密码认证容器上每步都会真实走提示词路径。listDir/exists/stat 恰好
+        # 覆盖提示词残留最敏感的三种输出消费（ls 解析、echo 探针、stat 分列）。
+        pty_conn_id = "smoke-fs-pty-conn"
+        pty_connection = dict(
+            connection,
+            id=pty_conn_id,
+            name="smoke-fs-pty",
+            external_config={"authentication": "password", "sudo_use_pty": True},
+        )
+        pty_session_state: dict = {}
+
+        def case_sudo_pty_session_open():
+            client.request("connection/connect", lifecycle_params(pty_connection))
+            session = req("ssh/session/open",
+                          {"connectionId": pty_conn_id, "workbenchId": "smoke-fs-pty",
+                           "cols": 120, "rows": 30})
+            pty_session_state["id"] = session.get("sessionId", "smoke-fs-pty")
+            print(f"    pty session {pty_session_state['id']}")
+
+        def case_sudo_pty_listdir():
+            result = req("sudo/listDir", {"sessionId": pty_session_state["id"], "path": home})
+            names = [str(e.get("name")) for e in result.get("entries", [])]
+            if not names:
+                raise AssertionError(f"sudo/listDir (pty) {home}: unexpectedly empty")
+            if any("password" in name.lower() for name in names):
+                raise AssertionError(f"sudo prompt leaked into listing: {names[:5]}")
+            print(f"    sudo/listDir (pty) {home}: {len(names)} entries")
+
+        def case_sudo_pty_exists_and_stat():
+            sid = pty_session_state["id"]
+            present = req("sudo/exists", {"sessionId": sid, "path": home})
+            if present.get("exists") is not True:
+                raise AssertionError(f"sudo/exists (pty) {home} -> {json.dumps(present)[:120]}")
+            stat = req("sudo/stat", {"sessionId": sid, "path": home})
+            kind = entry_kind(stat)
+            if kind != "directory":
+                raise AssertionError(f"sudo/stat (pty) {home} kind={kind!r}, want 'directory'")
+            print(f"    sudo/exists+stat (pty): exists=true kind={kind}")
+
+        def case_sudo_pty_session_close():
+            req("ssh/session/close", {"sessionId": pty_session_state["id"]})
+
+        print("\n--- sudo PTY lane group ---")
+        report.run("sudo pty session open", "connection/connect", case_sudo_pty_session_open)
+        report.run("sudo/listDir (pty lane)", "sudo/listDir", case_sudo_pty_listdir,
+                   needs="sudo pty session open")
+        report.run("sudo/exists+stat (pty lane)", "sudo/exists", case_sudo_pty_exists_and_stat,
+                   needs="sudo pty session open")
+        report.run("sudo pty session close", "ssh/session/close", case_sudo_pty_session_close,
+                   needs="sudo/listDir (pty lane)")
+
         print("\n--- quick sudo profiles group ---")
         report.run("sudo/profiles/list initial", "sudo/profiles/list", case_profiles_list_initial)
         report.run("sudo/profiles/save create", "sudo/profiles/save", case_profiles_save_create)

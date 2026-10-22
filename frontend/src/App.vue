@@ -357,6 +357,7 @@ import {
   recordHistoryMeta,
   recordHistoryTime,
   resolveHistoryPanelKey,
+  resolveHistoryPanelTypeAction,
   sanitizeHistoryMetaBuckets,
   sanitizeHistoryTimesBuckets,
   type HistoryPanelEntry,
@@ -1084,6 +1085,21 @@ function loadHistoryPanelEnabledPref(): boolean {
 }
 function setHistoryPanelEnabled(next: boolean) {
   historyPanelEnabled.value = next;
+}
+// 手动输入联动（issue #216）：面板开着时在终端打字——true（默认）收起面板
+// 不遮挡输入行；false 面板常驻并按输入行实时过滤（高亮锚定底部最匹配项）。
+// 同 enabled 的两端自治模式：SettingsDialog 写穿 pluginStore，这里只握内存
+// 权威态（各自水合同一键 ssh-history-panel-type-close）。
+const historyPanelTypeClose = ref(loadHistoryPanelTypeClosePref());
+function loadHistoryPanelTypeClosePref(): boolean {
+  try {
+    return pluginStore.getItem("ssh-history-panel-type-close") !== "0";
+  } catch {
+    return true;
+  }
+}
+function setHistoryPanelTypeClose(next: boolean) {
+  historyPanelTypeClose.value = next;
 }
 // 热键唤起时置 true（挂载即聚焦搜索框，批 3d）；裸 ↑ 唤起恒 false。
 const historyPanelFocusSearch = ref(false);
@@ -2298,6 +2314,19 @@ function createTerminal() {
     sendTerminalBytes(new TextEncoder().encode(data));
     const lineBeforeInput = pendingTerminalInput;
     trackPendingInput(data);
+    // 历史面板手动输入联动（issue #216）：默认档打字即收面板（不遮挡输入行，
+    // 字节照常进 PTY）；常驻档以输入行为查询实时过滤，高亮锚定底部最匹配项
+    // （不改写行——Enter 语义仍是执行用户正在打的内容），↑↓/Enter/Tab 快捷
+    // 选中沿用既有键权仲裁。IME 组合中的键入不进 onData，提交后的整段文本
+    // 自然触发本分支。
+    if (historyPanelOpen.value) {
+      if (resolveHistoryPanelTypeAction(historyPanelTypeClose.value, data) === "close") {
+        closeHistoryPanel();
+      } else {
+        historyPanelQuery.value = pendingTerminalInput;
+        updateHistoryPanelFilter(false);
+      }
+    }
     refreshSuggestionsAfterInput(data, lineBeforeInput);
     refreshGhostAfterInput(data);
     terminalDiag.keys += 1;
@@ -10582,6 +10611,7 @@ watch(historyScope, () => {
       @update:ctx-search-engines="updateCtxSearchEngines"
       @update:ghost-suggest="setGhostEnabled"
       @update:history-panel-enabled="setHistoryPanelEnabled"
+      @update:history-panel-type-close="setHistoryPanelTypeClose"
       @update:command-history-limit="applyCommandHistoryLimit"
       :ghost-tab-accept="ghostTabAccept"
       @update:ghost-tab-accept="setGhostTabAccept"

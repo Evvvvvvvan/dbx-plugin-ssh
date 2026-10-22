@@ -383,6 +383,31 @@ function setHistoryPanelEnabled(next: boolean) {
   emit("update:historyPanelEnabled", next);
 }
 
+// 手动输入联动（issue #216）：面板开着时在终端打字，默认收起面板（不再遮挡
+// 输入行）；关闭该开关则面板常驻并按输入行实时过滤（高亮锚定底部最匹配项，
+// ↑↓/Enter/Tab 快捷选中沿用既有键权）。与开关同自治模式：组件内读写
+// pluginStore，写穿后经 update:historyPanelTypeClose 上抛（App 消费行为）。
+const HISTORY_PANEL_TYPE_CLOSE_KEY = "ssh-history-panel-type-close";
+const historyPanelTypeClose = ref(loadHistoryPanelTypeClose());
+
+function loadHistoryPanelTypeClose(): boolean {
+  try {
+    return pluginStore.getItem(HISTORY_PANEL_TYPE_CLOSE_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+
+function setHistoryPanelTypeClose(next: boolean) {
+  historyPanelTypeClose.value = next;
+  try {
+    pluginStore.setItem(HISTORY_PANEL_TYPE_CLOSE_KEY, next ? "1" : "0");
+  } catch {
+    // 存储不可用：退化为会话内存态，开关仍然生效。
+  }
+  emit("update:historyPanelTypeClose", next);
+}
+
 // 历史显示条数（issue #192）：命令环上限（10..1000，默认 100）。与开关同
 // 自治模式——组件内读写 pluginStore，@change 归一化写穿并经
 // update:commandHistoryLimit 上抛；App 侧收紧各桶 + 持久化，即时生效。
@@ -551,6 +576,7 @@ const emit = defineEmits<{
   (e: "update:ghostSuggest", value: boolean): void;
   /** 历史面板功能开关（issue #169，组件自治持久化 pluginStore）。 */
   (e: "update:historyPanelEnabled", value: boolean): void;
+  (e: "update:historyPanelTypeClose", value: boolean): void;
   /** 历史显示条数（issue #192，组件自治持久化 pluginStore，App 收紧各桶）。 */
   (e: "update:commandHistoryLimit", value: number): void;
   (e: "update:ghostTabAccept", value: boolean): void;
@@ -2471,6 +2497,13 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               <span>{{ t("historyPanelSettings.enabledLabel") }}</span>
             </label>
             <p class="muted settings-note">{{ t("historyPanelSettings.enabledHint") }}</p>
+            <!-- 手动输入联动（issue #216）：默认终端打字即收面板（不遮挡）；
+                 关闭后面板常驻实时过滤、底部锚定最匹配项。 -->
+            <label class="settings-field settings-switch-row">
+              <Switch :model-value="historyPanelTypeClose" size="sm" @update:model-value="setHistoryPanelTypeClose(Boolean($event))" />
+              <span>{{ t("historyPanelSettings.typeCloseLabel") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("historyPanelSettings.typeCloseHint") }}</p>
             <!-- 历史显示条数（issue #192）：命令环上限，收紧即时裁剪生效。 -->
             <label class="settings-field">
               <span>{{ t("historyPanelSettings.limitLabel") }}</span>

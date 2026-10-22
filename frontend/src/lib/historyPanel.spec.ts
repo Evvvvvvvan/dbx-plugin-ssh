@@ -21,6 +21,7 @@ import {
   recordHistoryTime,
   relativeHistoryAge,
   resolveHistoryPanelKey,
+  resolveHistoryPanelTypeAction,
   sanitizeHistoryTimes,
 } from "./historyPanel";
 
@@ -323,5 +324,19 @@ describe("分桶历史档（scope = 连接 id，本地/串口固定桶）", () =
     const meta = { "conn-1": { a: { durationMs: 1, exitCode: 0 }, gone: { durationMs: 2, exitCode: 1 } } };
     const rings = { "conn-1": ["a"], "conn-2": [] };
     expect(persistableHistoryMetaBuckets(meta, rings)).toEqual({ "conn-1": [{ c: "a", d: 1, x: 0 }] });
+  });
+});
+
+describe("resolveHistoryPanelTypeAction (#216)", () => {
+  it("typeClose enabled: any typed input closes the panel", () => {
+    for (const data of ["x", "a b c", "\r", "\u007f", "\u001b[C"]) {
+      expect(resolveHistoryPanelTypeAction(true, data)).toBe("close");
+    }
+  });
+
+  it("typeClose disabled: printable edits filter, Enter closes", () => {
+    expect(resolveHistoryPanelTypeAction(false, "x")).toBe("filter");
+    expect(resolveHistoryPanelTypeAction(false, "docker ")).toBe("filter");
+    expect(resolveHistoryPanelTypeAction(false, "\r")).toBe("close");
   });
 });

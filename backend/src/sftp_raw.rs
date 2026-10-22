@@ -80,6 +80,11 @@ const PFLAGS_TRUNC: u32 = 0x10;
 /// 包上限是 256 KiB，但旧服务器可能更小），调用方按此切分数据。
 pub const MAX_WRITE_CHUNK: usize = 32 * 1024;
 
+/// 流水线写窗口深度（latin-1 裸包上传）：一次在途 WRITE 数。8 × 32KiB =
+/// 256KiB 在途字节，与 IPC 块大小同量级；100ms RTT 链路吞吐约从 0.3 MiB/s
+/// 提升至 2.5 MiB/s 量级。上限同时约束服务端乱序处理的内存占用。
+pub const RAW_WRITE_PIPELINE_DEPTH: usize = 8;
+
 /// READ 单请求建议长度：与写侧同取 v3 规范建议的 32 KiB（`read_file` 的
 /// 分块粒度；workbench 下载逐 chunk 的 256 KiB 是高层客户端语义，这里按
 /// 裸包最大兼容口径）。
@@ -631,6 +636,106 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> RawSftp<S> {
             }
             _ => Err("SFTP raw write got an unexpected reply".to_string()),
         }
+    }
+
+    /// 发出一个 WRITE 请求但不等回包（流水线写入的发射半段）。任何发送
+    /// 失败即 poisoned（与 [`Self::request`] 同语义）。
+    async fn write_chunk_nowait(
+        &mut self,
+        handle: &[u8],
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), String> {
+        if data.len() > MAX_WRITE_CHUNK {
+            return Err(format!(
+                "SFTP raw write chunk too large: {} > {MAX_WRITE_CHUNK}",
+                data.len()
+            ));
+        }
+        if self.poisoned {
+            return Err("SFTP raw client is out of sync after an earlier failure".to_string());
+        }
+        let id = self.next_id();
+        if let Err(error) = self.send(&build_write(id, handle, offset, data)).await {
+            self.poisoned = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// 按发射顺序收集 `count` 个 WRITE 回包（STATUS 0 = 成功）。SFTP 服务器
+    /// 按 request id 应答且同 handle 的 WRITE 处理保序，逐个 recv 即可。
+    /// 任何失败立即 poisoned 并上抛——流里可能还压着后续回包，由调用方
+    /// 报废整个客户端（与 request 的失步语义一致）。
+    async fn collect_write_acks(&mut self, count: usize) -> Result<(), String> {
+        for _ in 0..count {
+            let payload = match tokio::time::timeout(REQUEST_TIMEOUT, self.recv()).await {
+                Ok(Ok(payload)) => payload,
+                Ok(Err(error)) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.poisoned = true;
+                    return Err("SFTP raw write ack timed out".to_string());
+                }
+            };
+            let (kind, _, body) = match parse_response_header(&payload) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+            };
+            if kind != FXP_STATUS {
+                self.poisoned = true;
+                return Err("SFTP raw write got an unexpected reply".to_string());
+            }
+            match parse_status_code(body) {
+                Ok(0) => {}
+                Ok(code) => return Err(format!("SFTP raw write failed with status {code}")),
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 流水线批量写（latin-1 裸包上传热路径）：最多 [`RAW_WRITE_PIPELINE_DEPTH`]
+    /// 个在途 WRITE，窗口满或数据发完后统一收 ACK。相比逐段 write_chunk
+    ///（一写一 RTT），高延迟链路吞吐约提升窗口深度倍。`progress` 按
+    /// 已发字节回调（字节已在途；EOF 后收齐 ACK 才算完成）。
+    pub async fn write_file_pipelined(
+        &mut self,
+        handle: &[u8],
+        source: &mut tokio::fs::File,
+        mut progress: impl FnMut(u64) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut offset = 0_u64;
+        let mut in_flight = 0_usize;
+        let mut buffer = vec![0_u8; MAX_WRITE_CHUNK];
+        loop {
+            if in_flight >= RAW_WRITE_PIPELINE_DEPTH {
+                self.collect_write_acks(in_flight).await?;
+                in_flight = 0;
+            }
+            let read = source
+                .read(&mut buffer)
+                .await
+                .map_err(|error| format!("Failed to read upload spool file: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            self.write_chunk_nowait(handle, offset, &buffer[..read])
+                .await?;
+            offset += read as u64;
+            in_flight += 1;
+            progress(offset)?;
+        }
+        self.collect_write_acks(in_flight).await?;
+        Ok(())
     }
 
     /// SETSTAT：按 attrs 子集改写路径属性（touch 的 utime 语义、上传提交的

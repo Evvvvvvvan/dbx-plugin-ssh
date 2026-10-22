@@ -37,7 +37,7 @@ export function useUploadChain(options: {
   terminalDragActive: Ref<boolean>;
   sftpPaneOpen: Ref<boolean>;
   terminalTransferBusy: Ref<boolean>;
-  uploadSource: (name: string, size: number, readChunk: (offset: number, length: number) => Promise<Uint8Array>, resume?: { taskId: string; remotePath: string }, targetDir?: string, options?: { duplicatePreCheckedAbsent?: boolean; batchId?: string }) => Promise<boolean>;
+  uploadSource: (name: string, size: number, readChunk: (offset: number, length: number) => Promise<Uint8Array>, resume?: { taskId: string; remotePath: string }, targetDir?: string, options?: { duplicatePreCheckedAbsent?: boolean; batchId?: string; lzpack?: boolean }) => Promise<boolean>;
   /** 传输任务账本（issue #165）：批次字节进度按 batchId 聚合。 */
   transferTasks: Record<string, import("../lib/transferQueue").TransferTask>;
   loadTransferConcurrency: () => number;
@@ -61,6 +61,8 @@ export function useUploadChain(options: {
   const batchTransferLimit = () => Math.min(loadTransferConcurrency(), loadTransferMaxActive());
 
 const uploadInput = ref<HTMLInputElement>();
+// ST10 显式压缩包上传的 webview 兜底选择器（桥不可用时）。
+const lzpackUploadInput = ref<HTMLInputElement>();
 // 文件夹上传（issue #78）：webkitdirectory 选择器 + 能力探测（缺失时入口隐藏）。
 const folderUploadInput = ref<HTMLInputElement>();
 const folderUploadSupported = ref(false);
@@ -112,8 +114,32 @@ const dropUploadPathInputEl = ref<HTMLInputElement>();
 
 let dropUploadResolver: ((choice: "cancel" | "cwd" | { dir: string }) => void) | undefined;
 
-async function chooseUpload() {
+async function chooseUpload(lzpack = false) {
   if (!connected.value || !canWrite.value) return;
+  // ST10 显式压缩包模式只支持单文件（交付 <名>.dbxz，批量逐文件各自 .dbxz
+  // 语义混乱，先收敛单文件）；sudo 车道不支持。
+  if (lzpack) {
+    openTransferPanel();
+    if (!window.dbxPlugin.fileTransfer) {
+      lzpackUploadInput.value?.click();
+      return;
+    }
+    try {
+      const selection = await window.dbxPlugin.fileTransfer.pick({ multiple: false });
+      const file = selection.files[0];
+      if (!file) return;
+      const uploaded = await uploadHandleFiles([file], undefined, { lzpack: true });
+      await loadDirectory();
+      if (uploaded) showNotice(t("sftpLzpack.uploaded", { name: `${file.name}.dbxz` }));
+    } catch (cause) {
+      if (isHostBridgeReadFailure(cause)) {
+        fallbackToNativeUploadPicker();
+        return;
+      }
+      showError(cause);
+    }
+    return;
+  }
   openTransferPanel();
   if (!window.dbxPlugin.fileTransfer) {
     uploadInput.value?.click();
@@ -137,7 +163,7 @@ async function chooseUpload() {
 }
 
 /** 宿主桥句柄批量上传；返回真实上传数（重复弹窗放弃跳过的不计）。 */
-async function uploadHandleFiles(files: Array<{ handleId: string; name: string; size: number }>, targetDir?: string): Promise<number> {
+async function uploadHandleFiles(files: Array<{ handleId: string; name: string; size: number }>, targetDir?: string, options?: { lzpack?: boolean }): Promise<number> {
   if (!window.dbxPlugin.fileTransfer || !files.length) return 0;
   uploadDuplicateBatchDecision = undefined;
   const batchId = fileBatch.begin(files);
@@ -150,7 +176,7 @@ async function uploadHandleFiles(files: Array<{ handleId: string; name: string; 
           const done = await uploadSource(file.name, file.size, async (offset, length) => {
             const result = await window.dbxPlugin.fileTransfer!.read(file.handleId, offset, length);
             return window.dbxPlugin.decodeBase64(result.dataBase64);
-          }, undefined, targetDir, { batchId });
+          }, undefined, targetDir, { batchId, lzpack: options?.lzpack });
           if (done) uploaded += 1;
         } catch (cause) {
           // 桥接读盘错误转成可理解的提示；uploadSource 已补 upload-read-failed 代码，
@@ -351,6 +377,29 @@ function onUploadInput(event: Event) {
   const files = Array.from(input.files || []);
   input.value = "";
   if (files.length) void uploadLocalFiles(files).catch(showError);
+}
+
+function onLzpackUploadInput(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const files = Array.from(input.files || []);
+  input.value = "";
+  // 显式压缩包模式单文件：uploadSource 直走 mode=lzpack。
+  const file = files[0];
+  if (!file) return;
+  openTransferPanel();
+  void uploadSource(
+    file.name,
+    file.size,
+    async (offset, length) => new Uint8Array(await file.slice(offset, offset + length).arrayBuffer()),
+    undefined,
+    undefined,
+    { lzpack: true },
+  )
+    .then((done) => {
+      if (done) showNotice(t("sftpLzpack.uploaded", { name: `${file.name}.dbxz` }));
+      return loadDirectory();
+    })
+    .catch(showError);
 }
 
 // —— 文件夹上传（issue #78）：纯前端编排，复用既有 sftp/upload 管线 ——
@@ -684,6 +733,8 @@ function resolveDropUpload(choice: "cancel" | "cwd" | { dir: string }) {
 
   return {
     uploadInput,
+    lzpackUploadInput,
+    onLzpackUploadInput,
     folderUploadInput,
     folderUploadSupported,
     folderUploadProgress,

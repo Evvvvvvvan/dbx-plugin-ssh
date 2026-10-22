@@ -19,6 +19,7 @@ mod local_editors;
 mod local_fs;
 mod local_target;
 mod local_terminal;
+mod lzpack;
 mod mcp;
 mod mcp_safety;
 mod metrics;
@@ -48,10 +49,14 @@ mod sudo_allowlist;
 mod sudo_download;
 mod sudo_fs;
 mod sudo_profiles;
+// P3 自动决策接入面：观测回灌已挂（finish_upload/completed），决策器 decide()
+// 由显式 lzpack 模式的可行性校验在下一阶段消费；纯函数与常量暂由单测覆盖。
 mod task_provider;
 mod telnet_session;
 mod transfer_compress;
 mod transfer_history;
+#[allow(dead_code)]
+mod transfer_schedule;
 mod transfer_throttle;
 mod triggers;
 mod tunnel_menu;
@@ -2088,6 +2093,10 @@ impl Plugin {
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string);
+                // 显式压缩包模式（ST10）：mode="lzpack" 时交付 `<目标名>.dbxz`，
+                // 原始目标路径永不触碰；与 M33 gzip 自动通道互斥（显式优先）。
+                let lzpack_explicit =
+                    matches!(params.get("mode").and_then(Value::as_str), Some("lzpack"));
                 // 压缩通道判定（M33）走连接级编码：latin-1 裸包车道强制
                 // 普通传输（远端 gunzip 的 shell 路径不做 latin-1 字节）。
                 let encoding = self.resolve_sftp_encoding(&session_id);
@@ -2098,6 +2107,7 @@ impl Plugin {
                     resume_task_id,
                     encoding,
                     false,
+                    lzpack_explicit,
                     emitter,
                 ))
             }
@@ -2117,6 +2127,8 @@ impl Plugin {
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string);
+                // sudo 车道暂不支持显式压缩包模式：提交走 sudo mv，压缩交付
+                // 名与还原语义在 root 车道上需要单独的产品定义（后续项）。
                 let encoding = self.resolve_sftp_encoding(&session_id);
                 self.runtime.block_on(self.ssh.start_upload(
                     session_id,
@@ -2125,6 +2137,7 @@ impl Plugin {
                     resume_task_id,
                     encoding,
                     true,
+                    false,
                     emitter,
                 ))
             }
@@ -2164,6 +2177,12 @@ impl Plugin {
                 // wire 串里的 `%XX` 是文件名字面量），latin-1 维持
                 // has_wire_escapes 判裸包车道。
                 let encoding = self.resolve_sftp_encoding(session_id);
+                // 显式解压下载（ST10）：expandLzpack=true 时源是 .dbxz，交付
+                // 原始文件（本地自研解压，远端零依赖）。
+                let expand_lzpack = params
+                    .get("expandLzpack")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 self.runtime.block_on(self.ssh.start_download(
                     session_id,
                     remote_path,
@@ -2172,6 +2191,7 @@ impl Plugin {
                     download_dir.as_deref(),
                     conflict,
                     encoding,
+                    expand_lzpack,
                     emitter,
                 ))
             }

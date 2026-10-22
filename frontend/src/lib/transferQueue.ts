@@ -19,9 +19,9 @@ export interface TransferTask {
   // 压缩通道（M33）阶段扩展见 transferProgress.TransferPhase。
   phase?: TransferPhase;
   staged?: number;
-  // 压缩通道标记（M33）：事件/start 响应携带 compression=gzip 时展示徽标；
-  // prep 回退（compression=none）时清除。
-  compression?: "gzip";
+  // 压缩通道标记（M33 gzip 自动通道 / ST10 lzpack 显式模式）：事件/start
+  // 响应携带 compression=gzip|lzpack 时展示徽标；prep 回退（none）时清除。
+  compression?: "gzip" | "lzpack";
   // 本工作台首次见到该任务的时间（issue #18 排序：live 行缺 startedAt 时
   // 用它兜底，保证活跃区顺序稳定可解释）。
   joinedAt?: number;

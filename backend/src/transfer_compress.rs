@@ -22,6 +22,9 @@ pub enum CompressionMode {
     None,
     /// gzip 压缩通道：本地 flate2 + 远端 gzip/gunzip（树为 tar.gz）。
     Gzip,
+    /// 自研压缩包模式（ST10）：本地 lzpack（`.dbxz`），远端零依赖。
+    /// 上传=交付 `<目标名>.dbxz`；下载=解压还原原始文件。与 Gzip 互斥。
+    Lzpack,
 }
 
 impl CompressionMode {
@@ -29,6 +32,7 @@ impl CompressionMode {
         match self {
             CompressionMode::None => "none",
             CompressionMode::Gzip => "gzip",
+            CompressionMode::Lzpack => "lzpack",
         }
     }
 }
@@ -340,6 +344,78 @@ pub fn decompress_file_to(
     }
     writer.flush()?;
     Ok(written)
+}
+
+/// lzpack 压缩整文件（显式压缩包模式）：spool → `.dbxz` 容器。压缩本体
+/// 不可中断，取消检查在读写前后各一次（单块 ≤4 MiB，最坏多压 4 MiB 后
+/// 退出）。返回压缩产物体积。与 gzip 预压不同：本函数不做比率守卫——
+/// 显式模式下用户明确要 `.dbxz` 交付，即使压缩率差也照常交付（浪费自知）。
+pub fn lzpack_compress_file_to(
+    source: &Path,
+    target: &Path,
+    cancelled: &AtomicBool,
+    progress: &dyn Fn(u64),
+) -> std::io::Result<u64> {
+    let mut input = Vec::new();
+    std::fs::File::open(source)?.read_to_end(&mut input)?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "transfer cancelled",
+        ));
+    }
+    let mut packed: Vec<u8> = Vec::with_capacity(input.len() / 2 + 64);
+    crate::lzpack::compress(&input, &mut |slice: &[u8]| packed.extend_from_slice(slice))
+        .map_err(|error| std::io::Error::other(format!("lzpack compress failed: {error}")))?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "transfer cancelled",
+        ));
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(target, &packed)?;
+    progress(input.len() as u64);
+    Ok(packed.len() as u64)
+}
+
+/// lzpack 解压整文件（显式压缩包模式）：`.dbxz` → 原始文件。`expected_size`
+/// 为容器头之外的预期原始体积（已知时传入，解压输出上限随之钳制）；未知
+/// 用 None（内部上限 1 GiB）。取消检查在整段解压前后各一次（解压吞吐
+/// 数百 MiB/s，整段粒度可接受）。返回写入的原始字节数。
+pub fn lzpack_decompress_file_to(
+    source: &Path,
+    target: &Path,
+    cancelled: &AtomicBool,
+    progress: &dyn Fn(u64),
+) -> std::io::Result<u64> {
+    let packed = std::fs::read(source)?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "transfer cancelled",
+        ));
+    }
+    let mut restored: Vec<u8> = Vec::new();
+    let result = crate::lzpack::decompress(&packed, None, &mut |slice: &[u8]| {
+        restored.extend_from_slice(slice);
+    });
+    if cancelled.load(Ordering::Acquire) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "transfer cancelled",
+        ));
+    }
+    let total = result
+        .map_err(|error| std::io::Error::other(format!("lzpack decompress failed: {error}")))?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(target, &restored)?;
+    progress(total as u64);
+    Ok(total as u64)
 }
 
 /// 把 tar.gz 归档解包到目标根目录（树下载压缩通道的本地端）。仅普通文件

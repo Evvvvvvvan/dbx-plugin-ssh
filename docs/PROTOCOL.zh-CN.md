@@ -84,10 +84,10 @@ WezTerm 的 ssh domain 支持 `spawn` 语义：在已认证 transport 上另开 
 | `sftp/diskUsage` | 路径所在挂载的磁盘用量 |
 | `sftp/home`、`sftp/list`、`sftp/read` | 浏览、预览远端文件（`sftp/list` 支持可选 `includeOwner` 附加属主/属组；`sftp/read` 支持可选 `offset` 分片续读，见下文）。`sftp/home` 走高层客户端 `canonicalize(".")`（`ssh.rs:3505`）——**编码边界（登记，M28-A）**：家目录名非 UTF-8 时返回串已含 U+FFFD（高层 lossy 解码，原始字节不可恢复），以其为基准拼接的后续路径无法命中，与 `sftp/list` 节 M17 段登记的 shell cwd 回读同类不可恢复边界 |
 | `sftp/createDirectory`、`sftp/rename`、`sftp/delete`、`sftp/exists`、`sftp/rename-unique`、`sftp/touch`、`sftp/write`、`sftp/upload/start/finish`、`sftp/upload-local`、`watch/upload` | SFTP 写操作/预检（`sftp_name_encoding` 为 `latin-1` 时走裸包客户端字节保真，路径来源分工见 `sftp/list` 节 M15-B/M16 段；symlink 三命令见独立行） |
-| `sftp/upload/start`、`finish` | 上传事务生命周期（`resumeTaskId` 断点续传；`finish` 校验后交后台任务推送并立即返回，见「上传两阶段计数与收尾语义」）。start/finish 响应附 `compression: "gzip"\|"none"`（M33 压缩通道决策结果，见「压缩传输（gzip 混合方案）」节；旧客户端可忽略） |
+| `sftp/upload/start`、`finish` | 上传事务生命周期（`resumeTaskId` 断点续传；`finish` 校验后交后台任务推送并立即返回，见「上传两阶段计数与收尾语义」）。start/finish 响应附 `compression: "gzip"\|"none"`（M33 压缩通道决策结果，见「压缩传输（gzip 混合方案）」节；旧客户端可忽略）。可选参数 `mode: "lzpack"`（ST10 显式压缩包模式）：spool 收齐后本地自研压缩（`backend/src/lzpack.rs`，`.dbxz` 容器，无需远端任何工具）→ 推送 → 原子提交为 **`<目标名>.dbxz`**——原始目标路径全程不被触碰，无远端还原步骤；`resumeTaskId` 续传与显式模式互斥（续传任务按普通管线交付原始文件）。压缩失败是任务失败（不静默回退直传：用户明确要压缩交付）。`sudo/upload/start` 不支持 `mode`。响应 `compression` 恒 `"none"`（交付语义由调用方知晓），进度事件 `compressing` 阶段分母=原始体积 |
 | `watch/start`、`watch/stop`、`watch/stop-all`、`watch/upload` | 外部编辑器回写 watcher（仅桌面端，见「外部编辑器 watcher（watch/*）」节）：`start` 对 `remote-edit/` 下载目录内的本机文件登记监听并返回 `{watchId}`，内容确认变化后发 `watch/file-modified` 事件；`upload` 把监听文件当前字节按 `sftp/write` 同款原子提交推回远端（latin-1 按所属连接编码走裸包字节保真，M21） |
 | `local/editors/list`、`local/open-with` | 外部编辑器目录与按名打开（编辑器映射增强，仅桌面端消费，见「外部编辑器目录与打开方式（local/editors/*、local/open-with）」节）：`list` 返回平台知名编辑器目录（文件系统/PATH 探测，不 spawn 进程，unavailable 条目仍返回）；`open-with` 在与 `local/open` 同源的下载历史 allowlist 下用目录编辑器或用户自定义命令行打开已下载文件（argv 直接 spawn，不过 shell） |
-| `sftp/download/start`、`next`、`finish` | 下载事务生命周期（`offset` 断点续传，见下文；桌面端可选 `downloadDir` 指定本机绝对保存目录）。**路径形态契约（M27-A）**：latin-1 生效时 `remotePath` 必须是 `sftp/list` 回传的 wire 形式（`pathFromUri(entry.uri)`）——wire 域内字面 `%` 已被 `escape_wire` 自转义为 `%25`，因此 wire 字符串中的 `%XX`（X∈hex）唯一解读就是转义还原（`has_wire_escapes` 判分支）；该入口不接受用户字面输入的显示文本，含字面 `%XX` 的真实文件名经列表回传时其 wire 形式为 `%25XX`，往返无损。**车道判定按生效编码区分（M28-B 修 D-7）**：latin-1 维持上述 raw 车道；auto 生效时一律走高层客户端——auto 列表 uri 由高层产出、字面 `%` 未经 `%25` 自转义，wire 串里的 `%XX` 是文件名字面量而非转义，不还原（auto 以字面量语义与列表一致）。响应附 `compression: "gzip"\|"none"`（M33 压缩通道决策结果，见「压缩传输（gzip 混合方案）」节；`offset > 0` 续传恒为 `none`） |
+| `sftp/download/start`、`next`、`finish` | 下载事务生命周期（`offset` 断点续传，见下文；桌面端可选 `downloadDir` 指定本机绝对保存目录）。**路径形态契约（M27-A）**：latin-1 生效时 `remotePath` 必须是 `sftp/list` 回传的 wire 形式（`pathFromUri(entry.uri)`）——wire 域内字面 `%` 已被 `escape_wire` 自转义为 `%25`，因此 wire 字符串中的 `%XX`（X∈hex）唯一解读就是转义还原（`has_wire_escapes` 判分支）；该入口不接受用户字面输入的显示文本，含字面 `%XX` 的真实文件名经列表回传时其 wire 形式为 `%25XX`，往返无损。**车道判定按生效编码区分（M28-B 修 D-7）**：latin-1 维持上述 raw 车道；auto 生效时一律走高层客户端——auto 列表 uri 由高层产出、字面 `%` 未经 `%25` 自转义，wire 串里的 `%XX` 是文件名字面量而非转义，不还原（auto 以字面量语义与列表一致）。响应附 `compression: "gzip"\|"none"`（M33 压缩通道决策结果，见「压缩传输（gzip 混合方案）」节；`offset > 0` 续传恒为 `none`）。可选参数 `expandLzpack: true`（ST10 显式解压下载）：源是 `.dbxz`（自研格式），sidecar 拉 `fetching`（分母=压缩流实测体积）→ 本地自研解压 `decompressing`（分母=容器头声明的原始体积）→ `ready`（`compression:"lzpack"`）→ `sftp/download/next` 从本地解压暂存按 offset 供给**原始字节**，交付物是还原后的原始文件（`.dbxz` 中间件在终态清理）。原始体积从容器头 16 字节读出，头非法即任务失败（无「回落直传」语义：源不是 .dbxz 时直传只会把压缩件交给用户）；不支持 `offset > 0` 续传 |
 | `sftp/download/tree/start` | 递归目录下载启动：远端 `read_dir` 走树扫描（有界），本地镜像目录布局后复用 `sftp/download/next`/`finish`/`sftp/transfer/cancel` 分块管线（见「递归目录下载」节）。`remotePath` 路径形态契约同 `sftp/download/start`（M27-A：列表回传的 wire 形式）。响应附 `compression`（M33：满足压缩条件时改走「远端 tar.gz 单流 → 本地解包 staging 树」通道，见「压缩传输（gzip 混合方案）」节） |
 | `sftp/stat`、`sftp/exists`、`sftp/touch`、`sftp/write` | 扩展文件操作：元信息单查、存在性检查、空文件创建、小文件直写；latin-1 下 `sftp/stat` 整条 wire 还原走裸包 LSTAT，`sftp/exists` 按 `form` 参数分工还原（缺省「wire 前缀 + 显示末段」、`form: "wire"` 整条），均走裸包 LSTAT（M17，见 `sftp/exists` 节） |
 | `sftp/symlink-create`、`sftp/symlink-read`、`sftp/symlink-update` | 符号链接三命令（路径来源分工详见 `sftp/list` 节 M16 段）：`create {target, linkPath}` 与 `update {linkPath, target}` 过 `ensure_writable` 只读门禁，`target` 允许相对路径（symlink 语义，仅清洗不归一）；SFTPv3 无 re-link 原语，update 为「读现指向比对——一致即 no-op，否则先删旧链再重建」；`read {linkPath}` → `{linkPath, target}`。latin-1 车道：linkPath 整条 wire 还原、target/指向文本按显示编码回字节，读↔写闭环（裸包建立失败回退高层，读侧任何失败即回退） |
@@ -1075,6 +1075,45 @@ plain/`.gz`/远端临时件，取消与会话关闭都穿过它（此前会话�
 （`UPLOAD_SPOOL_RETENTION`）的超龄 spool（连同 meta——断点续传不跨「7 天前」的窗口），
 健康续传态（`.part`+`.json`）原样保留。磁盘放大：上传本地 spool 2×（原始 + .gz）、远端 .gz+plain 2×、下载
 本地 .gz+.plain 2×、树远端 .tgz+源树 2×；`MAX_TRANSFER_SIZE`（16 GiB）仍按原始大小语义。
+
+### 显式压缩包模式（自研 lzpack，ST10）
+
+与 M33 的本质差异：**远端零依赖**。M33 gzip 通道的对端还原靠远端 `gzip`/`gunzip` shell 工具；
+ST10 的压缩/解压全部在本地（`backend/src/lzpack.rs` 自研 LZ77，DBXZ v1 容器格式），远端只是
+SFTP 收发字节——shell-less 服务器（仅 SFTP 权限）完整可用。
+
+**DBXZ v1 容器格式**：`"DBXZ"` magic + 版本号(u8) + 原始总长(u64 BE) + 3 字节保留，之后逐块
+（kind: 0=RAW 原样块 / 1=LZ77 压缩块；payload_len/original_len 各 u32 BE）。压缩块内是 token
+位流：字面量 run（0 bit + 字节对齐 + run 长度 u8 + 原始字节串）与匹配引用（1 bit +
+`<len:12><dist:16>`，len 3..=4095、dist 1..=65536，编码存 -1）。块上限 4 MiB、单块内匹配
+（跨块不引用，单块损坏不扩散）、窗口 64 KiB、哈希一槽贪心匹配。安全防护：magic/版本/保留位
+校验、声明总长与传入 expected 强一致校验、块 original_len 上限、匹配引用出界拒绝、截断/尾随
+垃圾检测、解压器全路径无 panic（模糊测试覆盖）。RAW 回退：压缩不省空间的块自动原样落块
+（随机数据不膨胀）。
+
+**实测吞吐**（Apple Silicon release 构建，32 MiB 样本）：文本类 1.67x / 压缩 134 MiB/s / 解压
+209 MiB/s；重复数据 988x / 压缩 391 MiB/s / 解压 615 MiB/s；随机数据 1.00x（RAW 回退）/
+压缩 121 MiB/s / 解压 5.4 GiB/s。压缩吞吐显著低于 gzip（flate2）——显式模式由用户权衡，
+自动决策器（`transfer_schedule.rs`）按 EMA 实测带宽 + 实测 codec 吞吐做纯函数比较
+（`T_direct` vs `T_compressed`，收益门槛缺省 10% 可配），带宽/吞吐任一无实测值时保守选直传。
+
+**上传交付语义**：`mode:"lzpack"` → spool 预压 `.dbxz`（`compressing`，spawn_blocking）→
+推送（`uploading` 分母=压缩体积）→ 同目录 rename 原子提交为 `<目标名>.dbxz`。原始目标路径
+永不触碰、无远端还原；已有同名 `.dbxz` 按覆盖让位语义处理。取消/失败清理全部本地与远端
+临时件。
+
+**下载交付语义**：`expandLzpack:true` → stat 压缩流体积 + 读容器头 16 字节取原始体积 →
+`fetching` 拉流（限速沿用 `transfer_download_limit_kib`）→ `decompressing` 自研解压到
+staged plain → `ready` → `sftp/download/next` 从 staged 供给原始字节。交付原始文件；不支持
+续传（`offset > 0` 报错）；latin-1 裸包车道支持（裸包 stat/READ）。
+
+**下载预取（ST9，普通单文件下载）**：`sftp/download/next` 返回第 N 块时后台预读第 N+1 块入
+任务槽，下一片命中直接回——消除每块一个整 RTT 的串行等待。树/压缩/latin-1/限速任务不启用
+（限速节奏下预取打乱配速）。槽 offset 与请求不一致即作废（续传/重试跳片安全）。
+
+**裸包上传流水线（ST9，latin-1 车道）**：`raw_push_upload_file` 从逐段 WRITE（一写一 RTT）
+改为有界在途窗口（8 × 32 KiB = 256 KiB 在途），窗口满或收尾统一收 ACK——高延迟链路吞吐约
+提升窗口倍数。取消检查保留在发射回调；任何 ACK 失败整客户端报废（与 RawSftp 失步语义一致）。
 
 ### 递归目录下载（sftp/download/tree/start）
 

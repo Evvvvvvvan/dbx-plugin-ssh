@@ -55,6 +55,7 @@ import {
   Network,
   PackageOpen,
   Palette,
+  FileArchive,
   PanelRightClose,
   Pencil,
   PlugZap,
@@ -5834,6 +5835,11 @@ const {
   setSftpSideTab,
   setSftpSideCollapsed,
 } = useSftpSidebar({ t, showError, session, sudoMode, sftpHomePath, sftpShowHidden, pathFromUri });
+// ST10 显式压缩包上传入口（文件菜单）：单文件选择 → mode=lzpack 上传。
+function chooseUploadLzpack() {
+  void chooseUpload(true);
+}
+
 /** 侧栏（目录树/快捷路径）行右键：打开 / 复制路径 / 复制文件名 / 压缩。
  *  行处理器只记录负载并互斥收口；定位/打开由包裹侧栏的 reka ContextMenuTrigger
  *  从冒泡上来的原生 contextmenu 事件完成（DirTree/SideNavPanel 不能再 prevent/stop）。 */
@@ -6947,6 +6953,8 @@ function focusSftpPaneOnPointerDown(event: PointerEvent) {
 // 上传链：五路上传入口/重复策略/拖拽落点收口在 composables/useUploadChain。
 const {
   uploadInput,
+  lzpackUploadInput,
+  onLzpackUploadInput,
   folderUploadInput,
   folderUploadSupported,
   folderUploadProgress,
@@ -9952,7 +9960,7 @@ watch(historyScope, () => {
             </Popover>
           </div>
           <button class="icon-button" :title="t('sftpPaste.action')" :aria-label="t('sftpPaste.action')" :disabled="!connected || !canWrite || !sftpClipboard || pasteBusy" @click="pasteClipboard"><ClipboardPaste /></button>
-          <button class="icon-button icon-teal" :title="`${t('upload')} · Ctrl/Cmd+V`" :aria-label="`${t('upload')} · Ctrl/Cmd+V`" :disabled="!connected || !canWrite" @click.stop="chooseUpload"><FileUp /></button>
+          <button class="icon-button icon-teal" :title="`${t('upload')} · Ctrl/Cmd+V`" :aria-label="`${t('upload')} · Ctrl/Cmd+V`" :disabled="!connected || !canWrite" @click.stop="chooseUpload()"><FileUp /></button>
           <button v-if="folderUploadSupported" class="icon-button icon-teal" :title="t('folderUpload.title')" :aria-label="t('folderUpload.action')" :disabled="!connected || !canWrite" @click.stop="chooseFolderUpload"><FolderUp /></button>
           <button class="icon-button icon-amber" :title="t('newFolder')" :aria-label="t('newFolder')" :disabled="!connected || !canWrite" @click="operationDraft = ''; operationDialog = 'mkdir'"><FolderPlus /></button>
           <button class="icon-button icon-amber" :title="t('sftpNewFile.action')" :aria-label="t('sftpNewFile.action')" :disabled="!connected || !canWrite" @click="openNewFileDialog"><FilePlus /></button>
@@ -10116,6 +10124,10 @@ watch(historyScope, () => {
                 <template v-else-if="fileMenu">
                   <ContextMenuItem v-if="fileMenu.entry.kind === 'directory' || fileMenu.entry.kind === 'file'" @select="openEntry(fileMenu.entry)"><Folder v-if="fileMenu.entry.kind === 'directory'" /><FileText v-else />{{ fileMenu.entry.kind === "directory" ? t("openFolder") : t("preview") }}</ContextMenuItem>
                   <ContextMenuItem v-if="fileMenu.entry.kind === 'file' || fileMenu.entry.kind === 'directory'" @select="downloadEntry(fileMenu.entry, sudoMode && canWrite && fileMenu.entry.kind === 'file')"><Download />{{ t("download") }}</ContextMenuItem>
+                  <!-- ST10 显式压缩包模式（自研 lzpack，远端零依赖）：文件级入口。
+                       压缩上传交付 <名>.dbxz；解压下载要求源是 .dbxz。 -->
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'file' && !sudoMode" :disabled="!canWrite" @select="chooseUploadLzpack()"><PackageOpen />{{ t("sftpLzpack.uploadAction") }}</ContextMenuItem>
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'file' && fileMenu.entry.name.endsWith('.dbxz')" @select="downloadEntry(fileMenu.entry, false, true)"><FileArchive />{{ t("sftpLzpack.expandAction") }}</ContextMenuItem>
                   <!-- 以 root 下载（M14-C DownloadSudo）：root 大文件二进制下载，读只读门禁
                        与 sudo 族一致（sidecar 对只读连接 fail closed，这里 canWrite 同步禁用）。
                        sudo 模式下默认「下载」已自动换 sudo 车道（UploadSudo/DownloadSudo
@@ -10876,6 +10888,8 @@ watch(historyScope, () => {
     </Dialog>
 
     <input ref="uploadInput" class="hidden" type="file" multiple @change="onUploadInput" />
+    <!-- ST10 显式压缩包上传的 webview 兜底选择器（宿主桥不可用时），单选。 -->
+    <input ref="lzpackUploadInput" class="hidden" type="file" @change="onLzpackUploadInput" />
     <!-- webkitdirectory 会自动携带多选语义；目录选择以相对路径（webkitRelativePath）回传。 -->
     <input v-if="folderUploadSupported" ref="folderUploadInput" class="hidden" type="file" multiple webkitdirectory @change="onFolderUploadInput" />
     <input ref="zmodemInput" class="hidden" type="file" multiple @change="onZmodemInput" />

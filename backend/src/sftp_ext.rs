@@ -958,8 +958,7 @@ pub(crate) async fn raw_push_upload_file(
     local_path: &Path,
     remote_path: &str,
     task_id: &str,
-    read_chunk_size: usize,
-    mut context: RawUploadContext<'_>,
+    context: RawUploadContext<'_>,
 ) -> Result<(), String> {
     let raw_target = sftp_name::write_path_bytes(remote_path);
     let (raw_temporary, raw_backup) = raw_paths_next_to(
@@ -971,29 +970,28 @@ pub(crate) async fn raw_push_upload_file(
         .await
         .map_err(|error| format!("Failed to open upload spool file: {error}"))?;
     let handle = client.open_write(&raw_temporary).await?;
-    let mut buffer = vec![0_u8; read_chunk_size];
+    // 流水线写（ST9）：取消检查按 32KiB 段粒度在发射循环外由进度回调承担
+    // ——在途窗口中的取消会在收 ACK 时以错误退出，清理路径照旧。相比
+    // 逐段 raw_write_all（一写一 RTT），高延迟链路吞吐约提升窗口倍数。
+    let cancelled = context.cancelled;
+    let cancel_reason = context.cancel_reason;
+    let mut progress = context.progress;
     let mut transferred = 0_u64;
     let result: Result<(), String> = async {
-        loop {
-            if context.cancelled.load(Ordering::Acquire) {
-                let reason = context
-                    .cancel_reason
-                    .lock()
-                    .map(|reason| reason.clone())
-                    .unwrap_or_default();
-                return Err(crate::ssh::upload_cancel_error(reason.as_deref()));
-            }
-            let read = source
-                .read(&mut buffer)
-                .await
-                .map_err(|error| format!("Failed to read upload spool file: {error}"))?;
-            if read == 0 {
-                break;
-            }
-            raw_write_all(client, &handle, &buffer[..read]).await?;
-            transferred = transferred.saturating_add(read as u64);
-            (context.progress)(transferred)?;
-        }
+        client
+            .write_file_pipelined(&handle, &mut source, |sent| {
+                if cancelled.load(Ordering::Acquire) {
+                    let reason = cancel_reason
+                        .lock()
+                        .map(|reason| reason.clone())
+                        .unwrap_or_default();
+                    return Err(crate::ssh::upload_cancel_error(reason.as_deref()));
+                }
+                (progress)(sent)?;
+                transferred = sent;
+                Ok(())
+            })
+            .await?;
         client.close(&handle).await?;
         Ok(())
     }

@@ -108,7 +108,7 @@ function updateTransfer(params: Record<string, unknown>) {
   const fileCount = params.fileCount !== undefined ? Number(params.fileCount) : existing?.fileCount;
   const currentFile = typeof params.currentFile === "string" ? params.currentFile : existing?.currentFile;
   // 压缩通道标记（M33）：prep 回退事件（compression=none）清掉徽标。
-  const compression = params.compression === "gzip" ? "gzip" as const : params.compression === "none" ? undefined : existing?.compression;
+  const compression = params.compression === "gzip" ? "gzip" as const : params.compression === "lzpack" ? "lzpack" as const : params.compression === "none" ? undefined : existing?.compression;
   transferTasks[taskId] = {
     taskId,
     sessionId: String(params.sessionId || existing?.sessionId || ""),
@@ -369,7 +369,7 @@ function persistTransferDownloadLimit(value: number) {
 /** 单文件上传入口。返回 boolean 供批次调用方区分成功与放弃：true=已交付
  * sidecar（后台推送中也算），false=重复目标弹窗里放弃跳过（无会话同理）——
  * 抛错仍是失败。成功提示的计数只该包含 true 的那份。 */
-async function uploadSource(name: string, size: number, readChunk: (offset: number, length: number) => Promise<Uint8Array>, resume?: { taskId: string; remotePath: string }, targetDir?: string, options?: { duplicatePreCheckedAbsent?: boolean; batchId?: string }): Promise<boolean> {
+async function uploadSource(name: string, size: number, readChunk: (offset: number, length: number) => Promise<Uint8Array>, resume?: { taskId: string; remotePath: string }, targetDir?: string, options?: { duplicatePreCheckedAbsent?: boolean; batchId?: string; lzpack?: boolean }): Promise<boolean> {
   if (!session.value) return false;
   // resume 携带原 taskId/remotePath：后端校验 spool meta 后从已传前缀续接。
   // targetDir 仅新上传生效（终端拖入的自定义目标目录）；缺省仍是 SFTP 当前目录。
@@ -391,11 +391,13 @@ async function uploadSource(name: string, size: number, readChunk: (offset: numb
   const finishMethod = sudoLane ? "sudo/upload/finish" : "sftp/upload/finish";
   const info = await window.dbxPlugin.invoke<{ taskId: string; chunkSize: number; resumeOffset?: number; compression?: string }>(startMethod, resume
     ? { sessionId: session.value.sessionId, remotePath: resume.remotePath, size, resumeTaskId: resume.taskId }
-    : { sessionId: session.value.sessionId, remotePath: joinRemote(dir, uploadName), size });
+    : { sessionId: session.value.sessionId, remotePath: joinRemote(dir, uploadName), size, mode: options?.lzpack ? "lzpack" : undefined });
   const startOffset = info.resumeOffset ?? 0;
   // 压缩通道标记（M33）：start 响应即带决策结果，任务卡建卡时就点徽标；
   // 后续 progress 事件（恒带 compression）接手维护，回退时以 none 清除。
-  transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "upload", fileName: uploadName, size, transferred: startOffset, compression: info.compression === "gzip" ? "gzip" : undefined, status: startOffset > 0 ? "running" : "queued", joinedAt: Date.now(), batchId: options?.batchId };
+  // ST10：显式 lzpack 由调用方 options 声明（响应 compression 恒 none，
+  // 交付 <目标名>.dbxz 由后端保证）。
+  transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "upload", fileName: uploadName, size, transferred: startOffset, compression: info.compression === "gzip" ? "gzip" : options?.lzpack ? "lzpack" : undefined, status: startOffset > 0 ? "running" : "queued", joinedAt: Date.now(), batchId: options?.batchId };
   try {
     let offset = startOffset;
     while (offset < size) {

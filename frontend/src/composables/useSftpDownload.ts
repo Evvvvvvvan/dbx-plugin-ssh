@@ -95,12 +95,18 @@ function probeLocalCapabilities() {
  * root 大文件二进制下载）——start 换方法换参数名（path），分块循环、finish、
  * 取消与进度面板全部复用既有下载管线，取消路径的 sftp/transfer/cancel 对
  * sudo 任务同样生效（sidecar 会顺带清掉远端临时件）。 */
-async function downloadEntry(entry: DownloadListEntry, forceSudo = false) {
+async function downloadEntry(entry: DownloadListEntry, forceSudo = false, expandLzpack = false) {
   fileMenu.value = undefined;
   // 目录条目走递归文件夹下载（tree/start + 同一分块管线）；文件沿用单文件管线。
   // sudo 下载只覆盖普通文件：root 目录没有对应的暂存语义，明确拒绝。
   if (forceSudo && entry.kind !== "file") {
     showError(new Error(t("sudoDownload.filesOnly")));
+    return;
+  }
+  // 显式解压下载（ST10）：仅普通文件——.dbxz 源不存在目录形态；sudo 车道
+  // 不参与（root 车道无解压语义）。
+  if (expandLzpack && entry.kind !== "file") {
+    showError(new Error(t("sftpLzpack.filesOnly")));
     return;
   }
   if (entry.kind === "directory") {
@@ -146,8 +152,8 @@ async function downloadEntry(entry: DownloadListEntry, forceSudo = false) {
     // sudo 下载族参数名用 path（与 sudo/stat 等同族一致），sftp 族用 remotePath。
     info = forceSudo
       ? await window.dbxPlugin.invoke<DownloadStartInfo>("sudo/download/start", { ...startParams, path: pathFromUri(entry.uri) })
-      : await window.dbxPlugin.invoke<DownloadStartInfo>("sftp/download/start", { ...startParams, remotePath: pathFromUri(entry.uri) });
-    transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "download", fileName: info.fileName, size: info.size, transferred: 0, status: "queued", joinedAt: Date.now(), compression: info.compression === "gzip" ? "gzip" : undefined };
+      : await window.dbxPlugin.invoke<DownloadStartInfo>("sftp/download/start", { ...startParams, remotePath: pathFromUri(entry.uri), expandLzpack: expandLzpack || undefined });
+    transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "download", fileName: info.fileName, size: info.size, transferred: 0, status: "queued", joinedAt: Date.now(), compression: info.compression === "gzip" ? "gzip" : info.compression === "lzpack" ? "lzpack" : undefined };
     // 压缩任务等 prep 就绪（M33）：普通任务（含 sudo/回退）立即返回。
     await waitForDownloadReady(info.taskId, info.compression);
     // beginSave 在用户取消原生保存框时按契约返回 null：必须立刻终止整个下载，
@@ -236,7 +242,7 @@ async function downloadEntry(entry: DownloadListEntry, forceSudo = false) {
       showNotice(t("transferStatus.cancelled"));
     } else {
       // 失败闭环：横幅带「重试」，按原入口完整重跑（含询问/冲突流程）。
-      showError(cause, "sftp", () => void downloadEntry(entry, forceSudo));
+      showError(cause, "sftp", () => void downloadEntry(entry, forceSudo, expandLzpack));
     }
   }
 }

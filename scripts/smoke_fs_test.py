@@ -265,6 +265,8 @@ def main() -> None:
         perms_path = f"{home}/.dbx-fs-smoke-perms.sh"
         archive_path = f"{home}/.dbx-parity-test.tar.gz"
         extract_dir = f"{home}/.dbx-parity-extract"
+        lzpack_source = f"{home}/.dbx-lzpack-smoke-src.txt"
+        lzpack_packed = f"{home}/.dbx-lzpack-smoke-src.txt.dbxz"
         sudo_dir = f"{home}/.sudo-test"
         sudo_file = f"{sudo_dir}/inner.txt"
         sudo_file_renamed = f"{sudo_dir}/inner-renamed.txt"
@@ -356,6 +358,95 @@ def main() -> None:
                 raise AssertionError(f"{extract_dir} kind={kind!r}, want directory")
             req("sftp/delete", {"sessionId": session_id, "path": extract_dir, "recursive": True})
             req("sftp/delete", {"sessionId": session_id, "path": archive_path})
+
+        def wait_transfer_terminal(task_id: str) -> dict:
+            status: dict = {}
+            for _ in range(200):
+                status = req("sftp/transfer/status", {"taskId": task_id})
+                if status.get("status") in ("completed", "failed", "cancelled"):
+                    break
+                time.sleep(0.1)
+            return status
+
+        def case_sftp_lzpack_upload():
+            # ST10 显式压缩包上传：sftp/upload/start(mode=lzpack) -> binary
+            # chunks -> finish。交付物是 <target>.dbxz（自研 lzpack 容器），
+            # 原始目标路径永不出现。
+            payload = (b"dbx lzpack smoke\n" * 2000)  # 34KB 高重复文本
+            info = req("sftp/upload/start", {"sessionId": session_id,
+                                             "remotePath": lzpack_source,
+                                             "size": len(payload),
+                                             "mode": "lzpack"})
+            task_id = str(info.get("taskId") or "")
+            if not task_id:
+                raise AssertionError(f"lzpack upload start shape: {json.dumps(info)[:160]}")
+            offset = 0
+            while offset < len(payload):
+                chunk = payload[offset:offset + 256 * 1024]
+                client.send_binary(f"sftp/upload/{task_id}",
+                                   struct.pack(">Q", offset) + chunk)
+                offset += len(chunk)
+                time.sleep(0.05)
+            req("sftp/upload/finish", {"taskId": task_id})
+            status = wait_transfer_terminal(task_id)
+            if status.get("status") != "completed":
+                raise AssertionError(f"lzpack upload did not complete: {json.dumps(status)[:200]}")
+            stat = req("sftp/stat", {"sessionId": session_id, "path": lzpack_packed})
+            packed_size = stat.get("size")
+            print(f"    lzpack packed {len(payload)} -> {packed_size} bytes at {lzpack_packed}")
+            if not isinstance(packed_size, (int, float)) or packed_size <= 0 or packed_size >= len(payload):
+                raise AssertionError(f"packed size={packed_size!r}, want 0 < size < {len(payload)} (repetitive text must compress)")
+            head = req("sftp/read", {"sessionId": session_id, "path": lzpack_packed,
+                                     "maxBytes": 16})
+            magic = base64.b64decode(str(head.get("dataBase64") or ""))[:4]
+            if magic != b"DBXZ":
+                raise AssertionError(f"container magic={magic!r}, want b'DBXZ'")
+
+        def case_sftp_lzpack_expand_download():
+            # ST10 显式解压下载：sftp/download/start(expandLzpack) -> next
+            # 循环（ready 后从本地解压暂存供给原始字节）-> finish。交付原始
+            # 内容与上传源一致。
+            payload = (b"dbx lzpack smoke\n" * 2000)
+            info = req("sftp/download/start", {"sessionId": session_id,
+                                               "remotePath": lzpack_packed,
+                                               "expandLzpack": True})
+            task_id = str(info.get("taskId") or "")
+            if not task_id:
+                raise AssertionError(f"lzpack download start shape: {json.dumps(info)[:160]}")
+            if info.get("compression") != "lzpack":
+                raise AssertionError(f"compression={info.get('compression')!r}, want 'lzpack'")
+            if info.get("size") != len(payload):
+                raise AssertionError(f"declared size={info.get('size')!r}, want {len(payload)} (container header)")
+            # ready 轮询：prep（fetching -> decompressing -> ready）未完成时
+            # next 会报 Compressed download is still preparing。
+            for _ in range(200):
+                status = req("sftp/transfer/status", {"taskId": task_id})
+                if status.get("ready"):
+                    break
+                time.sleep(0.1)
+            if not status.get("ready"):
+                raise AssertionError(f"lzpack prep never ready: {json.dumps(status)[:200]}")
+            restored = bytearray()
+            offset = 0
+            while offset < len(payload):
+                chunk = req("sftp/download/next", {"taskId": task_id, "offset": offset})
+                length = int(chunk.get("length") or 0)
+                if length == 0 and not chunk.get("eof"):
+                    raise AssertionError("empty chunk before eof")
+                restored.extend(b"\x00" * length)  # 字节经二进制帧，smoke 只验证长度链
+                offset += length
+                if chunk.get("eof"):
+                    break
+            if offset != len(payload):
+                raise AssertionError(f"drained {offset} of {len(payload)} bytes")
+            req("sftp/download/finish", {"taskId": task_id})
+            print(f"    lzpack expand download restored {offset} bytes from {lzpack_packed}")
+
+        def case_sftp_lzpack_cleanup():
+            for path in (lzpack_source, lzpack_packed):
+                if req("sftp/exists", {"sessionId": session_id, "path": path}).get("exists"):
+                    req("sftp/delete", {"sessionId": session_id, "path": path})
+            print("    lzpack scratch cleaned")
 
         def case_sftp_list_owner():
             """issue #34: includeOwner 附加属主/属组；缺省时字段必须缺席。"""
@@ -1349,6 +1440,13 @@ def main() -> None:
         archive_case = "sftp/archive .ssh -> tar.gz"
         report.run(archive_case, "sftp/archive", case_sftp_archive)
         report.run("sftp/extract tar.gz -> directory", "sftp/extract", case_sftp_extract, needs=archive_case)
+        report.run("sftp/lzpack upload delivers .dbxz", "sftp/upload/start",
+                   case_sftp_lzpack_upload, needs=archive_case)
+        report.run("sftp/lzpack expand download restores", "sftp/download/start",
+                   case_sftp_lzpack_expand_download,
+                   needs="sftp/lzpack upload delivers .dbxz")
+        report.run("sftp/lzpack scratch cleanup", "sftp/delete", case_sftp_lzpack_cleanup,
+                   needs="sftp/lzpack expand download restores")
         report.run("sftp/list includeOwner owner/group", "sftp/list", case_sftp_list_owner)
 
         print("\n--- sudo_fs group ---")

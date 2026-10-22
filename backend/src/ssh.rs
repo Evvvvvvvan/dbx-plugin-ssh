@@ -1477,6 +1477,11 @@ struct UploadState {
     /// 最终提交走 exec `sudo mv`（让位→提交→回滚）。false = 普通
     /// SFTP 车道（目标目录内暂存 + 同目录 rename 原子提交）。
     sudo_lane: bool,
+    /// 显式压缩包模式（ST10）：用户勾选后 spool 预压 `.dbxz`，远端最终
+    /// 交付 `<目标名>.dbxz`——原始目标路径永不落压缩字节，不做任何远端
+    /// 还原（shell-less 服务器语义成立）。与 M33 gzip 通道互斥（start
+    /// 处二选一：显式 lzpack 优先）。
+    lzpack_explicit: bool,
 }
 
 /// sudo 上传车道的暂存件名（登录用户 SFTP home 下）。独立前缀
@@ -1590,7 +1595,20 @@ struct DownloadState {
     /// poisoned 语义本就是一次性报废：任何错误置 None 由下一片惰性重建，
     /// 重建只是多一次握手。
     raw_client: Arc<AsyncMutex<Option<RawSftpClient>>>,
+    /// 显式解压下载（ST10）：远端源是 `.dbxz`（自研格式），拉到本地暂存后
+    /// 解压供给原始字节——交付物是原始文件，`.dbxz` 中间件在终态清理。与
+    /// M33 gzip prep 共用「拉流 → 本地解压 → staged 分块」骨架，但不需要
+    /// 远端任何工具。
+    expand_lzpack: bool,
+    /// 下载预取槽（ST9）：`download_chunk` 返回第 N 块时后台预读第 N+1 块，
+    /// 下一片命中直接回——消除每块一个整 RTT 的串行等待。仅普通单文件
+    /// 下载启用（树/压缩/latin-1 车道维持原路径，预取收益另计）。槽值是
+    /// (offset, chunk)；offset 与下一请求不一致即作废（续传跳片安全）。
+    prefetch: DownloadPrefetchSlot,
 }
+
+/// 下载预取槽类型（见 `DownloadState.prefetch`）。
+type DownloadPrefetchSlot = Arc<AsyncMutex<Option<(u64, Vec<u8>)>>>;
 
 /// Live state of one recursive folder download. Files stream through the same
 /// chunked pipeline one at a time: `current` is in flight into `sink`'s
@@ -1631,6 +1649,9 @@ struct FinishingUpload {
     /// sudo 上传车道（UploadSudo）：推送暂存件路径（登录用户 home 下）。
     /// 取消收尾按它删远端暂存件，而不是目标目录的 `.dbx-upload-<task>.part`。
     sudo_staging: Option<String>,
+    /// 显式压缩包模式（ST10）：finish 推送前预压 `.dbxz`，远端交付
+    /// `<推送目标>.dbxz`；原始目标路径永不触碰。
+    lzpack_explicit: bool,
 }
 
 /// 压缩下载 prep 的在途状态（M33）：`start_download`/`start_tree_download`
@@ -1929,6 +1950,10 @@ pub struct SshRuntime {
     download_preps: Mutex<HashMap<String, DownloadPrep>>,
     downloads: Mutex<HashMap<String, DownloadState>>,
     transfer_history: Mutex<VecDeque<Value>>,
+    /// 每连接传输性能档案（ST8）：上传/下载 EMA 带宽 + codec 吞吐观测。
+    /// 纯内存、按连接 LRU 容量封顶（transfer_schedule::MAX_TRACKED_CONNECTIONS），
+    /// 键是 connection_id——不落任何会话凭据。
+    transfer_metrics: Mutex<crate::transfer_schedule::TransferMetrics>,
     sudo_keepalive: Arc<Mutex<HashMap<String, SudoKeepalive>>>,
     /// Last metrics snapshot per session, in-memory only (see `CachedMetrics`).
     metrics_cache: Mutex<HashMap<String, CachedMetrics>>,
@@ -1998,6 +2023,7 @@ impl SshRuntime {
             download_preps: Mutex::new(HashMap::new()),
             downloads: Mutex::new(HashMap::new()),
             transfer_history: Mutex::new(VecDeque::new()),
+            transfer_metrics: Mutex::new(crate::transfer_schedule::TransferMetrics::new()),
             session_seq: AtomicU64::new(0),
             sudo_keepalive: Arc::new(Mutex::new(HashMap::new())),
             metrics_cache: Mutex::new(HashMap::new()),
@@ -6208,6 +6234,7 @@ impl SshRuntime {
         resume_task_id: Option<String>,
         encoding: NameEncoding,
         sudo_lane: bool,
+        lzpack_explicit: bool,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
         self.ensure_writable(&session_id).await?;
@@ -6229,8 +6256,12 @@ impl SshRuntime {
         // 正常参与——gz 暂存与远端 gunzip 都落在登录用户 home 暂存件上
         // （finish 的 gz 分支按 push_target 分派），全程不触碰目标目录。
         // 只读对上传无意义（ensure_writable 已整体拦截）。
-        let compression = self
-            .decide_transfer_compression(
+        // 显式压缩包模式（ST10）优先：用户勾选 lzpack 后不进 M33 决策，
+        // 交付 `<目标名>.dbxz`，无需远端任何工具。
+        let compression = if lzpack_explicit {
+            CompressionMode::None
+        } else {
+            self.decide_transfer_compression(
                 &session_id,
                 size,
                 Some(remote_path.rsplit('/').next().unwrap_or("")),
@@ -6238,7 +6269,8 @@ impl SshRuntime {
                 false,
                 encoding == NameEncoding::Latin1,
             )
-            .await;
+            .await
+        };
         // Resume path: re-register a previously interrupted upload job. The
         // spool file and its sidecar meta (written on the first start) hold
         // the received prefix; the caller re-streams only the missing tail.
@@ -6264,6 +6296,7 @@ impl SshRuntime {
                         progress_throttle: crate::progress_throttle::ProgressThrottle::default(),
                         compression,
                         sudo_lane,
+                        lzpack_explicit,
                     },
                 );
             let file_name = remote_path
@@ -6328,6 +6361,7 @@ impl SshRuntime {
                     progress_throttle: crate::progress_throttle::ProgressThrottle::default(),
                     compression,
                     sudo_lane,
+                    lzpack_explicit,
                 },
             );
         let file_name = remote_path.rsplit('/').next().unwrap_or("upload");
@@ -6601,6 +6635,7 @@ impl SshRuntime {
             progress_throttle: _,
             compression,
             sudo_lane,
+            lzpack_explicit,
         } = upload;
         drop(file);
         // sudo 车道（UploadSudo）：注册前先解析登录用户 home 并定死暂存
@@ -6633,6 +6668,7 @@ impl SshRuntime {
                     cancel_reason: cancel_reason.clone(),
                     compression,
                     sudo_staging: sudo_staging.clone(),
+                    lzpack_explicit,
                 },
             );
         let this = self.clone();
@@ -6643,6 +6679,9 @@ impl SshRuntime {
         // 时降级 none——终态与普通推送段的事件据此回传，前端徽标随之清除。
         let mut served_compression = compression;
         tokio::spawn(async move {
+            // 网络腿观测起点（ST8）：压缩预压计入 CPU 段，不回灌带宽模型；
+            // 推送完成时以 expected_size/耗时回灌该连接的上传 EMA。
+            let network_started = std::time::Instant::now();
             let result: Result<(), String> = async {
                 // 压缩通道预压（M33）：spool → `<spool>.gz`。取消即中止；
                 // 压缩失败或比率不划算回落普通推送（原始 spool 语义不变）。
@@ -6720,7 +6759,6 @@ impl SshRuntime {
                                 &local_path,
                                 &remote_path,
                                 &task_id,
-                                TRANSFER_CHUNK_SIZE,
                                 sftp_ext::RawUploadContext {
                                     cancelled: &cancelled,
                                     cancel_reason: &cancel_reason,
@@ -6744,6 +6782,187 @@ impl SshRuntime {
                 let push_target = sudo_staging
                     .clone()
                     .unwrap_or_else(|| temporary.clone());
+                // 显式压缩包交付（ST10）：spool 预压 `.dbxz` → 推送 → 提交为
+                // `<目标名>.dbxz`。与 M33 gzip 通道的本质差异：交付物就是压
+                // 缩文件本身，**不做任何远端还原**，原始目标路径（remote_path）
+                // 全程不被触碰——shell-less 服务器语义成立。压缩失败是任务
+                // 失败（不是回退直传）：用户明确选择压缩交付，静默改交付
+                // 原始文件会违背意图。
+                if lzpack_explicit {
+                    let packed_target = format!("{push_target}.packed.dbxz");
+                    // 最终交付名：普通车道 `<目标目录>/<名>.dbxz`（同目录
+                    // rename 原子提交）；sudo 车道不支持（start 处已拒绝）。
+                    let packed_final = format!("{}.dbxz", remote_path);
+                    let packed_temporary = format!("{push_target}.dbxz");
+                    let packed_backup = format!("{backup}.dbxz");
+                    // 1) 预压（spawn_blocking；phase=compressing）。
+                    emitter
+                        .event(
+                            "sftp/transfer/progress",
+                            upload_progress_payload(
+                                &task_id,
+                                &session_id,
+                                None,
+                                0,
+                                expected_size,
+                                UploadPhase::Compressing,
+                                "running",
+                                CompressionMode::None,
+                            ),
+                        )
+                        .ok();
+                    let spool = local_path.clone();
+                    let packed_path = PathBuf::from(format!("{}.dbxz", local_path.display()));
+                    let packed_local = {
+                        let spool = spool.clone();
+                        let packed_path = packed_path.clone();
+                        let cancelled = cancelled.clone();
+                        let expected = expected_size;
+                        let emitter = emitter.clone();
+                        let task_id = task_id.clone();
+                        let session_id = session_id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let throttle = Arc::new(std::sync::Mutex::new(
+                                crate::progress_throttle::ProgressThrottle::default(),
+                            ));
+                            let progress: transfer_compress::ProgressSink =
+                                Arc::new(move |bytes: u64| {
+                                    let emit = throttle
+                                        .lock()
+                                        .map(|mut throttle| {
+                                            throttle
+                                                .should_emit(expected > 0 && bytes >= expected)
+                                        })
+                                        .unwrap_or(true);
+                                    if !emit {
+                                        return;
+                                    }
+                                    let _ = emitter.event(
+                                        "sftp/transfer/progress",
+                                        upload_progress_payload(
+                                            &task_id,
+                                            &session_id,
+                                            None,
+                                            bytes,
+                                            expected,
+                                            UploadPhase::Compressing,
+                                            "running",
+                                            CompressionMode::None,
+                                        ),
+                                    );
+                                });
+                            transfer_compress::lzpack_compress_file_to(
+                                &spool,
+                                &packed_path,
+                                &cancelled,
+                                &*progress,
+                            )
+                        })
+                        .await
+                    };
+                    let packed_size = match packed_local {
+                        Ok(Ok(size)) => size,
+                        Ok(Err(error))
+                            if error.kind() == std::io::ErrorKind::Interrupted =>
+                        {
+                            let reason = cancel_reason
+                                .lock()
+                                .map(|reason| reason.clone())
+                                .unwrap_or_default();
+                            return Err(upload_cancel_error(reason.as_deref()));
+                        }
+                        Ok(Err(error)) => {
+                            let _ = tokio::fs::remove_file(&packed_path).await;
+                            return Err(format!("lzpack compress failed: {error}"));
+                        }
+                        Err(join_error) => {
+                            return Err(format!("lzpack compress task failed: {join_error}"));
+                        }
+                    };
+                    if cancelled.load(Ordering::Acquire) {
+                        let reason = cancel_reason
+                            .lock()
+                            .map(|reason| reason.clone())
+                            .unwrap_or_default();
+                        return Err(upload_cancel_error(reason.as_deref()));
+                    }
+                    // 2) 推送 .dbxz 到 `<推送暂存>.dbxz`（进度分母=压缩体积）。
+                    Self::push_compressed_stream(
+                        &sftp,
+                        &packed_path,
+                        &packed_temporary,
+                        packed_size,
+                        &task_id,
+                        &session_id,
+                        &transferred_bytes,
+                        &cancelled,
+                        &emitter,
+                    )
+                    .await?;
+                    let _ = tokio::fs::remove_file(&packed_path).await;
+                    if cancelled.load(Ordering::Acquire) {
+                        let _ = sftp.lock().await.remove_file(packed_temporary.clone()).await;
+                        let reason = cancel_reason
+                            .lock()
+                        .map(|reason| reason.clone())
+                            .unwrap_or_default();
+                        return Err(upload_cancel_error(reason.as_deref()));
+                    }
+                    // 3) 提交为 `<目标名>.dbxz`：普通车道同目录 rename 原子
+                    // 提交（让位→落位→清备份，与 plain 提交同款）；压缩交付
+                    // 不保留原始权限位（新文件）。
+                    let target_attributes =
+                        sftp.lock().await.metadata(packed_final.clone()).await.ok();
+                    if let Some(permissions) = target_attributes
+                        .as_ref()
+                        .and_then(|attrs| attrs.permissions)
+                    {
+                        if let Err(error) = sftp
+                            .lock()
+                            .await
+                            .set_metadata(
+                                packed_temporary.clone(),
+                                russh_sftp::protocol::FileAttributes {
+                                    permissions: Some(permissions & 0o7777),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        {
+                            eprintln!("[sftp] upload {task_id} lzpack setstat failed: {error}");
+                        }
+                    }
+                    if target_attributes.is_some() {
+                        // 已有同名 `.dbxz`：按覆盖规则让位（backup → 回滚语义
+                        // 与 commit_remote_file 一致）。
+                        sftp
+                            .lock()
+                            .await
+                            .rename(packed_final.clone(), packed_backup.clone())
+                            .await
+                            .map_err(sftp_error)?;
+                    }
+                    if let Err(error) = sftp
+                        .lock()
+                        .await
+                        .rename(packed_temporary.clone(), packed_final.clone())
+                        .await
+                    {
+                        // 回滚：让位的旧 .dbxz 还原。
+                        if target_attributes.is_some() {
+                            let _ = sftp
+                                .lock()
+                                .await
+                                .rename(packed_backup.clone(), packed_final.clone())
+                                .await;
+                        }
+                        let _ = sftp.lock().await.remove_file(packed_temporary.clone()).await;
+                        return Err(format!("SFTP upload commit failed: {error}"));
+                    }
+                    let _ = sftp.lock().await.remove_file(packed_backup.clone()).await;
+                    let _ = packed_target;
+                    return Ok(());
+                }
                 // 压缩通道推送（M33）：.gz → 远端 `<推送暂存件>.gz` → 远端
                 // gunzip 还原成推送暂存件 → 与普通路径合流走原子提交。
                 // 普通车道的暂存件在目标目录、sudo 车道在登录用户 home
@@ -6944,9 +7163,21 @@ impl SshRuntime {
             // 压缩预压产物（M33）：所有终态路径都清（成功路径已在提交前
             // 删过，这里是取消/回退路径的兜底；重复删除无害）。
             let _ = tokio::fs::remove_file(format!("{}.gz", local_path.display())).await;
+            let _ = tokio::fs::remove_file(format!("{}.dbxz", local_path.display())).await;
             remove_upload_meta(&this.transfer_dir, &task_id);
             match result {
                 Ok(()) => {
+                    // 带宽观测回灌（ST8）：以声明体积与网络腿耗时更新该
+                    // 连接的上传 EMA；小体积观测被模型忽略。
+                    let connection_id = this.session_connection_id(&session_id).await;
+                    if let Ok(mut metrics) = this.transfer_metrics.lock() {
+                        metrics.observe_network(
+                            &connection_id,
+                            crate::transfer_schedule::Direction::Upload,
+                            expected_size,
+                            network_started.elapsed(),
+                        );
+                    }
                     let task = upload_progress_payload(
                         &task_id,
                         &session_id,
@@ -7376,6 +7607,8 @@ impl SshRuntime {
                     overwrite: false,
                     read_handle: Arc::new(AsyncMutex::new(None)),
                     raw_client: Arc::new(AsyncMutex::new(None)),
+                    expand_lzpack: false,
+                    prefetch: Arc::new(AsyncMutex::new(None)),
                 },
             );
         emitter
@@ -7399,6 +7632,492 @@ impl SshRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// 显式解压下载（ST10）：远端源 `.dbxz` → 本地暂存拉流 → 自研解压 →
+    /// staged 分块供给原始字节。注册表里 compression=None + expand_lzpack=
+    /// true：分块供给走 staged 车道（download_staged_chunk），status/事件
+    /// 的 compression 字段标 "lzpack"。原始体积从容器头读出——无法读出
+    /// 即任务失败（不是回退：用户明确要还原 .dbxz，源不是 .dbxz 时静默
+    /// 直传原始文件会暴露服务器上的压缩件语义混乱）。
+    #[allow(clippy::too_many_arguments)]
+    async fn start_lzpack_download(
+        self: &Arc<Self>,
+        session_id: &str,
+        remote_path: &str,
+        save_to_local: bool,
+        download_dir: Option<&str>,
+        conflict: Option<&str>,
+        encoding: NameEncoding,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        // 只读连接不解压下载：读远端无副作用，但落盘本地是同一条链——本
+        // 判定与 M33 prep 的 read_only 拦截口径一致（prep 需要远端写临时件，
+        // lzpack 不需要远端写，因此这里不拦只读）。
+        let latin1 = encoding == NameEncoding::Latin1;
+        // 1) 实测压缩流体积（SFTP stat；latin-1 车道裸包 stat）。
+        let packed_size = if latin1 && sftp_name::has_wire_lane(remote_path, encoding) {
+            let mut client = self.raw_sftp_client(session_id).await?;
+            client
+                .stat(&sftp_name::unescape_wire(remote_path))
+                .await
+                .map_err(sftp_error)?
+                .size
+                .unwrap_or(0)
+        } else {
+            let size = self
+                .sftp(session_id)
+                .await?
+                .lock()
+                .await
+                .metadata(remote_path.to_string())
+                .await
+                .map_err(sftp_error)?
+                .size
+                .unwrap_or(0);
+            size
+        };
+        if packed_size > MAX_TRANSFER_SIZE {
+            return Err(format!(
+                "Transfers are limited to {MAX_TRANSFER_SIZE} bytes"
+            ));
+        }
+        if packed_size == 0 {
+            return Err("Remote .dbxz file is empty".to_string());
+        }
+        // 2) 容器头探测原始体积（首 16 字节，裸包/高层按车道读）。
+        let head = if latin1 && sftp_name::has_wire_escapes(remote_path) {
+            let mut client = self.raw_sftp_client(session_id).await?;
+            client
+                .read_chunk(
+                    &sftp_name::unescape_wire(remote_path),
+                    0,
+                    crate::lzpack::HEADER_LEN as u32,
+                )
+                .await?
+        } else {
+            let sftp = self.sftp(session_id).await?;
+            let mut handle_slot_file = sftp
+                .lock()
+                .await
+                .open(remote_path.to_string())
+                .await
+                .map_err(sftp_error)?;
+            use tokio::io::AsyncReadExt;
+            let mut head = vec![0_u8; crate::lzpack::HEADER_LEN];
+            handle_slot_file
+                .read_exact(&mut head)
+                .await
+                .map_err(|error| format!("Failed to read .dbxz header: {error}"))?;
+            head
+        };
+        let original_size = crate::lzpack::read_container_original_size(&head)
+            .map_err(|error| format!("Not a valid .dbxz container: {error}"))?;
+        if original_size as u64 > MAX_TRANSFER_SIZE {
+            return Err(format!(
+                "Transfers are limited to {MAX_TRANSFER_SIZE} bytes"
+            ));
+        }
+        // 3) 任务注册：sink 按普通下载同款（saveToLocal 落盘由 finish 阶段
+        // 处理；浏览器模式字节直接给前端），分块供给 staged plain。
+        let task_id = Uuid::new_v4().to_string();
+        let file_name = remote_path
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("download")
+            .strip_suffix(".dbxz")
+            .filter(|value| !value.is_empty())
+            .unwrap_or(remote_path.rsplit('/').next().unwrap_or("download"))
+            .to_string();
+        let staging_dir = self.transfer_dir.join("downloads");
+        std::fs::create_dir_all(&staging_dir)
+            .map_err(|error| format!("Failed to create download staging directory: {error}"))?;
+        let packed_staging = staging_dir.join(format!("download-{task_id}.part.dbxz"));
+        let staged_plain = staging_dir.join(format!("download-{task_id}.plain"));
+        let final_dir = if save_to_local {
+            let dir = download_dir
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    local_downloads::downloads_base_dir(|key| std::env::var_os(key), &self.data_dir)
+                });
+            if !dir.is_absolute() {
+                return Err("Download directory must be an absolute path".to_string());
+            }
+            std::fs::create_dir_all(&dir).map_err(|error| {
+                format!(
+                    "Failed to create download directory '{}': {error}",
+                    dir.display()
+                )
+            })?;
+            Some(dir)
+        } else {
+            None
+        };
+        let throttle = Throttle::new(crate::preferences::transfer_download_limit_kib(
+            &self.data_dir,
+        ));
+        self.downloads
+            .lock()
+            .map_err(|_| "Download registry is poisoned".to_string())?
+            .insert(
+                task_id.clone(),
+                DownloadState {
+                    session_id: session_id.to_string(),
+                    remote_path: remote_path.to_string(),
+                    file_name: file_name.clone(),
+                    size: original_size as u64,
+                    next_offset: 0,
+                    sink: None,
+                    tree: None,
+                    sudo_tmp: None,
+                    latin1,
+                    throttle,
+                    progress_throttle: crate::progress_throttle::ProgressThrottle::default(),
+                    compression: CompressionMode::None,
+                    ready: false,
+                    serving_plain: false,
+                    staged_plain: Some(staged_plain.clone()),
+                    gz_staging: Some(packed_staging.clone()),
+                    remote_temp: None,
+                    final_dir,
+                    overwrite: matches!(conflict, Some("overwrite")),
+                    read_handle: Arc::new(AsyncMutex::new(None)),
+                    raw_client: Arc::new(AsyncMutex::new(None)),
+                    expand_lzpack: true,
+                    prefetch: Arc::new(AsyncMutex::new(None)),
+                },
+            );
+        // 4) prep 后台任务：拉流（packed 车道进度）→ 解压 → ready。
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_reason = Arc::new(Mutex::new(None::<String>));
+        let phase = Arc::new(std::sync::Mutex::new("fetching"));
+        self.download_preps
+            .lock()
+            .map_err(|_| "Download prep registry is poisoned".to_string())?
+            .insert(
+                task_id.clone(),
+                DownloadPrep {
+                    session_id: session_id.to_string(),
+                    cancelled: cancelled.clone(),
+                    cancel_reason: cancel_reason.clone(),
+                    phase: Arc::new(std::sync::Mutex::new("fetching")),
+                    remote_temp: None,
+                    gz_staging: packed_staging.clone(),
+                },
+            );
+        let this = self.clone();
+        let prep_task_id = task_id.clone();
+        let prep_session_id = session_id.to_string();
+        let prep_remote_path = remote_path.to_string();
+        let prep_emitter = emitter.clone();
+        tokio::spawn(async move {
+            let outcome = this
+                .prep_lzpack_download(
+                    &prep_task_id,
+                    &prep_session_id,
+                    &prep_remote_path,
+                    packed_size,
+                    original_size as u64,
+                    &packed_staging,
+                    &staged_plain,
+                    &throttle,
+                    &cancelled,
+                    &phase,
+                    &prep_emitter,
+                )
+                .await;
+            match outcome {
+                PrepOutcome::Ready => {
+                    {
+                        let mut downloads = this
+                            .downloads
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        if let Some(current) = downloads.get_mut(&prep_task_id) {
+                            current.ready = true;
+                        }
+                    }
+                    this.download_preps
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .remove(&prep_task_id);
+                    let _ = prep_emitter.event(
+                        "sftp/transfer/progress",
+                        json!({ "taskId": prep_task_id, "sessionId": prep_session_id, "direction": "download", "transferred": 0, "size": original_size, "status": "running", "phase": "ready", "compression": "lzpack" }),
+                    );
+                }
+                PrepOutcome::Fallback(reason) => {
+                    // 解压下载无「回落直传」语义：源就是 .dbxz，直传只会把
+                    // 压缩件交给用户——失败终态更诚实。
+                    eprintln!("[sftp] download {prep_task_id} lzpack prep failed: {reason}");
+                    let _ = tokio::fs::remove_file(&packed_staging).await;
+                    let _ = tokio::fs::remove_file(&staged_plain).await;
+                    let downloads = this
+                        .downloads
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .remove(&prep_task_id);
+                    this.download_preps
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .remove(&prep_task_id);
+                    if let Some(download) = downloads {
+                        let task = json!({ "taskId": prep_task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": 0, "status": "failed", "error": format!("lzpack expand failed: {reason}") });
+                        this.record_transfer(task.clone());
+                        let _ = prep_emitter.event("sftp/transfer/progress", task);
+                    }
+                }
+                PrepOutcome::Cancelled => {
+                    let _ = tokio::fs::remove_file(&packed_staging).await;
+                    let _ = tokio::fs::remove_file(&staged_plain).await;
+                    this.download_preps
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .remove(&prep_task_id);
+                }
+            }
+        });
+        emitter
+            .event(
+                "sftp/transfer/progress",
+                json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "transferred": 0, "size": original_size, "status": "queued", "phase": "fetching", "compression": "lzpack" }),
+            )
+            .map_err(plugin_error)?;
+        let connection_id = self.session_connection_id(session_id).await;
+        self.record_transfer_start(
+            &task_id,
+            session_id,
+            &connection_id,
+            "download",
+            &file_name,
+            original_size as u64,
+        );
+        Ok(
+            json!({ "taskId": task_id, "fileName": file_name, "size": original_size, "chunkSize": TRANSFER_CHUNK_SIZE, "resumeOffset": 0_u64, "saveToLocal": save_to_local, "compression": "lzpack" }),
+        )
+    }
+
+    /// lzpack 下载 prep 主体（ST10）：拉 `.dbxz` 到本地暂存（车道感知分块
+    /// + 限速 + 取消检查）→ spawn_blocking 自研解压 → staged plain。
+    ///
+    /// 任何一步失败走 Fallback（终态失败），取消走 Cancelled。
+    #[allow(clippy::too_many_arguments)]
+    async fn prep_lzpack_download(
+        self: &Arc<Self>,
+        task_id: &str,
+        session_id: &str,
+        remote_path: &str,
+        packed_size: u64,
+        original_size: u64,
+        packed_staging: &Path,
+        staged_plain: &Path,
+        throttle: &Throttle,
+        cancelled: &Arc<AtomicBool>,
+        _phase: &Arc<std::sync::Mutex<&'static str>>,
+        emitter: &PluginEmitter,
+    ) -> PrepOutcome {
+        // 车道判定在 prep 内重算（注册表快照不携带编码）：与 start 处同
+        // 口径——latin-1 且 wire 含转义才走裸包。
+        let raw_lane = self
+            .downloads
+            .lock()
+            .map(|downloads| {
+                downloads
+                    .get(task_id)
+                    .map(|download| {
+                        download.latin1 && sftp_name::has_wire_escapes(&download.remote_path)
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let is_cancelled = || {
+            cancelled.load(Ordering::Acquire)
+                || self
+                    .downloads
+                    .lock()
+                    .map(|downloads| !downloads.contains_key(task_id))
+                    .unwrap_or(false)
+        };
+        let emit_phase = |phase_name: &str,
+                          transferred: u64,
+                          denominator: u64,
+                          compression: &str|
+         -> Result<(), String> {
+            emitter
+                .event(
+                    "sftp/transfer/progress",
+                    json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "transferred": transferred, "size": denominator, "status": "running", "phase": phase_name, "compression": compression }),
+                )
+                .map_err(plugin_error)
+        };
+        // 1) 拉流：latin-1 裸包车道按 32KiB READ；高层车道按 256KiB READ
+        // （句柄复用语义与 pull_remote_gzip 相同的循环骨架）。
+        if let Err(error) = emit_phase("fetching", 0, packed_size, "lzpack") {
+            return PrepOutcome::Fallback(error);
+        }
+        let pulled = {
+            let pull_result: Result<u64, String> = async {
+                let mut target = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(packed_staging)
+                    .await
+                    .map_err(|error| format!("Failed to create packed staging file: {error}"))?;
+                let mut pulled = 0_u64;
+                let mut progress_throttle = crate::progress_throttle::ProgressThrottle::default();
+                if raw_lane {
+                    // 裸包车道：逐 32KiB READ（raw 客户端单请求上限）。
+                    let mut raw_slot: Option<RawSftpClient> = None;
+                    let raw_path = sftp_name::unescape_wire(remote_path);
+                    while pulled < packed_size {
+                        if cancelled.load(Ordering::Acquire) {
+                            return Err(upload_cancel_error(None));
+                        }
+                        let want = ((packed_size - pulled).min(32 * 1024)) as u32;
+                        if raw_slot.is_none() {
+                            raw_slot = Some(self.raw_sftp_client(session_id).await?);
+                        }
+                        let chunk = match raw_slot
+                            .as_mut()
+                            .expect("raw just ensured")
+                            .read_chunk(&raw_path, pulled, want)
+                            .await
+                        {
+                            Ok(chunk) => chunk,
+                            Err(error) => return Err(error),
+                        };
+                        if chunk.is_empty() {
+                            return Err("remote .dbxz truncated".to_string());
+                        }
+                        target
+                            .write_all(&chunk)
+                            .await
+                            .map_err(|error| format!("Failed to write packed staging: {error}"))?;
+                        pulled += chunk.len() as u64;
+                        if let (true, Some(started)) =
+                            (throttle.enabled(), Some(std::time::Instant::now()))
+                        {
+                            throttle.pace(chunk.len(), started.elapsed()).await;
+                        }
+                        if progress_throttle.should_emit(pulled >= packed_size) {
+                            let _ = emit_phase("fetching", pulled, packed_size, "lzpack");
+                        }
+                    }
+                } else {
+                    let mut source = self
+                        .sftp(session_id)
+                        .await?
+                        .lock()
+                        .await
+                        .open(remote_path.to_string())
+                        .await
+                        .map_err(sftp_error)?;
+                    let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+                    loop {
+                        if cancelled.load(Ordering::Acquire) {
+                            return Err(upload_cancel_error(None));
+                        }
+                        let chunk_started = throttle.enabled().then(std::time::Instant::now);
+                        let read = source
+                            .read(&mut buffer)
+                            .await
+                            .map_err(|error| format!("SFTP dbxz fetch failed: {error}"))?;
+                        if read == 0 {
+                            break;
+                        }
+                        target
+                            .write_all(&buffer[..read])
+                            .await
+                            .map_err(|error| format!("Failed to write packed staging: {error}"))?;
+                        pulled += read as u64;
+                        if let (true, Some(started)) = (throttle.enabled(), chunk_started) {
+                            throttle.pace(read, started.elapsed()).await;
+                        }
+                        if progress_throttle.should_emit(pulled >= packed_size) {
+                            let _ = emit_phase("fetching", pulled, packed_size, "lzpack");
+                        }
+                    }
+                }
+                target
+                    .flush()
+                    .await
+                    .map_err(|error| format!("Failed to flush packed staging: {error}"))?;
+                Ok(pulled)
+            }
+            .await;
+            match pull_result {
+                Ok(pulled) => pulled,
+                Err(error) => {
+                    if is_cancelled() {
+                        return PrepOutcome::Cancelled;
+                    }
+                    return PrepOutcome::Fallback(format!("dbxz fetch failed: {error}"));
+                }
+            }
+        };
+        if pulled != packed_size {
+            return PrepOutcome::Fallback(format!(
+                "remote .dbxz size mismatch: pulled {pulled} of {packed_size}"
+            ));
+        }
+        if is_cancelled() {
+            return PrepOutcome::Cancelled;
+        }
+        // 2) 自研解压（spawn_blocking；输出上限按 stat 探测的原始体积钳制
+        // 由容器头声明值承担）。
+        if let Err(error) = emit_phase("decompressing", 0, original_size, "lzpack") {
+            return PrepOutcome::Fallback(error);
+        }
+        let decompressed = {
+            let source = packed_staging.to_path_buf();
+            let target = staged_plain.to_path_buf();
+            let cancelled = cancelled.clone();
+            let emitter = emitter.clone();
+            let task_id = task_id.to_string();
+            let session_id = session_id.to_string();
+            let throttle = Arc::new(std::sync::Mutex::new(
+                crate::progress_throttle::ProgressThrottle::default(),
+            ));
+            let progress: transfer_compress::ProgressSink = Arc::new(move |bytes: u64| {
+                let emit = throttle
+                    .lock()
+                    .map(|mut throttle| {
+                        throttle.should_emit(original_size > 0 && bytes >= original_size)
+                    })
+                    .unwrap_or(true);
+                if !emit {
+                    return;
+                }
+                let _ = emitter.event(
+                    "sftp/transfer/progress",
+                    json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "transferred": bytes, "size": original_size, "status": "running", "phase": "decompressing", "compression": "lzpack" }),
+                );
+            });
+            tokio::task::spawn_blocking(move || {
+                transfer_compress::lzpack_decompress_file_to(
+                    &source, &target, &cancelled, &*progress,
+                )
+            })
+            .await
+        };
+        match decompressed {
+            Ok(Ok(bytes)) if bytes == original_size => PrepOutcome::Ready,
+            Ok(Ok(bytes)) => PrepOutcome::Fallback(format!(
+                "decompressed size mismatch: {bytes} of {original_size}"
+            )),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
+                PrepOutcome::Cancelled
+            }
+            Ok(Err(error)) => PrepOutcome::Fallback(format!("decompress failed: {error}")),
+            Err(join_error) => {
+                PrepOutcome::Fallback(format!("decompress task failed: {join_error}"))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_download(
         self: &Arc<Self>,
         session_id: &str,
@@ -7408,9 +8127,28 @@ impl SshRuntime {
         download_dir: Option<&str>,
         conflict: Option<&str>,
         encoding: NameEncoding,
+        expand_lzpack: bool,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
         let remote_path = normalize_remote_path(remote_path)?;
+        // 显式解压下载（ST10）：仅新任务可续传互斥与 M33 相同。压缩流体积
+        // 用 SFTP stat 实测，原始体积从容器头 16 字节读出。
+        if expand_lzpack {
+            if offset > 0 {
+                return Err("Lzpack downloads cannot resume from an offset".to_string());
+            }
+            return self
+                .start_lzpack_download(
+                    session_id,
+                    &remote_path,
+                    save_to_local,
+                    download_dir,
+                    conflict,
+                    encoding,
+                    emitter,
+                )
+                .await;
+        }
         if self.active_transfer_count(session_id)? as u64 >= self.transfer_depth_limit() {
             return Err(format!(
                 "This SSH session already has {} active transfers",
@@ -7581,6 +8319,8 @@ impl SshRuntime {
                     overwrite: matches!(conflict, Some("overwrite")),
                     read_handle: Arc::new(AsyncMutex::new(None)),
                     raw_client: Arc::new(AsyncMutex::new(None)),
+                    expand_lzpack: false,
+                    prefetch: Arc::new(AsyncMutex::new(None)),
                 },
             );
         if compression == CompressionMode::Gzip {
@@ -8305,6 +9045,8 @@ impl SshRuntime {
                     overwrite: false,
                     read_handle: Arc::new(AsyncMutex::new(None)),
                     raw_client: Arc::new(AsyncMutex::new(None)),
+                    expand_lzpack: false,
+                    prefetch: Arc::new(AsyncMutex::new(None)),
                 },
             );
         if compression == CompressionMode::Gzip {
@@ -8974,7 +9716,7 @@ impl SshRuntime {
     }
 
     pub async fn download_chunk(
-        &self,
+        self: &Arc<Self>,
         task_id: &str,
         offset: u64,
         emitter: &PluginEmitter,
@@ -8998,7 +9740,11 @@ impl SshRuntime {
                 .download_tree_chunk(task_id, offset, download, emitter)
                 .await;
         }
-        if download.compression == CompressionMode::Gzip && !download.serving_plain {
+        // staged 车道分派（M33 gzip 与 ST10 lzpack 解压下载共用）：压缩任
+        // 务的原始字节都来自本地 staged plain 文件。
+        if download.expand_lzpack
+            || (download.compression == CompressionMode::Gzip && !download.serving_plain)
+        {
             return self
                 .download_staged_chunk(task_id, offset, download, emitter)
                 .await;
@@ -9015,66 +9761,31 @@ impl SshRuntime {
         // 由 limiter 补足差额等待。限速关闭时 Throttle::pace 是纯即时调用，
         // 热路径零开销。
         let chunk_started = download.throttle.enabled().then(std::time::Instant::now);
-        // latin-1 转义路径走裸包 READ（raw 字节打开远端文件）；普通路径
-        // 保持高层客户端的 seek+read。车道判定按 start 登记的生效编码
-        // （M28-B 修 D-7）：auto 一律走高层——auto 列表 uri 字面 `%` 未
-        // 未经 `%25` 自转义，wire 串里的 `%XX` 是文件名字面量，不能还原。
-        // 每 chunk 独立 open/close：转义名是极少数派，简单性优先。raw EOF
-        // 回空 chunk，与高层路径的 eof 语义一致。
-        let chunk = if download.latin1 && sftp_name::has_wire_escapes(&download.remote_path) {
-            self.raw_read_chunk_cached(
-                &download.session_id,
-                &download.raw_client,
-                &download.remote_path,
-                offset,
-                requested as u32,
-            )
-            .await?
+        // 预取命中（ST9）：上一片返回时后台预读的本片已在槽里，直接取出，
+        // 省一个整 RTT。仅普通单文件下载启用（树/压缩/latin-1 车道不预取）；
+        // 槽 offset 与本片请求不一致即作废（续传/重试跳片安全）。
+        let prefetchable = download.compression == CompressionMode::None
+            && !(download.latin1 && sftp_name::has_wire_escapes(&download.remote_path));
+        let mut served_from_prefetch = false;
+        let chunk = if prefetchable {
+            let mut slot = download.prefetch.lock().await;
+            match slot.take() {
+                Some((hit_offset, hit_chunk))
+                    if hit_offset == offset && hit_chunk.len() == requested =>
+                {
+                    served_from_prefetch = true;
+                    hit_chunk
+                }
+                Some(_) | None => {
+                    // 槽空/过期：正常同步读。
+                    drop(slot);
+                    self.read_plain_download_chunk(&download, offset, requested)
+                        .await?
+                }
+            }
         } else {
-            // 句柄复用：首片 open 后缓存在任务槽（File 的 Drop 发
-            // close_nowait，槽位置 None 即完成关闭），后续片直接
-            // seek+read——逐片 OPEN/READ/CLOSE 每片多付 2 个 RTT，高延迟
-            // 链路吞吐被 RTT 界死。seek 用绝对 offset，断点续传/重试跳片
-            // 同样成立。
-            let read_result: Result<Vec<u8>, String> = async {
-                let sftp = self.sftp(&download.session_id).await?;
-                let mut handle_slot = download.read_handle.lock().await;
-                if handle_slot.is_none() {
-                    let opened = sftp
-                        .lock()
-                        .await
-                        .open(download.remote_path.clone())
-                        .await
-                        .map_err(sftp_error)?;
-                    *handle_slot = Some(opened);
-                }
-                let source = handle_slot.as_mut().expect("handle just ensured");
-                source
-                    .seek(std::io::SeekFrom::Start(offset))
-                    .await
-                    .map_err(|error| format!("SFTP download seek failed: {error}"))?;
-                let mut chunk = vec![0_u8; requested];
-                let length = source
-                    .read(&mut chunk)
-                    .await
-                    .map_err(|error| format!("SFTP download failed: {error}"))?;
-                chunk.truncate(length);
-                Ok(chunk)
-            }
-            .await;
-            match read_result {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    // 读失败即弃句柄（下一片惰性重建）；通道级错误连带失效
-                    // 整个 SFTP 客户端缓存——死通道被原样复用会把该会话
-                    // SFTP 打到永久报错（误判无害：重建只是多一次握手）。
-                    *download.read_handle.lock().await = None;
-                    if is_channel_level_sftp_error(&error) {
-                        self.invalidate_sftp_cache(&download.session_id).await;
-                    }
-                    return Err(error);
-                }
-            }
+            self.read_plain_download_chunk(&download, offset, requested)
+                .await?
         };
         // 限速等待在读毕、本地落盘之前：等待本身计入下一块之前的墙钟，
         // 且不会推迟本地写完成的应答语义（前端循环按块等待）。
@@ -9123,9 +9834,106 @@ impl SshRuntime {
                 )
                 .map_err(plugin_error)?;
         }
+        // 预取下一片（ST9）：仅当本片非 EOF、限速关闭（限速节奏下预取会
+        // 打乱配速）且本次不是预取命中时发起；命中时后台任务通常还在跑，
+        // 槽仍为空则补发一次。预读失败静默丢弃（槽保持空，下一片同步读）。
+        if prefetchable
+            && next_offset < download.size
+            && !download.throttle.enabled()
+            && !served_from_prefetch
+        {
+            let this = self.clone_for_download_prefetch();
+            let download = download.clone();
+            let prefetch_offset = next_offset;
+            let prefetch_len = download
+                .size
+                .saturating_sub(prefetch_offset)
+                .min(TRANSFER_CHUNK_SIZE as u64) as usize;
+            tokio::spawn(async move {
+                // 预取失败不打断主流程，下一片同步读兜底。
+                if let Ok(prefetched) = this
+                    .read_plain_download_chunk(&download, prefetch_offset, prefetch_len)
+                    .await
+                {
+                    *download.prefetch.lock().await = Some((prefetch_offset, prefetched));
+                }
+            });
+        }
         Ok(
             json!({ "taskId": task_id, "offset": offset, "length": length, "eof": next_offset >= download.size, "fileName": download.file_name }),
         )
+    }
+
+    /// download_chunk 的 Arc 派生入口（预取任务用）：download_chunk 本就
+    /// 定义在 `Arc<Self>` 上（start_download 同款）。
+    fn clone_for_download_prefetch(self: &Arc<Self>) -> Arc<Self> {
+        Arc::clone(self)
+    }
+
+    /// 普通单文件下载的分片读取（原 download_chunk 内联逻辑抽取）：latin-1
+    /// 转义名走裸包 READ，其余走高层句柄复用 seek+read。错误语义与抽取前
+    /// 一致：句柄错误弃槽、通道级错误连带失效 SFTP 客户端缓存。
+    async fn read_plain_download_chunk(
+        &self,
+        download: &DownloadState,
+        offset: u64,
+        requested: usize,
+    ) -> Result<Vec<u8>, String> {
+        if download.latin1 && sftp_name::has_wire_escapes(&download.remote_path) {
+            return self
+                .raw_read_chunk_cached(
+                    &download.session_id,
+                    &download.raw_client,
+                    &download.remote_path,
+                    offset,
+                    requested as u32,
+                )
+                .await;
+        }
+        // 句柄复用：首片 open 后缓存在任务槽（File 的 Drop 发
+        // close_nowait，槽位置 None 即完成关闭），后续片直接
+        // seek+read——逐片 OPEN/READ/CLOSE 每片多付 2 个 RTT，高延迟
+        // 链路吞吐被 RTT 界死。seek 用绝对 offset，断点续传/重试跳片
+        // 同样成立。
+        let read_result: Result<Vec<u8>, String> = async {
+            let sftp = self.sftp(&download.session_id).await?;
+            let mut handle_slot = download.read_handle.lock().await;
+            if handle_slot.is_none() {
+                let opened = sftp
+                    .lock()
+                    .await
+                    .open(download.remote_path.clone())
+                    .await
+                    .map_err(sftp_error)?;
+                *handle_slot = Some(opened);
+            }
+            let source = handle_slot.as_mut().expect("handle just ensured");
+            source
+                .seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|error| format!("SFTP download seek failed: {error}"))?;
+            let mut chunk = vec![0_u8; requested];
+            let length = source
+                .read(&mut chunk)
+                .await
+                .map_err(|error| format!("SFTP download failed: {error}"))?;
+            chunk.truncate(length);
+            Ok(chunk)
+        }
+        .await;
+        match read_result {
+            Ok(chunk) => Ok(chunk),
+            Err(error) => {
+                // 读失败即弃句柄（下一片惰性重建）；通道级错误连带失效
+                // 整个 SFTP 客户端缓存——死通道被原样复用会把该会话
+                // SFTP 打到永久报错（误判无害：重建只是多一次握手）。
+                *download.read_handle.lock().await = None;
+                if is_channel_level_sftp_error(&error) {
+                    self.invalidate_sftp_cache(&download.session_id).await;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// `sftp/transfer/cancel`. `reason` is an optional workbench slug ("user",
@@ -9150,7 +9958,7 @@ impl SshRuntime {
                 eprintln!("[sudo-download] temp cleanup failed ({tmp}): {error}");
             }
         }
-        if download.compression == CompressionMode::Gzip {
+        if download.compression == CompressionMode::Gzip || download.expand_lzpack {
             if let Some(staged) = download.staged_plain.as_ref() {
                 let _ = std::fs::remove_file(staged);
             }
@@ -9335,14 +10143,18 @@ impl SshRuntime {
         }
         let sudo_tmp = download.sudo_tmp.clone();
         let session_id = download.session_id.clone();
-        let compressed_cleanup = (download.compression == CompressionMode::Gzip).then(|| {
-            (
-                download.remote_temp.clone(),
-                download.gz_staging.clone(),
-                download.staged_plain.clone(),
-                download.final_dir.is_none(),
-            )
-        });
+        // 压缩任务终态清理条件（M33 gzip 与 ST10 lzpack 解压下载同骨架）：
+        // lzpack 的 gz_staging 槽放的是 packed 暂存件（.part.dbxz），remote_temp
+        // 恒为 None（无远端临时件）。
+        let compressed_cleanup =
+            (download.compression == CompressionMode::Gzip || download.expand_lzpack).then(|| {
+                (
+                    download.remote_temp.clone(),
+                    download.gz_staging.clone(),
+                    download.staged_plain.clone(),
+                    download.final_dir.is_none(),
+                )
+            });
         let result = self
             .complete_single_file_download(download, task_id, emitter)
             .await;
@@ -9725,7 +10537,13 @@ impl SshRuntime {
                 } else {
                     "running"
                 },
-                upload.compression,
+                // 显式压缩包模式在 status 上标注 lzpack（前端徽标与分母
+                // 语义：压缩预压段按原始体积，推送段按压缩体积）。
+                if upload.lzpack_explicit {
+                    CompressionMode::Lzpack
+                } else {
+                    upload.compression
+                },
             );
             return Ok(status);
         }
@@ -9736,7 +10554,19 @@ impl SshRuntime {
             .get(task_id)
         {
             let mut status = json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "size": download.size, "transferred": download.next_offset, "status": "running" });
-            if download.compression == CompressionMode::Gzip {
+            if download.expand_lzpack {
+                status["compression"] = json!("lzpack");
+                status["ready"] = json!(download.ready);
+                if !download.ready {
+                    if let Ok(preps) = self.download_preps.lock() {
+                        if let Some(prep) = preps.get(task_id) {
+                            if let Ok(phase) = prep.phase.lock() {
+                                status["phase"] = json!(*phase);
+                            }
+                        }
+                    }
+                }
+            } else if download.compression == CompressionMode::Gzip {
                 // ready-wait 的兜底轮询面（M33）：事件丢失时前端据此判断
                 // prep 是否完成；进行中的 prep 阶段从 prep 注册表取。
                 status["compression"] = json!("gzip");
@@ -14842,6 +15672,8 @@ matrix-ed25519";
                 overwrite: false,
                 read_handle: Arc::new(AsyncMutex::new(None)),
                 raw_client: Arc::new(AsyncMutex::new(None)),
+                expand_lzpack: false,
+                prefetch: Arc::new(AsyncMutex::new(None)),
             },
         );
         let no_connection = |_: &str| String::new();
@@ -14952,6 +15784,8 @@ matrix-ed25519";
                     overwrite: false,
                     read_handle: Arc::new(AsyncMutex::new(None)),
                     raw_client: Arc::new(AsyncMutex::new(None)),
+                    expand_lzpack: false,
+                    prefetch: Arc::new(AsyncMutex::new(None)),
                 },
             );
         }

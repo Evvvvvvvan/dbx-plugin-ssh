@@ -1107,6 +1107,12 @@ SFTP 收发字节——shell-less 服务器（仅 SFTP 权限）完整可用。
 staged plain → `ready` → `sftp/download/next` 从 staged 供给原始字节。交付原始文件；不支持
 续传（`offset > 0` 报错）；latin-1 裸包车道支持（裸包 stat/READ）。
 
+**性能模型闭环（P3）**：每连接维护上传/下载分离的 EMA 有效带宽（α=0.3，<256KiB 观测不回灌，
+LRU 64 连接封顶，connection/disconnect 主动清理）与 lzpack codec 实测吞吐（上传预压/下载解压
+完成点回灌 + 压缩率）。显式 lzpack start 时跑一次顾问预测（`advise_explicit_compression`）：
+带宽样本不足或 codec 无实测 → 沉默；预测负收益 → 仅 stderr 日志提示，**不拦截**——交付语义
+由用户决定。预测公式与自动决策 `decide()` 同源（`T_direct` vs `T_compressed`）。
+
 **下载预取（ST9，普通单文件下载）**：`sftp/download/next` 返回第 N 块时后台预读第 N+1 块入
 任务槽，下一片命中直接回——消除每块一个整 RTT 的串行等待。树/压缩/latin-1/限速任务不启用
 （限速节奏下预取打乱配速）。槽 offset 与请求不一致即作废（续传/重试跳片安全）。

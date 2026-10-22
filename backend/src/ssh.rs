@@ -2154,6 +2154,12 @@ impl SshRuntime {
     }
 
     pub async fn disconnect_connection(&self, connection_id: &str) -> Result<(), String> {
+        // 性能档案随连接销毁（ST8/P3）：EMA/codec 观测是连接级的，重连后的
+        // 链路可能完全不同，旧档案只会污染下一次顾问预测。容量封顶之外的
+        // 主动清理面（任务书 §9「历史可清理」）。
+        if let Ok(mut metrics) = self.transfer_metrics.lock() {
+            metrics.forget(connection_id);
+        }
         // Serialize against an independent forward being authenticated and
         // registered for this connection.
         let mut forward_guard = self.forward_transports.lock().await;
@@ -6268,7 +6274,28 @@ impl SshRuntime {
         // （finish 的 gz 分支按 push_target 分派），全程不触碰目标目录。
         // 只读对上传无意义（ensure_writable 已整体拦截）。
         // 显式压缩包模式（ST10）优先：用户勾选 lzpack 后不进 M33 决策，
-        // 交付 `<目标名>.dbxz`，无需远端任何工具。
+        // 交付 `<目标名>.dbxz`，无需远端任何工具。P3 顾问：历史 EMA 带宽 +
+        // codec 吞吐齐全时跑一次预测，负收益打日志（不拦截——交付语义由
+        // 用户决定；首次使用无观测时静默）。
+        if lzpack_explicit {
+            let connection_id = self.session_connection_id(&session_id).await;
+            if let Ok(metrics) = self.transfer_metrics.lock() {
+                if let Some(profile) = metrics.profile(&connection_id) {
+                    let advice = crate::transfer_schedule::advise_explicit_compression(
+                        size,
+                        crate::transfer_schedule::Direction::Upload,
+                        profile,
+                        0.6,
+                        crate::transfer_schedule::DEFAULT_GAIN_THRESHOLD,
+                    );
+                    if advice == crate::transfer_schedule::Advice::RecommendDirect {
+                        eprintln!(
+                            "[sftp] upload {session_id} lzpack advisor: predicted gain negative on this link, plain transfer would likely be faster (explicit mode proceeds)"
+                        );
+                    }
+                }
+            }
+        }
         let compression = if lzpack_explicit {
             CompressionMode::None
         } else {
@@ -6840,6 +6867,7 @@ impl SshRuntime {
                         .ok();
                     let spool = local_path.clone();
                     let packed_path = PathBuf::from(format!("{}.dbxz", local_path.display()));
+                    let compress_started = std::time::Instant::now();
                     let packed_local = {
                         let spool = spool.clone();
                         let packed_path = packed_path.clone();
@@ -6888,7 +6916,30 @@ impl SshRuntime {
                         .await
                     };
                     let packed_size = match packed_local {
-                        Ok(Ok(size)) => size,
+                        Ok(Ok(size)) => {
+                            // codec 观测回灌（ST8/P3）：压缩吞吐 + 压缩率记入
+                            // 该连接档案，供决策器 `decide()` 预测用。吞吐 =
+                            // 原始体积/耗时；比率 = 压缩流/原始体积。
+                            let elapsed = compress_started.elapsed();
+                            if elapsed.as_secs_f64() > 0.0 && expected_size > 0 {
+                                let compress_rate = expected_size as f64 / elapsed.as_secs_f64();
+                                let ratio = size as f64 / expected_size as f64;
+                                let connection_id =
+                                    this.session_connection_id(&session_id).await;
+                                if let Ok(mut metrics) = this.transfer_metrics.lock() {
+                                    let decompress_rate = metrics
+                                        .profile(&connection_id)
+                                        .and_then(|profile| profile.decompress_rate);
+                                    metrics.observe_codec(
+                                        &connection_id,
+                                        compress_rate,
+                                        decompress_rate.unwrap_or(0.0),
+                                        ratio,
+                                    );
+                                }
+                            }
+                            size
+                        }
                         Ok(Err(error))
                             if error.kind() == std::io::ErrorKind::Interrupted =>
                         {
@@ -7680,6 +7731,7 @@ impl SshRuntime {
         // 判定与 M33 prep 的 read_only 拦截口径一致（prep 需要远端写临时件，
         // lzpack 不需要远端写，因此这里不拦只读）。
         let latin1 = encoding == NameEncoding::Latin1;
+
         // 1) 实测压缩流体积（SFTP stat；latin-1 车道裸包 stat）。
         let packed_size = if latin1 && sftp_name::has_wire_lane(remote_path, encoding) {
             let mut client = self.raw_sftp_client(session_id).await?;
@@ -7742,6 +7794,27 @@ impl SshRuntime {
             return Err(format!(
                 "Transfers are limited to {MAX_TRANSFER_SIZE} bytes"
             ));
+        }
+        // P3 顾问：显式解压下载的负收益预警（带宽 EMA + codec 吞吐齐全才
+        // 说话；不拦截——用户明确要还原 .dbxz）。
+        {
+            let connection_id = self.session_connection_id(session_id).await;
+            if let Ok(metrics) = self.transfer_metrics.lock() {
+                if let Some(profile) = metrics.profile(&connection_id) {
+                    let advice = crate::transfer_schedule::advise_explicit_compression(
+                        original_size as u64,
+                        crate::transfer_schedule::Direction::Download,
+                        profile,
+                        0.6,
+                        crate::transfer_schedule::DEFAULT_GAIN_THRESHOLD,
+                    );
+                    if advice == crate::transfer_schedule::Advice::RecommendDirect {
+                        eprintln!(
+                            "[sftp] download {session_id} lzpack advisor: predicted gain negative on this link, expand will cost extra CPU (explicit mode proceeds)"
+                        );
+                    }
+                }
+            }
         }
         // 3) 任务注册：sink 按普通下载同款（saveToLocal 落盘由 finish 阶段
         // 处理；浏览器模式字节直接给前端），分块供给 staged plain。
@@ -8093,10 +8166,11 @@ impl SshRuntime {
             return PrepOutcome::Cancelled;
         }
         // 2) 自研解压（spawn_blocking；输出上限按 stat 探测的原始体积钳制
-        // 由容器头声明值承担）。
+        // 由容器头声明值承担）。解压吞吐回灌 codec 档案（ST8/P3）。
         if let Err(error) = emit_phase("decompressing", 0, original_size, "lzpack") {
             return PrepOutcome::Fallback(error);
         }
+        let decompress_started = std::time::Instant::now();
         let decompressed = {
             let source = packed_staging.to_path_buf();
             let target = staged_plain.to_path_buf();
@@ -8130,7 +8204,32 @@ impl SshRuntime {
             .await
         };
         match decompressed {
-            Ok(Ok(bytes)) if bytes == original_size => PrepOutcome::Ready,
+            Ok(Ok(bytes)) if bytes == original_size => {
+                // 解压吞吐观测（P3）：吞吐 = 原始体积/耗时；比率沿用压缩侧
+                // 档案（这里没有压缩流，packed_size/original_size 同值可用）。
+                let elapsed = decompress_started.elapsed();
+                if elapsed.as_secs_f64() > 0.0 && original_size > 0 {
+                    let decompress_rate = original_size as f64 / elapsed.as_secs_f64();
+                    let connection_id = self.session_connection_id(session_id).await;
+                    if let Ok(mut metrics) = self.transfer_metrics.lock() {
+                        let compress_rate = metrics
+                            .profile(&connection_id)
+                            .and_then(|profile| profile.compress_rate);
+                        let ratio = if packed_size > 0 {
+                            packed_size as f64 / original_size as f64
+                        } else {
+                            1.0
+                        };
+                        metrics.observe_codec(
+                            &connection_id,
+                            compress_rate.unwrap_or(0.0),
+                            decompress_rate,
+                            ratio,
+                        );
+                    }
+                }
+                PrepOutcome::Ready
+            }
             Ok(Ok(bytes)) => PrepOutcome::Fallback(format!(
                 "decompressed size mismatch: {bytes} of {original_size}"
             )),

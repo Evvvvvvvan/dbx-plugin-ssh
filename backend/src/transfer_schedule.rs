@@ -39,15 +39,6 @@ pub enum Direction {
     Download,
 }
 
-impl Direction {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Direction::Upload => "upload",
-            Direction::Download => "download",
-        }
-    }
-}
-
 /// 单方向 EMA 带宽观测（字节/秒）。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DirectionStats {
@@ -58,13 +49,6 @@ pub struct DirectionStats {
 }
 
 impl DirectionStats {
-    pub const fn empty() -> Self {
-        Self {
-            ema_bytes_per_sec: None,
-            samples: 0,
-        }
-    }
-
     /// 回灌一次网络腿观测（elapsed 含纯网络段，不含本地压缩/解压）。
     pub fn observe(&mut self, bytes: u64, elapsed: std::time::Duration) {
         if bytes < MIN_OBSERVATION_BYTES || elapsed.is_zero() {
@@ -180,12 +164,9 @@ impl TransferMetrics {
         self.profiles.retain(|(key, _, _)| key != connection_id);
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.profiles.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.profiles.is_empty()
     }
 }
 
@@ -262,6 +243,58 @@ pub fn bandwidth_for(profile: &ConnectionProfile, direction: Direction) -> Optio
     }
 }
 
+/// 显式压缩模式的顾问结论（不改变策略——交付语义由用户决定；仅产出前端
+/// 可展示的提示载荷与日志判断依据）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Advice {
+    /// 无足够观测（带宽或 codec 吞吐缺一）——沉默，不打扰用户。
+    NoData,
+    /// 预测压缩交付比直传原始字节还慢（负收益 ≥ 门槛）——建议直传。
+    RecommendDirect,
+    /// 预测压缩交付有正收益——维持用户选择。
+    Endorse,
+}
+
+/// 显式压缩模式的顾问决策（P3）：与 [`decide`] 同公式，但结论是建议而非
+/// 选择——显式模式下带宽/吞吐任一未知都不能拦截用户，只能沉默。
+pub fn advise_explicit_compression(
+    size: u64,
+    direction: Direction,
+    profile: &ConnectionProfile,
+    expected_ratio: f64,
+    gain_threshold: f64,
+) -> Advice {
+    // 预测可信度门槛（任务书 §5）：带宽 EMA 样本不足时沉默——少量大文件
+    // 观测就敢建议用户改道，比不说话更危险。
+    let stats = match direction {
+        Direction::Upload => &profile.upload,
+        Direction::Download => &profile.download,
+    };
+    if !stats.is_confident() {
+        return Advice::NoData;
+    }
+    let Some(bandwidth) = bandwidth_for(profile, direction) else {
+        return Advice::NoData;
+    };
+    let candidate = CompressionCandidate {
+        compress_rate: profile.compress_rate,
+        decompress_rate: profile.decompress_rate,
+        expected_ratio,
+    };
+    let (strategy, _gain) = decide(size, direction, Some(bandwidth), candidate, gain_threshold);
+    match strategy {
+        TransferStrategy::Compressed => Advice::Endorse,
+        // decide() 在数据缺失时也回 Direct；这里区分「真预测直传更快」与
+        // 「数据不足」：codec 吞吐任一缺失 → NoData（不臆测）。
+        TransferStrategy::Direct
+            if profile.compress_rate.is_none() || profile.decompress_rate.is_none() =>
+        {
+            Advice::NoData
+        }
+        TransferStrategy::Direct => Advice::RecommendDirect,
+    }
+}
+
 trait Pipe: Sized {
     fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
         f(self)
@@ -277,7 +310,7 @@ mod tests {
 
     #[test]
     fn ema_converges_and_requires_min_bytes() {
-        let mut stats = DirectionStats::empty();
+        let mut stats = DirectionStats::default();
         stats.observe(1024, std::time::Duration::from_secs(1)); // 太小，忽略
         assert!(stats.ema_bytes_per_sec.is_none());
         stats.observe(2 * MIB as u64, std::time::Duration::from_secs(2));
@@ -411,6 +444,67 @@ mod tests {
         let (accepted, _) = decide(size, Direction::Upload, Some(MIB), candidate, 0.10);
         assert_eq!(accepted, TransferStrategy::Compressed);
         assert!(gain > 0.4 && gain < 0.5, "gain {gain}");
+    }
+
+    #[test]
+    fn advise_endorses_when_gain_positive() {
+        let mut profile = ConnectionProfile {
+            upload: DirectionStats {
+                ema_bytes_per_sec: Some(MIB),
+                samples: 3,
+            },
+            ..ConnectionProfile::default()
+        };
+        profile.compress_rate = Some(50.0 * MIB);
+        profile.decompress_rate = Some(200.0 * MIB);
+        let advice = advise_explicit_compression(
+            100 * MIB as u64,
+            Direction::Upload,
+            &profile,
+            0.4,
+            DEFAULT_GAIN_THRESHOLD,
+        );
+        assert_eq!(advice, Advice::Endorse);
+    }
+
+    #[test]
+    fn advise_recommends_direct_on_slow_codec() {
+        let mut profile = ConnectionProfile {
+            upload: DirectionStats {
+                ema_bytes_per_sec: Some(1000.0 * MIB),
+                samples: 3,
+            },
+            ..ConnectionProfile::default()
+        };
+        profile.compress_rate = Some(30.0 * MIB);
+        profile.decompress_rate = Some(100.0 * MIB);
+        let advice = advise_explicit_compression(
+            100 * MIB as u64,
+            Direction::Upload,
+            &profile,
+            0.9,
+            DEFAULT_GAIN_THRESHOLD,
+        );
+        assert_eq!(advice, Advice::RecommendDirect);
+    }
+
+    #[test]
+    fn advise_silent_without_codec_measurements() {
+        let profile = ConnectionProfile {
+            upload: DirectionStats {
+                ema_bytes_per_sec: Some(MIB),
+                samples: 3,
+            },
+            ..ConnectionProfile::default()
+        };
+        let advice = advise_explicit_compression(
+            100 * MIB as u64,
+            Direction::Upload,
+            &profile,
+            0.4,
+            DEFAULT_GAIN_THRESHOLD,
+        );
+        assert_eq!(advice, Advice::NoData);
     }
 
     #[test]

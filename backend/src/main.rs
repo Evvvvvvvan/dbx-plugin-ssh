@@ -55,7 +55,9 @@ mod task_provider;
 mod telnet_session;
 mod transfer_compress;
 mod transfer_history;
-#[allow(dead_code)]
+// 传输性能模型（ST8/P3）：网络腿 EMA 回灌（finish_upload 完成点）、codec
+// 吞吐回灌（lzpack 预压/解压点）、显式 lzpack 顾问（start 预测日志）均已
+// 接入产品路径；decide() 是 advisor 的底层纯函数。
 mod transfer_schedule;
 mod transfer_throttle;
 mod triggers;

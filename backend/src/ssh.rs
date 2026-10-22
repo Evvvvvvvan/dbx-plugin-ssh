@@ -6423,6 +6423,12 @@ impl SshRuntime {
     ) -> CompressionMode {
         let policy = crate::preferences::transfer_compress_mode(&self.data_dir);
         let threshold = crate::preferences::transfer_compress_threshold_mib(&self.data_dir);
+        let parallelism = transfer_compress::local_parallelism();
+        // 诊断日志（macOS 压缩通道排查）：打印决策全部入参——probe 未被
+        // 调用说明 decide() 提前返回 None，从这行直接看是哪个门拦的。
+        eprintln!(
+            "[sftp] compress decide: policy={policy:?} size={size} threshold={threshold} name={name:?} needs_tar={needs_tar} read_only={read_only} latin1={latin1} parallelism={parallelism}"
+        );
         let decided = transfer_compress::decide(
             policy,
             size,
@@ -6431,8 +6437,9 @@ impl SshRuntime {
             true,
             read_only,
             latin1,
-            transfer_compress::local_parallelism(),
+            parallelism,
         );
+        eprintln!("[sftp] compress decide -> {decided:?}");
         if decided != CompressionMode::Gzip {
             return decided;
         }
@@ -6460,11 +6467,20 @@ impl SshRuntime {
         let command = transfer_compress::probe_command(needs_tar);
         let available = match self.exec(session_id, None, &command, false, Some(5)).await {
             Ok(outcome) => {
-                outcome.get("exitCode").and_then(Value::as_i64) == Some(0)
-                    && outcome
-                        .get("output")
-                        .and_then(Value::as_str)
-                        .is_some_and(|output| output.contains("DBX_COMPRESS_OK"))
+                let exit_code = outcome.get("exitCode").and_then(Value::as_i64);
+                let output = outcome.get("output").and_then(Value::as_str);
+                let ok = exit_code == Some(0)
+                    && output.is_some_and(|output| output.contains("DBX_COMPRESS_OK"));
+                // 诊断日志（macOS 压缩通道排查）：exec 成功但条件不满足时打印
+                // 实际 exitCode/output——此前 false 分支静默，无法分辨是
+                // exec 超时、非零退出还是输出缺标记。
+                if !ok {
+                    eprintln!(
+                        "[sftp] compress tool probe negative: exit={exit_code:?} output={:?} cmd={command}",
+                        output.map(|o| o.chars().take(200).collect::<String>())
+                    );
+                }
+                ok
             }
             Err(error) => {
                 eprintln!("[sftp] compress tool probe failed, plain transfer: {error}");

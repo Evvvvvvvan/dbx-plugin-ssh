@@ -362,6 +362,7 @@ import {
   recordHistoryMeta,
   recordHistoryTime,
   resolveHistoryPanelKey,
+  resolveHistoryPanelTypeAction,
   sanitizeHistoryMetaBuckets,
   sanitizeHistoryTimesBuckets,
   type HistoryPanelEntry,
@@ -1105,8 +1106,25 @@ function loadHistoryPanelArrowUpInvokePref(): boolean {
     return true;
   }
 }
+
+// 手动输入联动（issue #216）：面板开着时在终端打字——true（默认）收起面板
+// 不遮挡输入行；false 面板常驻并按输入行实时过滤（高亮锚定底部最匹配项）。
+// 同 enabled 的两端自治模式：SettingsDialog 写穿 pluginStore，这里只握内存
+// 权威态（各自水合同一键 ssh-history-panel-type-close）。
+const historyPanelTypeClose = ref(loadHistoryPanelTypeClosePref());
+function loadHistoryPanelTypeClosePref(): boolean {
+  try {
+    return pluginStore.getItem("ssh-history-panel-type-close") !== "0";
+  } catch {
+    return true;
+  }
+}
 function setHistoryPanelArrowUpInvoke(next: boolean) {
   historyPanelArrowUpInvoke.value = next;
+}
+
+function setHistoryPanelTypeClose(next: boolean) {
+  historyPanelTypeClose.value = next;
 }
 // 热键唤起时置 true（挂载即聚焦搜索框，批 3d）；裸 ↑ 唤起恒 false。
 const historyPanelFocusSearch = ref(false);
@@ -2337,7 +2355,21 @@ function createTerminal() {
     sendTerminalBytes(new TextEncoder().encode(data));
     const lineBeforeInput = pendingTerminalInput;
     trackPendingInput(data);
+    // 历史面板手动输入联动（issue #216，合并裁决）：typeClose 开启一律收起
+    // （任何编辑都表示用户已离开面板语境）；关闭时回车执行收起、其余键入
+    // 进常驻过滤。#108 反馈二的 prefix 唤起模式（refineHistoryPanelFromInput，
+    // 内部含 same-idempotent 查询同步）由此收口为「面板已开时的唯一联动
+    // 面」——refine 先行处理其专属的 prefix 语义（含 \r/\u0003 收口），随后的
+    // typeClose 裁决只在面板仍开时生效（prefix 已收起则自然跳过）。
     refineHistoryPanelFromInput(data);
+    if (historyPanelOpen.value) {
+      if (resolveHistoryPanelTypeAction(historyPanelTypeClose.value, data) === "close") {
+        closeHistoryPanel();
+      } else {
+        historyPanelQuery.value = pendingTerminalInput;
+        updateHistoryPanelFilter(false);
+      }
+    }
     refreshSuggestionsAfterInput(data, lineBeforeInput);
     refreshGhostAfterInput(data);
     terminalDiag.keys += 1;
@@ -8298,6 +8330,10 @@ async function initialize() {
   // 否则 workbenchUi 镜像与 setup 期的 sftp-pane-open 等键全部读到空档，
   // 布局偏好整组"不持久"（issue #178 的半个根因，另一半是宿主缺桥）。
   await pluginStore.ready.catch(() => undefined);
+  // 设置偏好以水合后的持久化值为准重读（issue #216 type-close 同款）：setup
+  // 同步初始化时宿主异步 storage 尚未落地，直读必然落在空档，跳过这步用户
+  // 设置跨会话不生效。
+  historyPanelTypeClose.value = loadHistoryPanelTypeClosePref();
   restoreUiState();
   const appearanceAppliedAtBoot = Boolean(api.appearance || api.theme);
   // 外观偏好的 CSS 部分（终端内边距变量）与宿主是否推送 appearance 无关，
@@ -10718,6 +10754,7 @@ watch(historyScope, () => {
       @update:ghost-suggest="setGhostEnabled"
       @update:history-panel-enabled="setHistoryPanelEnabled"
       @update:history-panel-arrow-up="setHistoryPanelArrowUpInvoke"
+      @update:history-panel-type-close="setHistoryPanelTypeClose"
       @update:command-history-limit="applyCommandHistoryLimit"
       :ghost-tab-accept="ghostTabAccept"
       @update:ghost-tab-accept="setGhostTabAccept"

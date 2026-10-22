@@ -407,3 +407,19 @@ export function persistableHistoryMetaBuckets(meta: Readonly<HistoryMetaBuckets>
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// 手动输入联动（issue #216）：面板开着时用户在终端打字的两档行为——
+// close（默认，面板让位不再遮挡输入行）/ filter（面板常驻，按输入行实时
+// 过滤，高亮锚定最匹配项 = 列表底部，↑↓/Tab/Enter 快捷选中沿用既有键权）。
+// ---------------------------------------------------------------------------
+
+export type HistoryPanelTypeAction = "close" | "filter";
+
+/** 面板开启时终端 onData 的联动裁决：typeClose 开启一律收起（任何编辑——
+ * 单键、粘贴、回车执行——都表示用户已离开面板语境）；关闭时除回车（执行当
+ * 前行，面板随命令运行收起）外保持常驻并进入过滤。 */
+export function resolveHistoryPanelTypeAction(typeCloseEnabled: boolean, data: string): HistoryPanelTypeAction {
+  if (typeCloseEnabled) return "close";
+  return data.includes("\r") ? "close" : "filter";
+}

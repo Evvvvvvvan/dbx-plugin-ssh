@@ -334,16 +334,23 @@ try {
   check("focus stays on the terminal input line after ArrowUp", focusOnLine, `active=${await historyPage.evaluate(() => document.activeElement?.className ?? "null")}`);
   // mock PTY 启动回放会额外入一条 E 帧命令，计数不固定——只断言种子条目在列。
   await expectText(historyPage, ".terminal-history-hit", "echo ui-mock-history-a", "history panel lists the seeded history");
-  const unfilteredRows = await historyPage.locator(".terminal-history-hit").count();
-  // 终端焦点路径：打字进命令行（shell 语义），面板不过滤、列表保持原样。
-  await historyPage.keyboard.type("tail");
-  const rowsAfterLineTyping = await historyPage.locator(".terminal-history-hit").count();
-  check("terminal typing goes to the input line (panel stays unfiltered)", rowsAfterLineTyping === unfilteredRows, `rows=${rowsAfterLineTyping}/${unfilteredRows}`);
+  // #216 默认档（type-to-close 出厂开启）：终端打字即收起面板（不再遮挡
+  // 正在输入的行），字节照常进 PTY、焦点留在命令行。
+  await historyPage.keyboard.type("t");
+  await sleep(150);
+  const panelsAfterType = await historyPage.locator(".terminal-history-panel").count();
+  check("terminal typing closes the panel (type-to-close default)", panelsAfterType === 0, `panels=${panelsAfterType}`);
+  const focusAfterType = await historyPage.evaluate(() => document.activeElement?.classList?.contains("xterm-helper-textarea") === true);
+  check("focus stays on the input line after type-to-close", focusAfterType, `active=${await historyPage.evaluate(() => document.activeElement?.className ?? "null")}`);
+  // 重开面板继续搜索框路径；closeHistoryPanel 已清查询，搜索框为空。
+  await historyPage.keyboard.press("ArrowUp");
+  await expect(historyPage, ".terminal-history-panel", "history panel reopens after type-to-close");
   // 搜索框不再自动聚焦：点击聚焦后才过滤。
   // 面板锚点经 rAF 合帧随回显 settle 收敛（高负载下构建刚结束的宿主上可达
   // 秒级），且面板可能落在可滚动区边缘：点击前先 scrollIntoViewIfNeeded，
   // 消除「可见但瞬时不稳定/差一格视口」的误报；scroll 不可达的面板仍会以
   // 原生 actionability 失败暴露，不掩盖真实定位缺陷。
+  await historyPage.locator(".terminal-history-search-input").scrollIntoViewIfNeeded().catch(() => undefined);
   await historyPage.click(".terminal-history-search-input");
   const focusOnSearch = await historyPage.evaluate(() => document.activeElement?.classList?.contains("terminal-history-search-input") === true);
   check("clicking the search box focuses it", focusOnSearch, `active=${await historyPage.evaluate(() => document.activeElement?.className ?? "null")}`);
@@ -585,6 +592,44 @@ try {
     console.log("  FAIL accepted ghost echo");
   }
   await historyPage.close();
+
+  // --- history panel: type-to-close off = live filter (issue #216 mode 2) ---
+  // 配置档（设置·终端「打字关闭历史面板」关）：终端打字不收面板，而是以输入
+  // 行为查询实时过滤列表（issue 原话「历史命令与当前输入的命令动态匹配」）。
+  console.log("==> history panel: live-filter mode (type-to-close off)");
+  const filterPage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  filterPage.on("pageerror", (err) => pageError.push(String(err)));
+  await filterPage.addInitScript(() => {
+    window.localStorage.setItem(
+      "ssh-command-history",
+      JSON.stringify({
+        "visual-connection": ["echo ui-mock-history-a", "tail -f /var/log/ui-mock.log", "kubectl get pods -n ui-mock"],
+      }),
+    );
+    window.localStorage.setItem("ssh-history-panel-type-close", "0");
+  });
+  await filterPage.goto(`${baseUrl}?render=dom`, { waitUntil: "domcontentloaded", timeout: 30_000 });
+  await sleep(2_500);
+  await filterPage.bringToFront();
+  await filterPage.click(".terminal-host");
+  await filterPage.keyboard.press("ArrowUp");
+  // ↑ 开面板按 shell 语义把高亮项（最新历史 = mock 回放的 curl 命令）回填输入
+  // 行，live-filter 以输入行为查询、残留会让键入的 "tail" 拼成无关长串：
+  // 面板开着时 Ctrl+U 清行（readline 清行语义，trackPendingInput 归零并把
+  // 查询重置为空 → 全量列表），再键入查询词。
+  await filterPage.keyboard.press("Control+u");
+  await sleep(200);
+  await expect(filterPage, ".terminal-history-panel", "live-filter panel opens on ArrowUp");
+  await filterPage.keyboard.type("tail");
+  await sleep(300);
+  const filterRows = await filterPage.locator(".terminal-history-hit").count();
+  check("terminal typing keeps the panel open and live-filters it", filterRows === 1, `rows=${filterRows}`);
+  await expectText(filterPage, ".terminal-history-hit", "tail -f /var/log/ui-mock.log", "live-filter hit text");
+  await filterPage.screenshot({ path: `${SHOT_DIR}/04c-history-live-filter.png`, fullPage: false }).catch(() => undefined);
+  await filterPage.keyboard.press("Escape");
+  const filterPanelsAfterEsc = await filterPage.locator(".terminal-history-panel").count();
+  check("Escape closes the live-filter panel", filterPanelsAfterEsc === 0, `panels=${filterPanelsAfterEsc}`);
+  await filterPage.close();
 
   // --- global quick commands: delete --------------------------------------
   console.log("==> quick commands: delete");

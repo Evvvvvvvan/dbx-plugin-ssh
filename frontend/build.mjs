@@ -53,7 +53,13 @@ if (html.includes(scriptMatch[0])) {
 if (styleMatch && html.includes(styleMatch[0])) {
   throw new Error("Self-contained UI still contains the external stylesheet tag");
 }
-if ((html.match(/<script\b/gi) ?? []).length !== 1 || (html.match(/<\/script>/gi) ?? []).length !== 1) {
+// 只统计真实标签开口（`<script` 后跟空白或 `>`）；依赖代码里的正则字面量
+// （如 `<script(?=\s|>)`）与内联 HTML 模板串（file-viewer capability-text-tools
+// 的 railroad-diagrams）后随 `(`/引号，不应计入宿主文档的标签结构。
+const shell = html.slice(0, html.indexOf("<script type=\"module\">"));
+const scriptOpenings = (shell.match(/<script(?=[\s>])/gi) ?? []).length + 1;
+const scriptClosings = (html.slice(html.lastIndexOf("</script>"))).match(/<\/script>/gi)?.length ?? 0;
+if (scriptOpenings !== 1 || scriptClosings !== 1) {
   throw new Error("Self-contained UI contains an invalid script structure");
 }
 

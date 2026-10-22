@@ -1247,3 +1247,49 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .appearance-number-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
 .scheme-mini-swatch { display: inline-flex; gap: 1px; }
 .scheme-mini-swatch i { display: block; width: 6px; height: 10px; border-radius: 1px; }
+
+/* 多格式预览弹窗（自 files 插件 PreviewPane 移植）：嵌入 .preview-modal 容器，
+   头部/编辑条/进度条/正文分区；配色走宿主设计令牌，明暗自动跟随。 */
+.ssh-preview { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 8px; outline: none; }
+.ssh-preview-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-right: 28px; }
+.ssh-preview-header strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ssh-preview-meta { color: var(--muted-foreground); font-size: 12px; white-space: nowrap; }
+.ssh-preview-md-toggle { display: inline-flex; gap: 4px; }
+.ssh-preview-chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: var(--radius); padding: 3px 10px; background: var(--background); color: var(--foreground); font-size: 12px; white-space: nowrap; cursor: pointer; }
+.ssh-preview-chip:hover { border-color: var(--primary); }
+.ssh-preview-chip:disabled { opacity: 0.55; cursor: default; }
+.ssh-preview-chip-active { border-color: var(--primary); color: var(--primary); }
+.ssh-preview-chip-primary { border-color: var(--primary); background: var(--primary); color: var(--primary-foreground, #fff); }
+.ssh-preview-action { display: inline-flex; align-items: center; gap: 5px; border: none; background: transparent; color: var(--muted-foreground); font-size: 12px; cursor: pointer; padding: 3px 6px; border-radius: var(--radius); white-space: nowrap; }
+.ssh-preview-action:hover { background: var(--accent); color: var(--foreground); }
+.ssh-preview-action svg { width: 13px; height: 13px; }
+.ssh-preview-close { margin-left: auto; }
+.ssh-preview-header .ssh-preview-close { margin-left: auto; position: static; }
+.ssh-preview-editbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; color: var(--muted-foreground); }
+.ssh-preview-edit-error { color: var(--destructive); }
+.ssh-preview-progress { flex: 1 1 120px; min-width: 80px; height: 6px; border-radius: 3px; background: var(--muted); overflow: hidden; }
+.ssh-preview-progress-bar { height: 100%; background: var(--primary); transition: width 0.15s ease; }
+.ssh-preview-actions-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ssh-preview-body { display: flex; min-height: 0; flex: 1; flex-direction: column; overflow: hidden; }
+.ssh-preview-skeleton { display: flex; flex: 1; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.ssh-preview-skeleton-row { display: block; height: 12px; border-radius: 4px; background: color-mix(in srgb, var(--muted-foreground) 18%, var(--background)); animation: ssh-preview-pulse 1.2s ease-in-out infinite; }
+@keyframes ssh-preview-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+.ssh-preview-notice { display: flex; flex: 1; flex-direction: column; align-items: flex-start; justify-content: center; gap: 10px; font-size: 13px; color: var(--muted-foreground); overflow-wrap: anywhere; }
+.ssh-preview-image { max-width: 100%; max-height: 100%; object-fit: contain; margin: auto; }
+.ssh-preview-hex { flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 8px; border-radius: 6px; background: var(--ssh-terminal-background); color: var(--foreground); font-family: var(--terminal-font-family); font-size: 12px; line-height: 1.5; white-space: pre; }
+.ssh-preview-viewer { flex: 1; min-height: 0; overflow: hidden; border-radius: 6px; }
+.ssh-preview-banner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); font-size: 12px; color: var(--muted-foreground); }
+/* Markdown 渲染视图（MarkdownRender.vue）：白名单子集的排版样式。 */
+.wb-md-render { flex: 1; min-height: 0; overflow: auto; padding: 4px 2px; }
+.wb-md-body { font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; }
+.wb-md-h { margin: 0.7em 0 0.4em; line-height: 1.3; }
+.wb-md-h:first-child { margin-top: 0; }
+.wb-md-p { margin: 0.4em 0; }
+.wb-md-list { margin: 0.4em 0; padding-left: 1.4em; }
+.wb-md-quote { margin: 0.5em 0; padding: 0.2em 0.9em; border-left: 3px solid var(--border); color: var(--muted-foreground); }
+.wb-md-hr { border: none; border-top: 1px solid var(--border); margin: 0.8em 0; }
+.wb-md-link { color: var(--primary); text-decoration: underline; }
+.wb-md-code { background: var(--ssh-terminal-background); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; overflow: auto; }
+.wb-md-code code { font-family: var(--terminal-font-family); font-size: 12px; }
+.wb-md-code-inline { background: var(--muted); border-radius: 4px; padding: 1px 5px; font-family: var(--terminal-font-family); font-size: 12px; }
+.wb-md-render-failed { white-space: pre-wrap; overflow-wrap: anywhere; }

@@ -3,6 +3,7 @@ import { computed, ref, type Ref } from "vue";
 import { confirmDialog } from "../lib/confirmDialog";
 import { formatBytes } from "../lib/format";
 import { buildJsonPreview, type JsonPreviewState } from "../lib/jsonPreview";
+import { resolvePreview } from "../lib/previewResolver";
 import { MIB } from "../lib/settingsModel";
 import { looksBinary } from "../lib/textSniff";
 
@@ -45,6 +46,10 @@ const previewSaving = ref(false);
 const previewMode = ref<"text" | "image">("text");
 const previewImageUrl = ref("");
 const previewImageZoomed = ref(false);
+// 多格式预览（files 插件同款）：图片/Office/PDF/媒体/表格等走新 PreviewPane
+// 弹窗（分块流式 + 内嵌 viewer）；文本/JSON 仍走既有内联链路。
+const multiPreviewOpen = ref(false);
+const multiPreviewPath = ref<string | null>(null);
 // Baseline snapshot of the content when it was opened (or last saved); the
 // dirty marker compares the live draft against it.
 const previewBaseline = ref("");
@@ -69,6 +74,13 @@ async function openEntry(entry: PreviewEntry) {
     return;
   }
   if (entry.kind !== "file") return;
+  // 多格式车道：图片（>20MiB 走分块预览而非旧 data URI 链）、Office/PDF/
+  // 媒体/表格等 CodeMirror 无法渲染的格式分流到新 PreviewPane。
+  const resolution = resolvePreview(entry.name);
+  if (multiPreviewStrategy(resolution.previewStrategy, entry)) {
+    await openMultiFormatPreview(entry);
+    return;
+  }
   if (isImagePreviewable(entry)) {
     await openImagePreview(entry, IMAGE_MIME_BY_EXTENSION[imagePreviewExtension(entry.name)]);
     return;
@@ -124,6 +136,32 @@ async function openEntry(entry: PreviewEntry) {
   } finally {
     previewLoading.value = false;
   }
+}
+
+/** 多格式车道判定：image/file-viewer 车道走新 PreviewPane（旧 data URI 链
+ * 只覆盖 ≤20MiB 图片，Office/PDF/媒体等旧链路完全不支持）。
+ * image 车道全量接管后，超大的已知二进制图片不再被「提示不打开」拦下；
+ * 未知扩展（codemirror/hex 车道）与可编辑文本留在既有内联链路。 */
+function multiPreviewStrategy(strategy: ReturnType<typeof resolvePreview>["previewStrategy"], entry: PreviewEntry): boolean {
+  if (strategy === "image" || strategy === "file-viewer") {
+    // 已知二进制扩展名直接开（不再走「提示不打开」拦截），size=0 交分块链路兜底。
+    return true;
+  }
+  return false;
+}
+
+/** 打开多格式预览弹窗（路径驱动，读取/分块/sudo 全部收口在 PreviewPane）。 */
+async function openMultiFormatPreview(entry: PreviewEntry) {
+  if (multiPreviewOpen.value && multiPreviewPath.value) {
+    multiPreviewPath.value = pathFromUri(entry.uri);
+    return;
+  }
+  multiPreviewPath.value = pathFromUri(entry.uri);
+  multiPreviewOpen.value = true;
+}
+
+function closeMultiFormatPreview() {
+  multiPreviewOpen.value = false;
 }
 
 // 预览前的二进制嗅探：读头部 SNIFF_CHUNK_BYTES 字节交给 looksBinary 判定。
@@ -287,9 +325,12 @@ async function savePreview() {
     previewDirty,
     previewEditableAllowed,
     jsonPreviewState,
+    multiPreviewOpen,
+    multiPreviewPath,
     openEntry,
     openImagePreview,
     closePreview,
+    closeMultiFormatPreview,
     beginPreviewEdit,
     cancelPreviewEdit,
     savePreview,

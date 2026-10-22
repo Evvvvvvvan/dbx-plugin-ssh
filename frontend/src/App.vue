@@ -341,6 +341,7 @@ import { findTreeNode } from "./lib/sftpDirTree";
 import { workbenchMessage } from "./lib/i18n";
 import { randomUUID } from "./lib/uuid";
 import TextPreview from "./components/TextPreview.vue";
+import PreviewPane from "./components/PreviewPane.vue";
 import JsonPreviewPanel from "./components/JsonPreviewPanel.vue";
 import TerminalSearchPanel from "./components/TerminalSearchPanel.vue";
 import TerminalQuickSelectPanel from "./components/TerminalQuickSelectPanel.vue";
@@ -6557,7 +6558,8 @@ const {
   previewOpen, previewTitle, previewText, previewLoading, previewPath, previewSize,
   previewEditable, previewDraft, previewSaving, previewMode, previewImageUrl,
   previewImageZoomed, previewTruncated, previewDirty, previewEditableAllowed, jsonPreviewState,
-  openEntry, openImagePreview, closePreview, beginPreviewEdit, cancelPreviewEdit, savePreview,
+  multiPreviewOpen, multiPreviewPath,
+  openEntry, openImagePreview, closePreview, closeMultiFormatPreview, beginPreviewEdit, cancelPreviewEdit, savePreview,
   MAX_INLINE_PREVIEW_BYTES,
 } = useFilePreview({
   t, showNotice, showError, session, sudoMode, canWrite,
@@ -6565,6 +6567,14 @@ const {
   downloadEntry: (entry, forceSudo?: boolean) => downloadEntry(entry, forceSudo),
   pathFromUri,
 });
+// 多格式预览弹窗的下载/标题辅助：条目对象不在手（路径驱动），构造最小 entry
+// 复用既有 downloadEntry 车道（sudo 模式 + 可写时自动走 sudo 下载）。
+function previewFileLabel(path: string | null): string {
+  return path ? path.split(/[\\/]/).pop() ?? path : "";
+}
+function downloadMultiPreview(path: string) {
+  void downloadEntry({ uri: path, name: previewFileLabel(path), kind: "file" }, sudoMode.value && canWrite.value);
+}
 // 压缩/解压：行内归档与解包收口在 composables/useSftpArchive。
 const {
   archiveBusy,
@@ -7932,6 +7942,7 @@ const modalOpenStates = computed(() => [
   rdpCertPrompt.value !== null,
   folderPickerTarget.value !== null,
   previewOpen.value,
+  multiPreviewOpen.value,
   pasteConfirm.value,
   // 通用确认弹窗（SSH-H1）：模板顺序在 pasteConfirm 之后、dropUpload 之前。
   !!pendingConfirmDialog.value,
@@ -8026,6 +8037,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
   }
   if (previewOpen.value) {
     closePreview();
+    return;
+  }
+  if (multiPreviewOpen.value) {
+    closeMultiFormatPreview();
     return;
   }
   // ---- 对话框（安全取消语义；hostKey/agent 审批等安全弹窗不在此列）----
@@ -10220,6 +10235,24 @@ watch(historyScope, () => {
              原始视图 + 提示条）；其余文件与编辑态保持既有 TextPreview。 -->
         <JsonPreviewPanel v-else-if="!previewEditable && jsonPreviewState.kind !== 'unavailable'" :state="jsonPreviewState" :text="previewText" :file-name="previewTitle" :locale="locale" :appearance="appearance" />
         <TextPreview v-else :text="previewText" :file-name="previewTitle" :appearance="appearance" :editable="previewEditable" @change="previewDraft = $event" />
+      </DialogContent>
+    </Dialog>
+
+    <!-- 多格式预览（files 插件同款）：图片/Office/PDF/媒体/表格/Markdown 等走
+         分块流式读取 + 内嵌 file-viewer；sudo 模式整条链路换 sudo 车道。 -->
+    <Dialog :open="multiPreviewOpen" @update:open="(open) => { if (!open) closeMultiFormatPreview(); }">
+      <DialogContent class="modal preview-modal" @escape-key-down.prevent>
+        <PreviewPane
+          :path="multiPreviewPath"
+          :session-id="session?.sessionId"
+          :sudo="sudoMode && canWrite"
+          :can-write="canWrite"
+          :appearance="appearance"
+          :t="t"
+          @close="closeMultiFormatPreview"
+          @saved="showNotice(t('editSave.saved', { name: previewFileLabel(multiPreviewPath) }))"
+          @download="(path) => downloadMultiPreview(path)"
+        />
       </DialogContent>
     </Dialog>
 

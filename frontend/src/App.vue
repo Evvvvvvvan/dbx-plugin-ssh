@@ -2370,14 +2370,15 @@ function createTerminal() {
     sendTerminalBytes(new TextEncoder().encode(data));
     const lineBeforeInput = pendingTerminalInput;
     trackPendingInput(data);
-    // 历史面板手动输入联动（issue #216，合并裁决）：typeClose 开启一律收起
-    // （任何编辑都表示用户已离开面板语境）；关闭时回车执行收起、其余键入
-    // 进常驻过滤。#108 反馈二的 prefix 唤起模式（refineHistoryPanelFromInput，
-    // 内部含 same-idempotent 查询同步）由此收口为「面板已开时的唯一联动
-    // 面」——refine 先行处理其专属的 prefix 语义（含 \r/\u0003 收口），随后的
-    // typeClose 裁决只在面板仍开时生效（prefix 已收起则自然跳过）。
+    // 历史面板手动输入联动（issue #216 × #108 反馈二合并裁决）：
+    // prefix 模式（裸 ↑ 前缀搜索唤起）由 refineHistoryPanelFromInput 独占
+    // ——backspace 收窄/打字实时过滤/回车与 Ctrl+C 收口都是该模式的核心
+    // 交互，typeClose 的「打字即收」语义在此让位（面板内容正随输入联动，
+    // 收起反而打断）。普通模式（热键/点击唤起）走 typeClose 裁决：开启
+    // 一律收起（任何编辑都表示用户已离开面板语境），关闭时回车收起、其余
+    // 键入进常驻过滤。
     refineHistoryPanelFromInput(data);
-    if (historyPanelOpen.value) {
+    if (historyPanelOpen.value && !historyPanelPrefixMode.value) {
       if (resolveHistoryPanelTypeAction(historyPanelTypeClose.value, data) === "close") {
         closeHistoryPanel();
       } else {

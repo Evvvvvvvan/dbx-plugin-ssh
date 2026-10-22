@@ -2653,7 +2653,18 @@ impl SshRuntime {
                         let (data, stream) = match message {
                             Some(ChannelMsg::Data { data }) => (data.to_vec(), TerminalStream::Stdout),
                             Some(ChannelMsg::ExtendedData { data, .. }) => (data.to_vec(), TerminalStream::Stderr),
-                            Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
+                            // #108 堡垒机跟进取证：目标机 exit 后应回到堡垒机的
+                            // 服务器列表（同一通道续用），通道不该关闭。区分
+                            // 「远端主动 EOF/Close」与流自然结束，为下一轮定位
+                            // 是哪一侧先收线留下凭据（DBX 插件日志可见）。
+                            Some(msg @ (ChannelMsg::Eof | ChannelMsg::Close)) => {
+                                eprintln!("[ssh] terminal session {task_id}: channel ended by remote ({msg:?})");
+                                break;
+                            }
+                            None => {
+                                eprintln!("[ssh] terminal session {task_id}: channel stream ended");
+                                break;
+                            }
                             _ => continue,
                         };
                         if stream == TerminalStream::Stdout {

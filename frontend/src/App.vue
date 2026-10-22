@@ -348,11 +348,14 @@ import TerminalQuickSelectPanel from "./components/TerminalQuickSelectPanel.vue"
 import TerminalHistoryPanel from "./components/TerminalHistoryPanel.vue";
 import TerminalPromptHints from "./components/TerminalPromptHints.vue";
 import {
+  bareArrowUpInvokesHistoryPanel,
   canOpenHistoryPanel,
+  integratedPromptIdleForArrowUp,
   clampHistoryPanelIndex,
   commandHistoryHotkeyPassthrough,
   decorateHistoryEntries,
   filterHistoryEntries,
+  filterHistoryEntriesByPrefix,
   moveHistoryPanelIndex,
   persistableHistoryMetaBuckets,
   pruneHistoryTimesBuckets,
@@ -1071,11 +1074,12 @@ const searchResultCount = ref(0);
 // 留在命令行（#138 交互跟进），↑↓/Enter/Tab/Esc 由 App 的面板分支统一消费；
 // 搜索框点击聚焦后字符键实时过滤，其余按键放行。
 const historyPanelOpen = ref(false);
-// 历史面板功能开关（issue #169）：默认开（现状）；关闭后提示符下的 ↑ 与
-// Ctrl+R / Ctrl+Shift+H 热键都归还远端 shell（↑/Ctrl+R 走 shell 原生历史与
-// 反向搜索），面板整体不可唤起。命令历史采集与建议浮层是独立功能（各有
-// 开关），不受此键影响。SettingsDialog 开关行自治持久化（pluginStore:
-// ssh-history-panel-enabled），这里只握内存权威态（两端各自水合同一键）。
+// 历史面板功能开关（issue #169）：默认开（现状）；关闭后面板整体不可唤起
+// （Ctrl+R / Ctrl+Shift+H 走 shell 原生反向搜索），提示符下的裸 ↑ 是否唤起
+// 另由独立开关控制（见 historyPanelArrowUpInvoke，issue #108 反馈二）。
+// 命令历史采集与建议浮层是独立功能（各有开关），不受此键影响。SettingsDialog
+// 开关行自治持久化（pluginStore: ssh-history-panel-enabled），这里只握内存
+// 权威态（两端各自水合同一键）。
 const historyPanelEnabled = ref(loadHistoryPanelEnabledPref());
 function loadHistoryPanelEnabledPref(): boolean {
   try {
@@ -1087,10 +1091,32 @@ function loadHistoryPanelEnabledPref(): boolean {
 function setHistoryPanelEnabled(next: boolean) {
   historyPanelEnabled.value = next;
 }
+// 裸 ↑ 唤起独立开关（issue #108 反馈二）：默认开，叠加 Warp 式正向证据门
+// （integratedPromptIdle）——堡垒机等非集成会话拿不到证据，↑ 恒透传，无需
+// 用户感知此开关；面板另有 command-history 热键（默认 Ctrl+R /
+// Ctrl+Shift+H）唤起。偏好写穿在 SettingsDialog（pluginStore:
+// ssh-history-panel-arrow-up），这里只握内存权威态。面板已开着时 ↑↓ 导航
+// 不受此开关影响。
+const historyPanelArrowUpInvoke = ref(loadHistoryPanelArrowUpInvokePref());
+function loadHistoryPanelArrowUpInvokePref(): boolean {
+  try {
+    return pluginStore.getItem("ssh-history-panel-arrow-up") !== "0";
+  } catch {
+    return true;
+  }
+}
+function setHistoryPanelArrowUpInvoke(next: boolean) {
+  historyPanelArrowUpInvoke.value = next;
+}
 // 热键唤起时置 true（挂载即聚焦搜索框，批 3d）；裸 ↑ 唤起恒 false。
 const historyPanelFocusSearch = ref(false);
 // 面板内搜索框的 query（点击聚焦后打字即过滤；关闭随面板清空）。
 const historyPanelQuery = ref("");
+// 前缀模式（Warp ↑ 前缀搜索同位）：裸 ↑ 打开时以打开前的真实输入行为过滤
+// 词（屏幕对账取行，见 openHistoryPanel），此后终端打字实时收窄（refine
+// HistoryPanelFromInput）、搜索框获得输入即切回模糊模式。热键入口与空行
+// 打开恒为模糊全量视图。
+const historyPanelPrefixMode = ref(false);
 const historyPanelEntries = ref<HistoryPanelEntry[]>([]);
 const historyPanelActiveIndex = ref(0);
 const historyPanelAnchor = ref<SuggestionAnchor | null>(null);
@@ -1191,6 +1217,17 @@ const commandMarker = reactive({
 });
 // Live elapsed milliseconds for the running marker (null when idle or finished).
 const commandMarkerElapsed = ref<number | null>(null);
+// 裸 ↑ 的 Warp 式正向证据门（issue #108 反馈二，学习 Warp 接管模型）：
+// OSC 633 集成标记（钩子注入成功）+ 无命令在执行 = 「集成 shell 的空闲
+// 提示符」——唯一允许面板接管 ↑ 的状态。堡垒机 koko（钩子无效 → 无标记）、
+// 嵌套 ssh / mysql 等前台程序（E 帧后无 D 帧 → active 恒 true）拿不到证据，
+// ↑ 恒透传；不再靠「无反向信号」猜测普通屏全屏程序。
+const integratedPromptIdle = computed(() =>
+  integratedPromptIdleForArrowUp({
+    integrationInstalled: commandMarker.installed,
+    commandActive: commandMarker.active,
+  }),
+);
 const sftpSearch = ref("");
 const sftpTypeFilter = ref<SftpTypeFilter>("all");
 /** 默认隐藏以 "." 开头的 Unix 隐藏文件、__pycache__ 等系统缓存条目；
@@ -2300,6 +2337,7 @@ function createTerminal() {
     sendTerminalBytes(new TextEncoder().encode(data));
     const lineBeforeInput = pendingTerminalInput;
     trackPendingInput(data);
+    refineHistoryPanelFromInput(data);
     refreshSuggestionsAfterInput(data, lineBeforeInput);
     refreshGhostAfterInput(data);
     terminalDiag.keys += 1;
@@ -2760,11 +2798,18 @@ function terminalOverlayKeyOwners(): KeyOwners {
 }
 
 /** 面板 claims：开 = 导航/Enter/Tab/Esc 全占；关 = 仅裸 ↑ 的唤起门。
- *  唤起门叠加 issue #169 的功能开关：关闭后 gate 不可见，↑ 归远端 shell
- *  原生历史；热键入口（Ctrl+R，见 command-history 分支）同样受开关控制。 */
+ *  唤起门三层叠加：issue #169 功能开关 + issue #108 反馈二的裸 ↑ 独立开关
+ *  + Warp 式正向证据门（integratedPromptIdle——仅集成 shell 的空闲提示符
+ *  可接管；热键入口 command-history 不受证据门约束）。 */
 function panelClaims(panelOpen: boolean): ArbiterClaim[] {
   const gate = priority("arrowUp", "historyPanel");
-  const arrowUpGate = panelOpen || (historyPanelGateOpen() && historyPanelEnabled.value);
+  const arrowUpGate =
+    panelOpen ||
+    bareArrowUpInvokesHistoryPanel({
+      masterEnabled: historyPanelEnabled.value,
+      arrowUpInvokeEnabled: historyPanelArrowUpInvoke.value,
+      gateOpen: historyPanelGateOpen() && integratedPromptIdle.value,
+    });
   return [
     { overlay: "historyPanel", key: "arrowUp", priority: gate, visible: arrowUpGate },
     { overlay: "historyPanel", key: "arrowDown", priority: gate, visible: panelOpen },
@@ -2800,33 +2845,48 @@ function overlayOwnsKey(owners: KeyOwners, event: KeyboardEvent, overlay: Overla
   return dimension !== null && owners[dimension] === overlay;
 }
 
-/** focusSearch（批 3d）：热键唤起（⌘⇧H / Ctrl+Shift+H）传 true——打开即
- *  聚焦面板搜索框（Warp Ctrl+R 心智，打字即过滤）；裸 ↑ 唤起不传，焦点留
- *  在命令行（shell ↑ 心智）。两个入口两种心智，互不打断。 */
+/** focusSearch（批 3d）：热键唤起（⌘⇧H / Ctrl+R / Ctrl+Shift+H）传 true——
+ *  打开即聚焦面板搜索框（Warp Ctrl+R 心智，打字即模糊过滤）；裸 ↑ 唤起不
+ *  传，焦点留在命令行（shell ↑ 心智）。两个入口两种心智，互不打断。 */
 function openHistoryPanel(focusSearch = false) {
   if (!terminal) return;
   // 用过即散：面板是引导条教的键位之一，真用过就不再教（持久化旗标）。
   dismissPromptHints();
   terminalMenuOpen.value = false;
   historyPanelFocusSearch.value = focusSearch;
-  // 每次打开都是全量视图:清掉上一次的搜索词,不读行缓冲(pendingTerminalInput
-  // 是简单字符模型,Ctrl+U/方向键/Ctrl+W 等编辑后会残留残影,曾把面板过滤得
-  // 只剩一条)。过滤只走面板内搜索框。
-  historyPanelQuery.value = "";
+  // 打开前的输入行快照要做屏幕对账（issue #169）：模型行失真（Tab 补全后停
+  // 在前缀）时直接存模型行，Esc 取消导航会把 `cd blen` 写回屏幕上本已是
+  // `cd blender/` 的行，补全结果被吞。以回显提取的真实行为快照；屏幕不可
+  // 测时回落模型行。
+  historyPanelOriginalLine = extractEchoedCommand(readEchoTextBeforeCursor(), pendingTerminalInput) ?? pendingTerminalInput;
+  // 前缀过滤种子（Warp「↑ performs a prefix search based on input」）：取行
+  // 模型而非屏幕对账行——对账提取以模型行在屏幕文本上的首次出现为锚，历史
+  // 命令留在屏上时会撞锚取出多行垃圾串。过滤是无破坏行为（不改行、搜索框
+  // 可见可清），模型轻微陈旧（Tab 补全等）代价可接受。非热键入口且行非空
+  // 才进前缀模式。
+  const seededPrefix = !focusSearch && pendingTerminalInput.trim().length > 0;
+  historyPanelPrefixMode.value = seededPrefix;
+  historyPanelQuery.value = seededPrefix ? pendingTerminalInput.trim() : "";
   // 远端历史导入尚未成功时(首次拉取赶上会话未就绪/超时),打开面板顺带重试
   // 一次;loadRemoteShellHistory 按会话去重,成功过即跳过。
   const panelSessionId = session.value?.sessionId;
   if (panelSessionId && !isLocalMode.value) void loadRemoteShellHistory(panelSessionId);
-  const next = decorateHistoryEntries(filterHistoryEntries(commandHistory.value, ""), commandHistoryTimes.value, commandHistoryMeta.value);
+  // 前缀种子零命中时回落全量视图（面板开了却空屏比全量更费解）；其余照种子。
+  let next = decorateHistoryEntries(
+    historyPanelPrefixMode.value ? filterHistoryEntriesByPrefix(commandHistory.value, historyPanelQuery.value) : filterHistoryEntries(commandHistory.value, ""),
+    commandHistoryTimes.value,
+    commandHistoryMeta.value,
+  );
+  if (historyPanelPrefixMode.value && next.length === 0) {
+    historyPanelPrefixMode.value = false;
+    historyPanelQuery.value = "";
+    next = decorateHistoryEntries(filterHistoryEntries(commandHistory.value, ""), commandHistoryTimes.value, commandHistoryMeta.value);
+  }
   historyPanelEntries.value = next;
-  // shell ↑ 语义:初始高亮最底部(最新执行的命令),↑ 一直往上翻更旧的;
-  // 打开即回填——按下 ↑ 的瞬间输入行就出现最新一条,与 shell 完全一致。
+  // shell ↑ 语义:初始高亮最底部(最新执行的命令/最新命中),↑ 一直往上翻更旧
+  // 的;打开即回填——按下 ↑ 的瞬间输入行就出现最新一条(前缀模式即最新命中),
+  // 与 shell 完全一致。
   historyPanelActiveIndex.value = clampHistoryPanelIndex(next.length - 1, next.length);
-  // 打开前输入行快照要做屏幕对账（issue #169）：模型行失真（Tab 补全后停在
-  // 前缀）时直接存模型行，Esc 取消导航会把 `cd blen` 写回屏幕上本已是
-  // `cd blender/` 的行，补全结果被吞。以回显提取的真实行为快照；屏幕不可
-  // 测时回落模型行。
-  historyPanelOriginalLine = extractEchoedCommand(readEchoTextBeforeCursor(), pendingTerminalInput) ?? pendingTerminalInput;
   syncHistoryPanelLine();
   historyPanelAnchor.value = readTerminalSuggestionAnchor();
   hideGhostSuggestion();
@@ -2841,6 +2901,7 @@ function closeHistoryPanel() {
   if (!historyPanelOpen.value) return;
   historyPanelOpen.value = false;
   historyPanelQuery.value = "";
+  historyPanelPrefixMode.value = false;
   historyPanelEntries.value = [];
   historyPanelActiveIndex.value = 0;
   historyPanelAnchor.value = null;
@@ -2868,18 +2929,37 @@ function moveHistoryPanelActive(delta: number) {
   syncHistoryPanelLine();
 }
 
-/** 开启期间的过滤联动:只认搜索框 query(点击聚焦后,打字即过滤;终端焦点
- *  路径的打字进命令行,不过滤);重算条目后高亮置底(最新/最相关匹配,shell ↑
- *  语义),锚点跟随光标。syncLine 仅搜索框驱动的重过滤置真——高亮变化同步进
- *  输入行;终端 onData 的无参重算路径不改行(用户正在终端打字,行内容不归
- *  面板管)。 */
+/** 开启期间的过滤联动:前缀模式按已输入行前缀精确收窄（filterHistory
+ *  EntriesByPrefix），模糊模式走搜索框 query 的子序列检索（点击聚焦后,打字
+ *  即过滤;终端焦点路径的打字进命令行,仅前缀模式下镜像收窄,见 refine）。重算
+ *  条目后高亮置底(最新/最相关匹配,shell ↑ 语义),锚点跟随光标。syncLine 仅
+ *  搜索框驱动的重过滤置真——高亮变化同步进输入行;终端 onData 的无参重算路
+ *  径不改行(用户正在终端打字,行内容不归面板管)。 */
 function updateHistoryPanelFilter(syncLine = false) {
   if (!historyPanelOpen.value) return;
-  const next = decorateHistoryEntries(filterHistoryEntries(commandHistory.value, historyPanelQuery.value), commandHistoryTimes.value, commandHistoryMeta.value);
+  const filtered = historyPanelPrefixMode.value
+    ? filterHistoryEntriesByPrefix(commandHistory.value, historyPanelQuery.value)
+    : filterHistoryEntries(commandHistory.value, historyPanelQuery.value);
+  const next = decorateHistoryEntries(filtered, commandHistoryTimes.value, commandHistoryMeta.value);
   historyPanelEntries.value = next;
   historyPanelActiveIndex.value = clampHistoryPanelIndex(next.length - 1, next.length);
   historyPanelAnchor.value = readTerminalSuggestionAnchor();
   if (syncLine) syncHistoryPanelLine();
+}
+
+/** Warp「Keep typing to filter」：前缀模式下终端打字实时推进过滤词。过滤词
+ *  镜像行模型（trackPendingInput 已同步退格/Ctrl+U/W 等行编辑），打字只重算
+ *  不改行（高亮 ≠ 行内容，↑ 才回填——Warp 同语义）；回车/Ctrl+C 即执行/放弃，
+ *  面板收场。仅挂终端键入路由（routeTerminalData），粘贴/批量发送等旁路不
+ *  推进面板。 */
+function refineHistoryPanelFromInput(data: string) {
+  if (!historyPanelOpen.value || !historyPanelPrefixMode.value) return;
+  if (data.includes("\r") || data.includes("\n") || data.includes("\u0003")) {
+    closeHistoryPanel();
+    return;
+  }
+  historyPanelQuery.value = pendingTerminalInput;
+  updateHistoryPanelFilter(false);
 }
 
 /** 选中回填：抹掉当前行缓冲后写入命令文本，不回车（用户可再编辑/自行执行）。
@@ -8604,6 +8684,15 @@ function promptHintsKeyLabel(actionId: TerminalHotkeyActionId, preferCtrl: boole
 }
 const promptHintsHistoryKey = computed(() => promptHintsKeyLabel("command-history", true));
 const promptHintsCompletionsKey = computed(() => promptHintsKeyLabel("completions", false));
+// 引导条的 ↑ 芯片只在裸 ↑ 唤起真的可用时展示（issue #108 反馈二）：静态
+// 两开关之外还要求正向证据门在场——非集成会话（堡垒机 koko、fish 等）里
+// ↑ 不会生效，芯片一并隐藏；idle 门随时刻变化，芯片只看稳态组合。
+const historyPanelArrowUpVisible = computed(() =>
+  historyPanelEnabled.value &&
+  historyPanelArrowUpInvoke.value &&
+  integratedPromptIdle.value &&
+  historyPanelGateOpen(),
+);
 const promptHintsVisible = computed(() =>
   shouldShowPromptHints({
     enabled: promptHintsEnabled.value,
@@ -9221,6 +9310,7 @@ watch(historyScope, () => {
           v-if="promptHintsVisible"
           :locale="locale"
           :ai-search-available="aiBridgeOk() && aiSettingsState.search"
+          :arrow-up-history-enabled="historyPanelArrowUpVisible"
           :history-key-label="promptHintsHistoryKey"
           :completions-key-label="promptHintsCompletionsKey"
           :anchor="promptHintsAnchor"
@@ -9352,7 +9442,7 @@ watch(historyScope, () => {
           :query="historyPanelQuery"
           :viewport="suggestionViewport"
           :focus-search-on-mount="historyPanelFocusSearch"
-          @update:query="(value: string) => { historyPanelQuery = value; updateHistoryPanelFilter(true); }"
+          @update:query="(value: string) => { historyPanelPrefixMode = false; historyPanelQuery = value; updateHistoryPanelFilter(true); }"
           @panel-key="handleHistoryPanelPanelKey"
           @select="selectHistoryEntry"
           @close="closeHistoryPanel"
@@ -10627,6 +10717,7 @@ watch(historyScope, () => {
       @update:ctx-search-engines="updateCtxSearchEngines"
       @update:ghost-suggest="setGhostEnabled"
       @update:history-panel-enabled="setHistoryPanelEnabled"
+      @update:history-panel-arrow-up="setHistoryPanelArrowUpInvoke"
       @update:command-history-limit="applyCommandHistoryLimit"
       :ghost-tab-accept="ghostTabAccept"
       @update:ghost-tab-accept="setGhostTabAccept"

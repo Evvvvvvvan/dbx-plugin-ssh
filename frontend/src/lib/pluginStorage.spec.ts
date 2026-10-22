@@ -54,6 +54,9 @@ describe("ssh pluginStore wiring", () => {
         "ssh-suggestion-blocklist",
         // 历史面板功能开关（issue #169，SettingsDialog 自治读写，默认开）。
         "ssh-history-panel-enabled",
+        // 裸 ↑ 唤起独立开关（issue #108 反馈二，默认开 + Warp 式正向证据门：
+        // 堡垒机等非集成会话 ↑ 恒透传）。
+        "ssh-history-panel-arrow-up",
         // 历史显示条数（issue #192，命令环上限 10..1000 默认 100，App 穿参）。
         "ssh-command-history-limit",
         // 空提示符引导条开关+消散旗标（issue #178 补登记，terminalPromptHints 自治）。

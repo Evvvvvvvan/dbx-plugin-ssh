@@ -383,6 +383,31 @@ function setHistoryPanelEnabled(next: boolean) {
   emit("update:historyPanelEnabled", next);
 }
 
+// 裸 ↑ 唤起独立开关（issue #108 反馈二）：默认开，叠加 Warp 式正向证据门
+// （App 侧 integratedPromptIdle）——堡垒机等非集成会话拿不到集成证据，↑
+// 恒透传，无需用户关开关。与主开关同自治模式（pluginStore:
+// ssh-history-panel-arrow-up）。
+const HISTORY_PANEL_ARROW_UP_KEY = "ssh-history-panel-arrow-up";
+const historyPanelArrowUp = ref(loadHistoryPanelArrowUp());
+
+function loadHistoryPanelArrowUp(): boolean {
+  try {
+    return pluginStore.getItem(HISTORY_PANEL_ARROW_UP_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+
+function setHistoryPanelArrowUp(next: boolean) {
+  historyPanelArrowUp.value = next;
+  try {
+    pluginStore.setItem(HISTORY_PANEL_ARROW_UP_KEY, next ? "1" : "0");
+  } catch {
+    // 存储不可用（沙箱降级链耗尽）：退化为会话内存态，开关仍然生效。
+  }
+  emit("update:historyPanelArrowUp", next);
+}
+
 // 历史显示条数（issue #192）：命令环上限（10..1000，默认 100）。与开关同
 // 自治模式——组件内读写 pluginStore，@change 归一化写穿并经
 // update:commandHistoryLimit 上抛；App 侧收紧各桶 + 持久化，即时生效。
@@ -551,6 +576,8 @@ const emit = defineEmits<{
   (e: "update:ghostSuggest", value: boolean): void;
   /** 历史面板功能开关（issue #169，组件自治持久化 pluginStore）。 */
   (e: "update:historyPanelEnabled", value: boolean): void;
+  /** 裸 ↑ 唤起独立开关（issue #108 反馈二，组件自治持久化 pluginStore）。 */
+  (e: "update:historyPanelArrowUp", value: boolean): void;
   /** 历史显示条数（issue #192，组件自治持久化 pluginStore，App 收紧各桶）。 */
   (e: "update:commandHistoryLimit", value: number): void;
   (e: "update:ghostTabAccept", value: boolean): void;
@@ -2471,6 +2498,13 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               <span>{{ t("historyPanelSettings.enabledLabel") }}</span>
             </label>
             <p class="muted settings-note">{{ t("historyPanelSettings.enabledHint") }}</p>
+            <!-- 裸 ↑ 唤起独立开关（issue #108 反馈二）：默认开，叠加 Warp 式
+                 正向证据门——堡垒机等非集成会话拿不到集成证据，↑ 恒透传。 -->
+            <label class="settings-field settings-switch-row">
+              <Switch :model-value="historyPanelArrowUp" size="sm" @update:model-value="setHistoryPanelArrowUp(Boolean($event))" />
+              <span>{{ t("historyPanelSettings.arrowUpLabel") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("historyPanelSettings.arrowUpHint") }}</p>
             <!-- 历史显示条数（issue #192）：命令环上限，收紧即时裁剪生效。 -->
             <label class="settings-field">
               <span>{{ t("historyPanelSettings.limitLabel") }}</span>

@@ -18,6 +18,9 @@ interface Props {
   /** 历史搜索键的展示标签（App 按实时绑定计算，Apple 平台渲染 ⌃/⌘ 符号）；
    *  空 = 该动作已解绑，整项隐藏。 */
   historyKeyLabel: string;
+  /** 裸 ↑ 唤起历史面板可用（issue #108 反馈二默认关）：关闭时隐藏 ↑ 芯片，
+   *  不能教一个不会生效的键；面板入口改教热键（historyKeyLabel 项）。 */
+  arrowUpHistoryEnabled?: boolean;
   /** 补全手动键的展示标签（同上，跟随实时绑定——Ctrl+Space 被系统输入法
    *  抢占的机器上默认键已改为 Ctrl+/，标签必须跟着绑定走而非写死）。 */
   completionsKeyLabel: string;
@@ -57,7 +60,7 @@ const style = computed(() => {
 
 <template>
   <div ref="rootEl" class="terminal-prompt-hints" :class="{ 'anchor-fallback': anchor === null }" :style="style" role="note" :aria-label="t('terminalHints.ariaLabel')">
-    <span class="terminal-prompt-hints-item"><kbd>↑</kbd><span>{{ t("terminalHints.history") }}</span></span>
+    <span v-if="arrowUpHistoryEnabled" class="terminal-prompt-hints-item"><kbd>↑</kbd><span>{{ t("terminalHints.history") }}</span></span>
     <span v-if="aiSearchAvailable" class="terminal-prompt-hints-item"><kbd>#</kbd><span>{{ t("terminalHints.aiSearch") }}</span></span>
     <span v-if="historyKeyLabel" class="terminal-prompt-hints-item"><kbd>{{ historyKeyLabel }}</kbd><span>{{ t("terminalHints.searchHistory") }}</span></span>
     <span v-if="completionsKeyLabel" class="terminal-prompt-hints-item"><kbd>{{ completionsKeyLabel }}</kbd><span>{{ t("terminalHints.completions") }}</span></span>

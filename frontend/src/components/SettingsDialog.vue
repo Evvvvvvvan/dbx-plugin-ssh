@@ -994,12 +994,17 @@ function updateFontWeight(key: "fontWeight" | "fontWeightBold", value: unknown) 
 
 function applyTheme(theme: TerminalAppearanceProfile) {
   emit("apply-theme", theme);
+  // #219：主题快照携带字体（null = 跟随宿主），apply-theme 落地后弹窗的字体
+  // 控件必须立刻回显真实覆盖态——否则控件仍显示上一次的自定义字体，用户以为
+  // 自己的设置还在（issue #219 的「界面显示自定义、终端却是默认字体」）。
+  syncFontControls(theme.font.family, theme.font.size ?? props.terminalFontSize);
 }
 
 function resetAppearance() {
   // 复用「跟随 DBX 宿主」预设：设置重置与字体回跟随宿主走同一条链路，
   // 不另写一份默认值展开，避免两处默认值漂移。
   emit("apply-theme", TERMINAL_APPEARANCE_PRESETS[0]);
+  syncFontControls(TERMINAL_APPEARANCE_PRESETS[0].font.family, props.terminalFontSize);
 }
 
 function saveCurrentTheme() {
@@ -1298,7 +1303,17 @@ watch(() => props.open, (open) => {
   if (open) {
     void reloadSettings();
     void ensureLocalShellOptions();
+    // #219：字体控件只在组件 setup 时回显一次（当时字号还是宿主基准），弹窗
+    // 常驻挂载下草稿就此陈旧——开窗一律按持久化覆盖态 + 当前生效字号重新
+    // 回显，控件展示的字体/字号与终端实际生效值保持一致。
+    syncFontControls(loadTerminalFontOverride().fontFamily, props.terminalFontSize);
   }
+});
+
+// #219：弹窗开着时字号在弹窗外变化（Ctrl+滚轮缩放/主题落地），字号草稿跟随
+// 生效值，避免下一次字体控件交互把陈旧草稿写回终端。
+watch(() => props.terminalFontSize, (size) => {
+  if (props.open) terminalFontSizeDraft.value = String(size);
 });
 
 // 弹窗开着时活跃会话切到另一连接：启动命令区按新 connectionId 重新回显。

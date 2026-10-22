@@ -8,6 +8,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import SettingsDialog from "./SettingsDialog.vue";
+import { pluginStore } from "../lib/pluginStore";
 import { workbenchMessage } from "../lib/i18n";
 import { TERMINAL_BEHAVIOR_DEFAULTS } from "../lib/terminalBehavior";
 import { ACTION_IDS, type TerminalHotkeyBindings } from "../lib/terminalHotkeys";
@@ -214,6 +215,67 @@ describe("SettingsDialog 会话级门控", () => {
     for (const labelKey of ["settingsNav.suggestions", "settingsNav.sudo", "agentTerminalSection"]) {
       expect(nav).toContain(workbenchMessage("zh-CN", labelKey));
     }
+    wrapper.unmount();
+  });
+});
+
+describe("SettingsDialog 字体控件回显（#219）", () => {
+  afterEach(() => {
+    pluginStore.removeItem("ssh-terminal-font-family");
+    pluginStore.removeItem("ssh-terminal-font-size");
+  });
+
+  const customInput = () =>
+    [...document.body.querySelectorAll<HTMLInputElement>("input")].find((el) =>
+      (el.placeholder || "").includes("Fira Code"),
+    );
+  const sizeInput = () =>
+    [...document.body.querySelectorAll<HTMLInputElement>("input")].find(
+      (el) => el.type === "number" && el.closest("label")?.querySelector("span")?.textContent === t("terminalFont.size"),
+    );
+
+  it("开窗按持久化覆盖态回显字体；字号草稿跟随生效字号而非 setup 时刻", async () => {
+    // 直接经 pluginStore 种子：store 水合是异步的（等宿主 init），直写
+    // localStorage 会因缓存未水合而读不到。
+    pluginStore.setItem("ssh-terminal-font-family", "Maple Mono NF");
+    pluginStore.setItem("ssh-terminal-font-size", "14");
+    installInvoke(null);
+    const wrapper = mountSettings(undefined);
+    // 弹窗常驻挂载：setup 时刻的字号是宿主基准（13），外部链路（Ctrl+滚轮/
+    // 主题落地）随后把生效字号推到 14——开窗回显必须读到 14 而非陈旧草稿。
+    await wrapper.setProps({ terminalFontSize: 14, open: true });
+    await flushPromises();
+    expect(customInput()?.value).toBe("Maple Mono NF");
+    expect(sizeInput()?.value).toBe("14");
+    wrapper.unmount();
+  });
+
+  it("恢复默认后字体控件立即回显跟随宿主（不再残留旧自定义字体）", async () => {
+    pluginStore.setItem("ssh-terminal-font-family", "Maple Mono NF");
+    installInvoke(null);
+    const wrapper = mountSettings(undefined);
+    await openDialog(wrapper);
+    expect(customInput()?.value).toBe("Maple Mono NF");
+    const reset = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find((b) =>
+      b.textContent?.includes(t("terminalAppearance.reset")),
+    );
+    expect(reset).toBeTruthy();
+    reset!.click();
+    await flushPromises();
+    const emittedThemes = wrapper.emitted("apply-theme");
+    expect(emittedThemes?.length).toBeGreaterThan(0);
+    // 跟随宿主预设 font 为 null：自定义输入框折叠（choice 回跟随宿主）。
+    expect(customInput()).toBeUndefined();
+    wrapper.unmount();
+  });
+
+  it("弹窗开着时字号 prop 变化，字号草稿跟随生效值", async () => {
+    installInvoke(null);
+    const wrapper = mountSettings(undefined);
+    await openDialog(wrapper);
+    await wrapper.setProps({ terminalFontSize: 16 });
+    await flushPromises();
+    expect(sizeInput()?.value).toBe("16");
     wrapper.unmount();
   });
 });

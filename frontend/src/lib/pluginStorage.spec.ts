@@ -56,6 +56,8 @@ describe("ssh pluginStore wiring", () => {
         "ssh-history-panel-enabled",
         // 历史显示条数（issue #192，命令环上限 10..1000 默认 100，App 穿参）。
         "ssh-command-history-limit",
+        // 历史面板打字联动档位（issue #216，默认开 = 打字即收面板）。
+        "ssh-history-panel-type-close",
         // 空提示符引导条开关+消散旗标（issue #178 补登记，terminalPromptHints 自治）。
         "ssh-terminal-prompt-hints-enabled",
         "ssh-terminal-prompt-hints-dismissed",

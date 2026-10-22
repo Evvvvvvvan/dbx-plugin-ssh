@@ -8224,6 +8224,10 @@ async function initialize() {
   // 否则 workbenchUi 镜像与 setup 期的 sftp-pane-open 等键全部读到空档，
   // 布局偏好整组"不持久"（issue #178 的半个根因，另一半是宿主缺桥）。
   await pluginStore.ready.catch(() => undefined);
+  // 设置偏好以水合后的持久化值为准重读（issue #216 type-close 同款）：setup
+  // 同步初始化时宿主异步 storage 尚未落地，直读必然落在空档，跳过这步用户
+  // 设置跨会话不生效。
+  historyPanelTypeClose.value = loadHistoryPanelTypeClosePref();
   restoreUiState();
   const appearanceAppliedAtBoot = Boolean(api.appearance || api.theme);
   // 外观偏好的 CSS 部分（终端内边距变量）与宿主是否推送 appearance 无关，

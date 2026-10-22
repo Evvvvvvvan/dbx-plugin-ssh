@@ -80,6 +80,10 @@ export const PLUGIN_STORE_KEYS: readonly string[] = [
   // 权威态（采集口/水合/合并穿参），SettingsDialog 数字行自治读写 + 上抛。
   // 漏登记 = 水合不拉，改完条数重启静默回 100。
   "ssh-command-history-limit",
+  // 历史面板打字联动档位（issue #216）：开（默认）打字即收面板；关面板常驻
+  // 实时过滤。漏登记 = 真机写入落盘但水合不拉，重启永远读不回（同 #178 的
+  // 白名单漏登记教训）。
+  "ssh-history-panel-type-close",
   // 空提示符快捷键引导条（terminalPromptHints.ts 自治读写）：设置开关 +
   // 用过即散的一次性旗标。此前漏登记白名单——真机写入落盘但水合不拉，
   // 重启永远读不回（issue #178），补登记后恢复持久化。

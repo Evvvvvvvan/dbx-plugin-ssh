@@ -77,6 +77,7 @@ function mountSettings(sessionId?: string) {
       aiSettings: { search: true, fix: false, assist: true, agentMode: false, fixConsent: false },
       aiBridgeReady: false,
       promptHintsEnabled: true,
+      flagHintEnabled: true,
       profilesOpen: false,
       sessionId,
       terminalFontSize: 14,

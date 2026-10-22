@@ -64,6 +64,8 @@ describe("ssh pluginStore wiring", () => {
         // 空提示符引导条开关+消散旗标（issue #178 补登记，terminalPromptHints 自治）。
         "ssh-terminal-prompt-hints-enabled",
         "ssh-terminal-prompt-hints-dismissed",
+        // 参数即时提示开关（issue #224 第 1 条，flagHints 自治读写，默认开）。
+        "ssh-terminal-flag-hints-enabled",
         // 跨重启布局/视图全局偏好（issue #178，单键 JSON，App.vue 写穿）。
         "ssh-workbench-layout",
         // AI 助手三开关 + AI 修复「不再询问」授权位（Warp AI 对齐批）。

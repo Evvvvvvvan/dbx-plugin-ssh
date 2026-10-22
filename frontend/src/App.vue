@@ -167,6 +167,7 @@ import { EnterLineTracker, acceptCommandWithContinuation, canCaptureEnterLine, e
 import { applyLineEditControlChar } from "./lib/terminalLineModel";
 import { loadGhostTabAccept, matchesGhostFullAccept, matchesGhostWordAccept, resolveCtrlFRoute, saveGhostTabAccept } from "./lib/ghostAcceptKey";
 import { isPasswordPromptLine, loadPromptHintsDismissed, loadPromptHintsEnabled, savePromptHintsDismissed, savePromptHintsEnabled, shouldShowPromptHints } from "./lib/terminalPromptHints";
+import { loadFlagHintEnabled, resolveFlagHint, saveFlagHintEnabled, shouldShowFlagHint, FLAG_HINTS, type FlagHint } from "./lib/flagHints";
 import { readWorkbenchUiMirror, writeWorkbenchUiMirror } from "./lib/workbenchUiMirror";
 // 终端交互提示守卫（issue #150 及其反馈扩展）：远端询问输入/要求选择（MFA/
 // 验证码/密码待输入、选择菜单、y/n 确认）时，↑/↓ 留给远端交互，不唤起历史
@@ -348,6 +349,7 @@ import TerminalSearchPanel from "./components/TerminalSearchPanel.vue";
 import TerminalQuickSelectPanel from "./components/TerminalQuickSelectPanel.vue";
 import TerminalHistoryPanel from "./components/TerminalHistoryPanel.vue";
 import TerminalPromptHints from "./components/TerminalPromptHints.vue";
+import FlagHintBar from "./components/FlagHintBar.vue";
 import {
   bareArrowUpInvokesHistoryPanel,
   canOpenHistoryPanel,
@@ -1021,6 +1023,7 @@ const {
     pendingTerminalInput = value;
     // 同 trackPendingInput：整行替换（回填/接受）也改变行空态。
     promptHintsLineEmpty.value = value === "";
+    flagHintLine.value = value;
   },
   commandRunning,
   isTerminalTransferBusy: () => terminalTransferBusy.value,
@@ -3340,6 +3343,10 @@ function trackPendingInput(data: string) {
   // 引导条的行空判定与行缓冲同步推进（pendingTerminalInput 是普通变量，
   // 引导条显隐要响应式，就在这个唯一汇点镜像一份）。
   promptHintsLineEmpty.value = pendingTerminalInput === "";
+  // flag hint 行镜像（issue #224 第 1 条）：pendingTerminalInput 是普通
+  // let，computed 读不到变化——flagHintLine 在两个写汇点镜像（同
+  // promptHintsLineEmpty 的先例），flagHint computed 只读镜像。
+  flagHintLine.value = pendingTerminalInput;
 }
 
 /** 回车行兜底采集：门过滤 + 回显对照后写入 commandHistory；与 E 帧/命令
@@ -8812,6 +8819,45 @@ function dismissPromptHints() {
   savePromptHintsDismissed(true);
 }
 
+// 命令参数即时提示条（issue #224 第 1 条，FlagHintBar）：行尾 token 命中
+// flagHints 语料即在光标行上方浮释义。零按键纯展示（设计稿硬约束 2）：
+// 不进 overlay 键权表、不出候选；ghost/建议/补全/history/quick-select/
+// 搜索/# 搜索任一开启即让位（shouldShowFlagHint 的 overlayOpen 门）。
+// 开关存 pluginStore（键随白名单声明水合），声明在 setup 尾部——visible
+// 依赖链上有后段才声明的门（commandRunning 等），放前段必踩 TDZ。
+const flagHintEnabled = ref(loadFlagHintEnabled());
+const flagHintAnchor = ref<SuggestionAnchor | null>(null);
+const flagHintLine = ref("");
+const flagHint = computed<FlagHint | null>(() => resolveFlagHint(flagHintLine.value));
+const flagHintVisible = computed(() =>
+  shouldShowFlagHint({
+    enabled: flagHintEnabled.value,
+    hint: flagHint.value !== null,
+    alternateActive: terminal?.buffer.active.type === "alternate",
+    commandRunning: commandRunning.value,
+    transferBusy: terminalTransferBusy.value,
+    overlayOpen:
+      ghostMatch.value !== null ||
+      suggestionOpen.value ||
+      completionOpen.value ||
+      historyPanelOpen.value ||
+      quickSelectOpen.value ||
+      searchOpen.value ||
+      aiSearchState.value.active,
+  }),
+);
+watch(flagHintVisible, (visible) => {
+  if (visible) flagHintAnchor.value = readTerminalSuggestionAnchor();
+});
+function setFlagHintEnabled(value: boolean) {
+  flagHintEnabled.value = value;
+  saveFlagHintEnabled(value);
+}
+/** 语料出处（hint 条 title）：FLAG_HINTS[command]?.source。 */
+function flagHintsSource(command: string): string {
+  return FLAG_HINTS[command]?.source ?? "";
+}
+
 // 命令历史作用域切换（连接切换 / SSH↔本地 / 本地↔串口）：命令弹窗的历史
 // 浏览态随环换桶作废，避免 ↑↓ 指向另一作用域的下标/草稿。放 setup 尾部：
 // watch 创建即求值 historyScope，引用的 connectionId/serialSession 在前段。
@@ -9401,6 +9447,19 @@ watch(historyScope, () => {
           :anchor="promptHintsAnchor"
           :viewport="suggestionViewport"
           @dismiss="dismissPromptHints"
+        />
+        <!-- 命令参数即时提示条（issue #224 第 1 条）：行尾键入 -X/--flag 命中
+             语料即浮释义。零按键纯展示（不接管键盘、对指针透明）；浮层在场/
+             运行中让位由 flagHintVisible 门判定。定位与引导条同一坐标系。 -->
+        <FlagHintBar
+          v-if="flagHintVisible && flagHint"
+          :locale="locale"
+          :flag="flagHint.flag"
+          :description="flagHint.description"
+          :command="flagHint.command"
+          :source="flagHintsSource(flagHint.command)"
+          :anchor="flagHintAnchor"
+          :viewport="suggestionViewport"
         />
         <!-- 命令模糊建议浮层（P1-1）：锚点为光标像素坐标，读不到时贴终端底部；
              键盘（↑↓/Tab/Enter/Esc）由 handleTerminalKey 在浮层开启时优先消费。 -->
@@ -10824,6 +10883,8 @@ watch(historyScope, () => {
       @reset-ai-consent="resetAiFixConsent"
       :prompt-hints-enabled="promptHintsEnabled"
       @update:prompt-hints-enabled="setPromptHintsEnabled"
+      :flag-hint-enabled="flagHintEnabled"
+      @update:flag-hint-enabled="setFlagHintEnabled"
       @update:wallpaper-enabled="updateWallpaperEnabled"
       @update:wallpaper-opacity="updateWallpaperOpacity"
       @set-wallpaper-image="setWallpaperImage"

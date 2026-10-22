@@ -272,6 +272,20 @@ def main() -> None:
         def req(method: str, params: dict | None = None, timeout: float = 60.0) -> dict:
             return client.request(method, params, timeout=timeout, on_event=auto_accept_challenge)
 
+        # 起跑前恢复干净压缩偏好：本脚本上一次中断（Ctrl-C / 用例 FAIL 后
+        # 未走到收尾 restore）会把 mode=on/threshold=0 留在 sidecar 数据目录，
+        # 后续所有运行的小文件下载都会走压缩车道——非压缩感知用例（local
+        # sink 等）首块 next 即踩「still preparing」（CI 全绿/本地复绿后仍
+        # 偶发的根因）。收尾 restore 只负责「本次设置的还原」，起跑清理在
+        # 这里兜底。同步恢复 latin-1 遗留编码偏好（本地长期数据目录可能
+        # 停留旧值，压缩 latin-1 门会拦掉全部压缩用例）。
+        try:
+            req("local/preferences/set", {"transfer_compress_mode": "auto",
+                                          "transfer_compress_threshold_mib": 64,
+                                          "sftp_name_encoding": "auto"})
+        except Exception as error:
+            print(f"    pref reset skipped: {error}")
+
         # -- sftp_ext group ------------------------------------------------------
 
         def case_sftp_stat():

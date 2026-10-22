@@ -124,6 +124,7 @@ export const messages = {
       success: "Connected",
       logsEmpty: "No log entries yet",
       log: {
+        starting: "Starting workbench…",
         attempt: "Connecting (attempt {attempt})…",
         retry: "Retrying in {seconds}s…",
         connected: "Connected in {seconds}s",
@@ -698,6 +699,7 @@ export const messages = {
       success: "Conectado",
       logsEmpty: "Aún no hay entradas de registro",
       log: {
+        starting: "Iniciando el workbench…",
         attempt: "Conectando (intento {attempt})…",
         retry: "Reintentando en {seconds} s…",
         connected: "Conectado en {seconds} s",
@@ -1265,6 +1267,7 @@ export const messages = {
       success: "Connesso",
       logsEmpty: "Nessuna voce di log",
       log: {
+        starting: "Avvio del workbench…",
         attempt: "Connessione (tentativo {attempt})…",
         retry: "Nuovo tentativo tra {seconds} s…",
         connected: "Connesso in {seconds} s",
@@ -1832,6 +1835,7 @@ export const messages = {
       success: "接続しました",
       logsEmpty: "ログはまだありません",
       log: {
+        starting: "ワークベンチを起動しています…",
         attempt: "接続中（{attempt} 回目）…",
         retry: "{seconds} 秒後に再試行…",
         connected: "{seconds} 秒で接続しました",
@@ -2399,6 +2403,7 @@ export const messages = {
       success: "Conectado",
       logsEmpty: "Nenhuma entrada de log ainda",
       log: {
+        starting: "Iniciando o workbench…",
         attempt: "Conectando (tentativa {attempt})…",
         retry: "Nova tentativa em {seconds} s…",
         connected: "Conectado em {seconds} s",
@@ -2966,6 +2971,7 @@ export const messages = {
       success: "连接成功",
       logsEmpty: "暂无日志",
       log: {
+        starting: "工作台启动中…",
         attempt: "正在连接（第 {attempt} 次尝试）…",
         retry: "{seconds} 秒后重试…",
         connected: "已连接，耗时 {seconds} 秒",
@@ -3540,6 +3546,7 @@ export const messages = {
       success: "連線成功",
       logsEmpty: "尚無日誌",
       log: {
+        starting: "工作台啟動中…",
         attempt: "正在連線（第 {attempt} 次嘗試）…",
         retry: "{seconds} 秒後重試…",
         connected: "已連線，耗時 {seconds} 秒",

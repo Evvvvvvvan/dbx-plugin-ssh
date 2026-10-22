@@ -123,7 +123,7 @@ import {
   markSessionTransportOpenSucceeded,
   sessionTransportOpenParams,
 } from "./lib/sessionTransportReuse";
-import { createConnectLog } from "./lib/connectLog";
+import { createConnectLog, latestConnectProgress } from "./lib/connectLog";
 import { pickModalFocusTarget } from "./lib/modalFocus";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
 import { readClipboardText, writeClipboardText, type ClipboardDeps } from "./lib/clipboardBridge";
@@ -4070,6 +4070,16 @@ const { connectCardState, connectLogEntries, reconnect, cancelConnect, startConn
   openSession,
   closeSession,
 });
+
+// #218 连接过渡反馈：connecting 态把最新连接日志行透出为状态行（工作台启动
+// → 第 N 次尝试 → 主机密钥确认 → …），过渡不再是一行静态文案；等待宿主重开
+// 的口径优先（既有行为），日志为空的启动空窗回落静态「连接中」。
+const connectCardStatusText = computed(() => {
+  if (inactiveWaiting.value) return t("connectCard.waitingReopen");
+  if (connectCardState.value === "connecting") return latestConnectProgress(connectLogEntries.value);
+  return "";
+});
+
 
 // 宿主推给 webview 的 connection 上下文缺 external_config.protocol，向
 // sidecar 查询 lifecycle 暂存的权威协议；宿主尚未推送该连接时返回空串。
@@ -8557,6 +8567,10 @@ async function syncMcpSettingsMirror() {
 
 onMounted(() => {
   document.addEventListener("click", onDocumentClickCloseMenus);
+  // #218 连接过渡反馈的启动空窗：workbench 挂载到 openSession 起跑之间
+  // （plugin/initialize + 连接装载）connectLog 为空，卡片只能显示静态
+  // 「连接中」——先落一条启动行，卡片状态行从第一帧起就有真实进度。
+  connectLog.push("info", t("connectCard.log.starting"));
   // AI 桥能力位（Warp AI 对齐批）：桥 bootstrap 与 UI 挂载同批完成，挂载后
   // 探一次供设置页横幅展示；运行时调用点各做新鲜探测（aiBridgeOk）。
   aiBridgeReady.value = aiBridgeOk();
@@ -9519,7 +9533,7 @@ watch(historyScope, () => {
             :name="connection.name || connectionIdentity"
             :identity="connectionIdentity"
             :state="connectCardState"
-            :status-text="inactiveWaiting ? t('connectCard.waitingReopen') : ''"
+            :status-text="connectCardStatusText"
             :error-text="terminalErrorFriendly || terminalError || t('disconnected')"
             :error-detail="terminalErrorDetail"
             :logs-open="connectLogsOpen"
@@ -9529,6 +9543,17 @@ watch(historyScope, () => {
             @connect="startConnect"
             @toggle-logs="connectLogsOpen = !connectLogsOpen"
           />
+        </div>
+        <!-- #218 面板表面连接中指示：dock/panel 直出终端区域是既定设计（宿主
+             预拨号，不叠整卡遮罩），但连接期间面板完全无反馈会读作空白——给
+             一颗轻量状态丸（最新连接日志行），不拦截面板交互，connected 即隐。 -->
+        <div
+          v-if="panelSurface && !isLocalMode && !localShellRestored && !isSerialMode && !isTelnetMode && !isVncMode && !isRdpConnection && !isRdpMode && terminalState === 'connecting' && !reconnectPending"
+          class="panel-connect-pill"
+          role="status"
+        >
+          <Loader2 class="spinning" />
+          <span>{{ connectCardStatusText || t("connecting") }}</span>
         </div>
         <!-- 本地终端启动中覆盖层：spawn 正常在数百毫秒内返回；卡在 starting
              （宿主桥丢响应、慢盘冷启动）必须有可见反馈，否则就是零信息黑屏。

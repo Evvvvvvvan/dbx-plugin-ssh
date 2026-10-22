@@ -41,3 +41,10 @@ export function createConnectLog(): ConnectLog {
     },
   };
 }
+
+/** 连接中卡片的状态行（issue #218）：entries 为 newest-first，取最新一条即
+ * 当前尝试的分步进度（工作台启动 → 第 N 次尝试 → 主机密钥确认…），让过渡
+ * 态有可感知的推进而非静态「连接中」。空缓冲返回空串，调用方回落静态文案。 */
+export function latestConnectProgress(entries: readonly ConnectLogEntry[]): string {
+  return entries[0]?.message ?? "";
+}

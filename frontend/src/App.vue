@@ -4239,9 +4239,13 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     }, { timeoutMs: attemptTimeoutMs });
     // 用户取消后在途 open 仍可能成功（invoke 无法中止）：立即关闭这个孤儿
     // 会话并提前返回——不置 connected、不补发 replay，卡片停在已取消态。
-    if (connectCancelled.value) {
+    // 工作台拆除（workbench/close 或卸载）同理：复制 tab 即开即关时 onClose
+    // 里 session.value 还是 undefined、sidecar 的 close_workbench 也扫不到
+    // 未注册的在途会话，成功返回即成孤儿并永久滞留批量目标注册表
+    // （issue #217）。拆除中的 webview 日志不可见，静默关闭即可。
+    if (connectCancelled.value || disposed) {
       void window.dbxPlugin.invoke("ssh/session/close", { sessionId: info.sessionId }).catch(() => undefined);
-      connectLog.push("warn", t("connectCard.log.orphanClosed"));
+      if (!disposed) connectLog.push("warn", t("connectCard.log.orphanClosed"));
       return;
     }
     // The caller-provided id lets the binary listener accept first output before

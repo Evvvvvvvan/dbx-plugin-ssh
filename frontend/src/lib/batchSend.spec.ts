@@ -3,6 +3,7 @@ import {
   applyConnectionNames,
   batchTargetLabel,
   deriveBatchCommandName,
+  filterLiveBatchTargets,
   normalizeBatchTargets,
   normalizeLocalBatchTargets,
   quickPickCommandById,
@@ -43,6 +44,32 @@ describe("normalizeBatchTargets", () => {
   it("returns empty on malformed payloads", () => {
     expect(normalizeBatchTargets(undefined)).toEqual([]);
     expect(normalizeBatchTargets({ sessions: [] })).toEqual([]);
+  });
+});
+
+describe("filterLiveBatchTargets", () => {
+  it("drops rows the backend lists as dead and keeps live and unliveness-tagged rows", () => {
+    // issue #217：关闭竞态滞留的 connected:false 死行不得进目标列表/计数。
+    const targets = [
+      row({ sessionId: "live-1", connected: true }),
+      row({ sessionId: "dead-1", connected: false }),
+      row({ sessionId: "dead-2", connected: false }),
+      // 旧 sidecar / 本地终端目标缺 liveness 字段：无从判定，保留。
+      row({ sessionId: "legacy", connected: undefined }),
+      { sessionId: "local-1", connectionId: "", local: true, host: "Local · zsh" },
+    ];
+    expect(filterLiveBatchTargets(targets).map((target) => target.sessionId)).toEqual([
+      "live-1",
+      "legacy",
+      "local-1",
+    ]);
+  });
+
+  it("does not mutate the input and tolerates empty lists", () => {
+    const targets = [row({ sessionId: "dead", connected: false })];
+    expect(filterLiveBatchTargets(targets)).toEqual([]);
+    expect(targets).toHaveLength(1);
+    expect(filterLiveBatchTargets([])).toEqual([]);
   });
 });
 

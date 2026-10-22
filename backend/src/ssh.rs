@@ -6424,7 +6424,8 @@ impl SshRuntime {
             Ok(outcome) => {
                 let exit_code = outcome.get("exitCode").and_then(Value::as_i64);
                 let output = outcome.get("output").and_then(Value::as_str);
-                let ok = exit_code == Some(0) && output.is_some_and(|output| output.contains("DBX_COMPRESS_OK"));
+                let ok = exit_code == Some(0)
+                    && output.is_some_and(|output| output.contains("DBX_COMPRESS_OK"));
                 // 诊断日志（macOS 压缩通道排查）：exec 成功但条件不满足时打印
                 // 实际 exitCode/output——此前 false 分支静默，无法分辨是
                 // exec 超时、非零退出还是输出缺标记。

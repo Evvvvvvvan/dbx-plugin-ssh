@@ -42,7 +42,20 @@ use crate::ssh::{
 use crate::sudo_allowlist;
 use crate::sudo_profiles;
 
+/// Fallback protocol version for the `initialize` handshake: answered when
+/// the peer's request names no version from [`SUPPORTED_PROTOCOL_VERSIONS`].
+/// The 2026-07-28 revision removed the initialize handshake entirely
+/// (per-request `_meta` versioning), so this only matters for pre-2026
+/// clients — and their versioning rule (answer with the same version when
+/// supported, else with one we do serve) is honored by the echo in
+/// `dispatch`.
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Protocol revisions this stdio MCP surface serves. Pre-2026 revisions
+/// share the same core (initialize/ping/tools/list/tools/call); 2026-07-28
+/// additionally requires `resultType` on every successful result — stamped
+/// in the dispatch envelope — and can be discovered via `server/discover`.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = ["2026-07-28", "2024-11-05"];
 
 /// Ceilings for the MCP size settings (tiny-rdm's PreferencesMCPSFTP
 /// equivalent): `mcp/settings/set` may lower a limit freely or raise it up
@@ -424,6 +437,21 @@ fn over_limit_line_response(bytes: usize, limit: usize) -> Value {
             ),
         },
     })
+}
+
+/// The `initialize` answer for the peer's requested version: echo it back
+/// when we serve it (the versioning rule of every revision), fall back to
+/// [`PROTOCOL_VERSION`] otherwise — including for the empty/absent params
+/// of pre-versioning callers.
+fn negotiated_protocol_version(params: &Value) -> &'static str {
+    match params.get("protocolVersion").and_then(Value::as_str) {
+        Some(version) => SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .copied()
+            .find(|served| *served == version)
+            .unwrap_or(PROTOCOL_VERSION),
+        None => PROTOCOL_VERSION,
+    }
 }
 
 /// One line read from the stdio peer, bounded by `max_line`.
@@ -886,7 +914,7 @@ impl McpState {
         // stay -32000 across all four plugins.
         let result: Result<Value, (i64, String)> = match method.as_str() {
             "initialize" => Ok(json!({
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": negotiated_protocol_version(&params),
                 "capabilities": { "tools": { "listChanged": false } },
                 "serverInfo": {
                     // 同族基线：完整插件 id（files/ldap/kafka 同款）。
@@ -895,6 +923,14 @@ impl McpState {
                 },
             })),
             "ping" => Ok(json!({})),
+            // 2026-07-28 removed the initialize handshake; version discovery
+            // is this method instead. Clients MAY call it but are not
+            // required to (per-request `_meta` works too), so -32601 here
+            // would only brand the server as pre-2026 — answer it properly.
+            "server/discover" => Ok(json!({
+                "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+                "capabilities": { "tools": { "listChanged": false } },
+            })),
             "tools/list" => Ok(json!({ "tools": tool_definitions() })),
             "tools/call" => {
                 let name = params
@@ -913,7 +949,19 @@ impl McpState {
             other => Err((-32601, format!("Method not found: {other}"))),
         };
         Some(match (id, result) {
-            (Some(id), Ok(result)) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            (Some(id), Ok(mut result)) => {
+                // 2026-07-28 requires `resultType` on every successful
+                // result (the absent-means-complete bridge applies only to
+                // earlier-revision peers). Older peers ignore the extra
+                // field, so stamp `complete` on everything that doesn't
+                // already carry one (a future `input_required` result).
+                if result.get("resultType").is_none() {
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert("resultType".to_string(), json!("complete"));
+                    }
+                }
+                json!({ "jsonrpc": "2.0", "id": id, "result": result })
+            }
             (Some(id), Err((code, message))) => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -5469,14 +5517,39 @@ mod tests {
             .unwrap();
         assert_eq!(init["id"], 1);
         assert_eq!(init["result"]["protocolVersion"], PROTOCOL_VERSION);
+        // 2026-07-28：所有成功结果必须带 resultType（缺失即 complete 的
+        // 桥接只对更早修订版的 peer 生效）。
+        assert_eq!(init["result"]["resultType"], "complete");
         assert!(init["result"]["capabilities"]["tools"].is_object());
         // 同族基线：serverInfo.name 用完整插件 id（files/ldap/kafka 同款）。
         assert_eq!(init["result"]["serverInfo"]["name"], "io.dbx.ssh");
+
+        // 版本协商：客户端请求受支持版本时原样回显（各修订版通用规则）。
+        let negotiated = state
+            .dispatch(json!({
+                "jsonrpc": "2.0", "id": 11, "method": "initialize",
+                "params": { "protocolVersion": "2026-07-28" },
+            }))
+            .await
+            .unwrap();
+        assert_eq!(negotiated["result"]["protocolVersion"], "2026-07-28");
+        assert_eq!(negotiated["result"]["resultType"], "complete");
+
+        // server/discover（2026-07-28 起 initialize 握手移除后的能力发现）。
+        let discover = state
+            .dispatch(json!({ "jsonrpc": "2.0", "id": 12, "method": "server/discover" }))
+            .await
+            .unwrap();
+        let supported = discover["result"]["supportedVersions"].as_array().unwrap();
+        assert!(supported.contains(&json!("2026-07-28")));
+        assert!(supported.contains(&json!("2024-11-05")));
+        assert!(discover["result"]["capabilities"]["tools"].is_object());
 
         let list = state
             .dispatch(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
             .await
             .unwrap();
+        assert_eq!(list["result"]["resultType"], "complete");
         let tools = list["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools
             .iter()
@@ -5839,6 +5912,25 @@ mod tests {
                 .as_str()
                 .unwrap_or_default(),
         )
+    }
+
+    #[tokio::test]
+    async fn tool_call_results_carry_result_type() {
+        let state = state();
+        let call = state
+            .dispatch(json!({
+                "jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                "params": { "name": "ssh_list_known_hosts", "arguments": {} },
+            }))
+            .await
+            .unwrap();
+        assert!(
+            call["error"].is_null(),
+            "unexpected error: {}",
+            call["error"]["message"]
+        );
+        assert_eq!(call["result"]["resultType"], "complete");
+        assert!(call["result"]["content"].is_array());
     }
 
     #[tokio::test]

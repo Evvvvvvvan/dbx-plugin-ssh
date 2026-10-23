@@ -45,7 +45,7 @@ dbx_call_plugin_tool {
 
 ## 方式二：独立 stdio 模式（无 DBX 宿主时）
 
-插件二进制直接作为 MCP 服务器运行（MCP `2024-11-05`，换行分隔 JSON-RPC 2.0）：
+插件二进制直接作为 MCP 服务器运行（MCP `2026-07-28` / `2024-11-05`，换行分隔 JSON-RPC 2.0）：
 
 ```bash
 dbx-plugin-ssh --mcp
@@ -67,6 +67,14 @@ stdio 会话里用 `connectionId` 调用连接类工具（`ssh_exec` / `ssh_exec
 ### JSON-RPC 错误码分档
 
 stdio JSON-RPC 层错误码与同系列插件一致：**传输层用标准码**——`-32700` parse error（请求行非合法 JSON）、`-32601` method not found（未注册的 `method`，文案仍为 `Method not found: <method>`）、`-32600` invalid request（缺 id 等）；**工具级/应用级错误（含 `tools/call` 内未注册工具名、门拒绝、远端失败）一律 `-32000`**。桥模式（DBX 插件内嵌）不经 JSON-RPC 信封，业务错误统一 `-32000`（`to_plugin_error`），未知 binary 通道 `-32601`。
+
+### 协议版本（2026-07-28 一致性）
+
+支持 `2026-07-28` 与 `2024-11-05` 两个修订版：
+
+- **`resultType`（2026-07-28 硬性要求）**：所有成功结果的 `result` 一律携带 `resultType: "complete"`（本服务端不产生 `input_required` 形态）。缺失即 complete 的桥接只对更早修订版的 peer 生效——客户端报 `Invalid result for tools/call: missing required resultType` 即说明对端在跑旧构建 sidecar，重建/重装即可。旧修订版客户端按原样忽略该额外字段，行为不变。
+- **`initialize` 版本回显**：请求里的 `protocolVersion` 命中受支持集合时原样回显，否则回落 `2024-11-05`（各修订版通用版本协商规则）。
+- **`server/discover`**（2026-07-28 起 initialize 握手移除后的能力发现）：返回 `{supportedVersions, capabilities}`；客户端 MAY 调用，未实现也不致命，但实现后新客户端可正确识别服务器能力面。
 
 ### 传输层健壮性
 

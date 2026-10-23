@@ -477,7 +477,22 @@ def main() -> None:
         })
         init = recv(proc, 1)["result"]
         assert init["protocolVersion"] == "2024-11-05", init
+        # MCP 2026-07-28 conformance: every successful result carries
+        # resultType ("complete"; absent-means-complete only bridges
+        # earlier-revision servers), a supported requested version is
+        # echoed back, and server/discover lists the supported set.
+        assert init["resultType"] == "complete", init
         print(f"initialize ok: {init['serverInfo']['name']} {init['serverInfo']['version']}")
+
+        send(proc, {
+            "jsonrpc": "2.0", "id": 5, "method": "initialize",
+            "params": {"protocolVersion": "2026-07-28", "capabilities": {}},
+        })
+        assert recv(proc, 5)["result"]["protocolVersion"] == "2026-07-28", "2026-07-28 not echoed"
+        send(proc, {"jsonrpc": "2.0", "id": 6, "method": "server/discover"})
+        supported = recv(proc, 6)["result"]["supportedVersions"]
+        assert "2026-07-28" in supported and "2024-11-05" in supported, supported
+        print("protocol negotiation ok: version echo + server/discover")
 
         send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = recv(proc, 2)["result"]["tools"]
@@ -530,6 +545,7 @@ def main() -> None:
         })
         result = recv(proc, 4)["result"]
         assert not result.get("isError", False), f"tool failed: {result}"
+        assert result["resultType"] == "complete", result
         parsed = json.loads(result["content"][0]["text"])
         assert isinstance(parsed["knownHosts"], list)
         print("tools/call round-trip ok")
@@ -1134,7 +1150,8 @@ def protocol_robustness_section(args: argparse.Namespace) -> None:
         next_id[0] += 1
         send(proc, {"jsonrpc": "2.0", "id": next_id[0], "method": "ping"})
         response = _recv_id(proc, next_id[0])
-        assert response.get("result") == {}, response
+        # 2026-07-28：成功结果统一带 resultType（此前断言严格等于 {}）。
+        assert response.get("result", {}).get("resultType") == "complete", response
 
     try:
         _handshake(proc)
@@ -1266,7 +1283,8 @@ def stdio_line_limit_section(args: argparse.Namespace) -> None:
         ping_id = 902
         send(proc, {"jsonrpc": "2.0", "id": ping_id, "method": "ping"})
         response = _recv_id(proc, ping_id)
-        assert response.get("result") == {}, response
+        # 2026-07-28：成功结果统一带 resultType（此前断言严格等于 {}）。
+        assert response.get("result", {}).get("resultType") == "complete", response
 
         # And a real tool call still round-trips on the limited sidecar.
         listed = call_tool(proc, next_id, "ssh_list_known_hosts", {})

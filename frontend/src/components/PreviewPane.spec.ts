@@ -10,7 +10,7 @@ import { defineComponent } from "vue";
 import PreviewPane from "./PreviewPane.vue";
 
 type PreviewPaneProps = InstanceType<typeof PreviewPane>["$props"];
-import { PREVIEW_MAX_BYTES, READ_MAX_BYTES, SUDO_READ_MAX_BYTES } from "../lib/preview";
+import { PREVIEW_CONFIRM_BYTES, PREVIEW_MAX_BYTES, READ_MAX_BYTES, SUDO_READ_MAX_BYTES } from "../lib/preview";
 
 config.global.stubs = { FileViewerPreview: true };
 
@@ -86,7 +86,7 @@ function bindSshApi(options: {
     record(method, params);
     if (options.failAll) throw new Error("sidecar unavailable");
     const p = (params ?? {}) as Record<string, unknown>;
-    if (method === "sftp/stat") {
+    if (method === "sftp/stat" || method === "sudo/stat") {
       return { path: p.path, kind: "file", size: options.total ?? 0 } as unknown as T;
     }
     if (method === "sftp/read" || method === "sudo/readFile") {
@@ -235,9 +235,42 @@ it("exposes unsaved-draft state as isDirty for the close guard", async () => {
   expect(dirty()).toBe(false);
 });
 
+// 预览头部：文件类型图标（files 插件 fileIcons 识别）+ 本地程序打开下拉。
+describe("PreviewPane header (file icon + open with)", () => {
+  it("renders the archive icon for a zip and enables local open when capable", async () => {
+    bindSshApi({ total: 0 });
+    const pane = mountPane({ path: "/downloads/bundle.zip", canOpenLocal: true });
+    await flush();
+    expect(pane.get(".ssh-preview-fileicon").classes()).toContain("ssh-fi-archive");
+    const trigger = pane.get("[data-test=preview-open-with]");
+    expect(trigger.attributes("disabled")).toBeUndefined();
+    expect(trigger.attributes("aria-label")).toBe("sftpEdit.openWith");
+  });
+
+  it("disables local open when the desktop capability is missing", async () => {
+    bindSshApi({ total: 0 });
+    const pane = mountPane({ path: "/downloads/bundle.zip", canOpenLocal: false });
+    await flush();
+    const trigger = pane.get("[data-test=preview-open-with]");
+    expect(trigger.attributes("disabled")).toBeDefined();
+    expect(trigger.attributes("title")).toBe("sftpEdit.desktopOnly");
+  });
+
+  it("toggles maximize and swaps the header action to restore", async () => {
+    bindSshApi({ total: 0 });
+    const pane = mountPane({ path: "/notes.txt", maximized: false });
+    await flush();
+    const button = pane.get("[data-test=preview-maximize]");
+    expect(button.attributes("aria-label")).toBe("previewDialog.maximize");
+    await button.trigger("click");
+    expect(pane.emitted("toggle-maximize")).toHaveLength(1);
+    await pane.setProps({ maximized: true });
+    expect(button.attributes("aria-label")).toBe("previewDialog.restore");
+  });
+});
+
 // 车道分流：文本走 CodeMirror，PDF 走 FileViewer，未知二进制回退 hex。
-it("routes strategies: text to CodeMirror, PDF to viewer, unknown binary to hex", async () => {
-  const calls: RecordedCall[] = [];
+it("routes strategies: text to CodeMirror, PDF to viewer, unknown binary to hex", async () => {  const calls: RecordedCall[] = [];
   bindSshApi({ total: 0, calls });
   wrapper = mountPane({ path: "/notes.txt" });
   await flush();
@@ -283,6 +316,73 @@ describe("PreviewPane sudo lane", () => {
     expect(write!.params).toMatchObject({ sessionId: "session-1", path: "/root/notes.txt" });
     expect(wrapper.emitted("saved")).toEqual([["/root/notes.txt"]]);
   });
+
+  // 回归：sudo 二进制预览此前把无 stat 大小当 0 字节直接收口，PDF/Office/
+  // 图片都拿到空 File；现在改用 sudo/stat 取大小并正常分块。
+  it("streams sudo binary previews using the sudo/stat size", async () => {
+    const total = 3 * SUDO_READ_MAX_BYTES + 321;
+    const calls = bindSshApi({ total, sudo: true });
+    wrapper = mountPane({ path: "/root/发票.pdf", sudo: true });
+    await flush(24);
+    expect(calls.some((item) => item.method === "sudo/stat")).toBe(true);
+    expect(calls.some((item) => item.method === "sudo/readFile")).toBe(true);
+    expect(calls.some((item) => item.method === "sftp/stat")).toBe(false);
+    const viewer = wrapper.findComponent({ name: "FileViewerPreview" });
+    expect(viewer.exists()).toBe(true);
+    expect((viewer.props("source") as File).size).toBe(total);
+  });
+});
+
+// 大文件门禁：>32MiB 的 PDF/Office/媒体不自动整文件进内存，先给
+// 「打开方式 / 下载 / 仍要预览」；>256MiB 由 overcap 分支只保留下载出口。
+describe("PreviewPane large file gate", () => {
+  it("holds a large PDF until the user downloads or explicitly previews it", async () => {
+    const total = PREVIEW_CONFIRM_BYTES + 1;
+    const calls = bindSshApi({ total });
+    wrapper = mountPane({ path: "/docs/huge.pdf" });
+    await flush(12);
+    const notice = wrapper.get("[data-test=preview-large]");
+    expect(notice.text()).toContain("previewDialog.largeFileNotice");
+    // 门禁阶段不发起任何分块读取。
+    expect(calls.some((item) => item.method === "sftp/read")).toBe(false);
+    // 下载出口直接交给 App 的既有下载链。
+    await wrapper.get("[data-test=preview-large-download]").trigger("click");
+    expect(wrapper.emitted("download")).toEqual([["/docs/huge.pdf"]]);
+    // 「仍要预览」显式确认后才开始分块并最终交给 viewer。
+    await wrapper.get("[data-test=preview-large-anyway]").trigger("click");
+    await flush(40);
+    expect(calls.some((item) => item.method === "sftp/read")).toBe(true);
+    expect(wrapper.findComponent({ name: "FileViewerPreview" }).exists()).toBe(true);
+  });
+});
+
+// 回归：sftp/stat 失败时不能把文件当 0 字节；未知大小按 truncated 语义读到 EOF。
+it("streams when sftp/stat fails instead of treating the file as empty", async () => {
+  const total = 2 * READ_MAX_BYTES + 7;
+  const calls: RecordedCall[] = [];
+  window.dbxPlugin = {
+    invoke: async <T,>(method: string, params: unknown): Promise<T> => {
+      calls.push({ method, params: (params ?? {}) as Record<string, unknown> });
+      if (method === "sftp/stat") throw new Error("stat unavailable");
+      if (method === "sftp/read") {
+        const offset = Number((params as Record<string, unknown>).offset ?? 0);
+        const length = Math.max(0, Math.min(READ_MAX_BYTES, total - offset));
+        const bytes = new Uint8Array(length);
+        bytes.fill(1);
+        return {
+          dataBase64: b64encode(bytes),
+          truncated: offset + length < total,
+        } as unknown as T;
+      }
+      throw new Error(`unexpected method ${method}`);
+    },
+    decodeBase64: b64decode,
+  } as unknown as DbxPluginApi;
+  wrapper = mountPane({ path: "/docs/report.pdf" });
+  await flush(24);
+  const viewer = wrapper.findComponent({ name: "FileViewerPreview" });
+  expect(viewer.exists()).toBe(true);
+  expect((viewer.props("source") as File).size).toBe(total);
 });
 
 // ---- 分块流式加载（sftp/stat + sftp/read offset）----------------------------
@@ -371,6 +471,40 @@ describe("PreviewPane chunked loading (sftp/read)", () => {
     await pane.get("[data-test=chunk-cancel]").trigger("click");
     expect(pane.emitted("close")).toHaveLength(1);
     // 释放被挂起的第二片后不再有后续分片请求（取消在分片间隙打断）。
+    releaseGate();
+    await flush(24);
+    expect(calls.filter((item) => item.method === "sftp/read").length).toBe(readsBefore);
+  });
+
+  it("stops the chunk loop when the preview unmounts", async () => {
+    const total = 3 * READ_MAX_BYTES;
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const calls: RecordedCall[] = [];
+    window.dbxPlugin = {
+      invoke: async <T,>(method: string, params: unknown): Promise<T> => {
+        calls.push({ method, params: (params ?? {}) as Record<string, unknown> });
+        if (method === "sftp/stat") return { path: "", kind: "file", size: total } as unknown as T;
+        if (method === "sftp/read") {
+          const offset = Number((params as Record<string, unknown>).offset ?? 0);
+          if (offset === READ_MAX_BYTES) await gate;
+          const length = Math.min(READ_MAX_BYTES, total - offset);
+          const bytes = new Uint8Array(length);
+          bytes.fill(1);
+          return { dataBase64: b64encode(bytes), truncated: false } as unknown as T;
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      decodeBase64: b64decode,
+    } as unknown as DbxPluginApi;
+    const pane = mountPane({ path: "/docs/big.pdf" });
+    await flush(24);
+    const readsBefore = calls.filter((item) => item.method === "sftp/read").length;
+    // 关闭预览（X/Esc/遮罩）会卸载组件：释放被挂起的分片后不得再请求后续分片。
+    pane.unmount();
+    wrapper = undefined;
     releaseGate();
     await flush(24);
     expect(calls.filter((item) => item.method === "sftp/read").length).toBe(readsBefore);

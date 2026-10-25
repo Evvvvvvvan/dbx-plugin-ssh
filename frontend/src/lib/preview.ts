@@ -7,6 +7,9 @@ export const READ_MAX_BYTES = 1024 * 1024;
 export const SUDO_READ_MAX_BYTES = 4 * 1024 * 1024;
 // 分块预览的硬上限（read 流式拼装，单文件 ≤256MiB 才进浏览器内存）。
 export const PREVIEW_MAX_BYTES = 256 * 1024 * 1024;
+// 多格式预览（PDF/Office/媒体）的“先询问”阈值：超过后不自动整文件进内存，
+// 改为引导下载 / 本地打开；用户仍可显式选择「仍要预览」。文本链路不受影响。
+export const PREVIEW_CONFIRM_BYTES = 32 * 1024 * 1024;
 
 /** 编辑保存前的大小判断：序列化后字节数 ≤ sftp/write 直写上限才允许直接写回。 */
 export function canEditBytes(byteLength: number): boolean {

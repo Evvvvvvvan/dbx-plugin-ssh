@@ -614,6 +614,20 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 /* gb18030 最小方案：不可解码文件名警示标记（U+FFFD 条目），不占格子只贴名后。 */
 .sftp-lossy-icon { flex: none; width: 13px; height: 13px; color: var(--destructive, #d93025); }
 .folder-icon { color: var(--warning); fill: color-mix(in srgb, var(--warning) 16%, transparent); }
+/* 文件类型图标（files 插件 fileIcons 移植）：媒体/代码/归档给主题色，
+   办公文档与未知类型保持中性灰，避免整列表彩虹化。 */
+.file-name svg.ssh-fi-image { color: color-mix(in srgb, var(--info) 72%, var(--muted-foreground)); }
+.file-name svg.ssh-fi-video { color: color-mix(in srgb, var(--primary) 72%, var(--muted-foreground)); }
+.file-name svg.ssh-fi-audio { color: color-mix(in srgb, var(--warning) 72%, var(--muted-foreground)); }
+.file-name svg.ssh-fi-code { color: color-mix(in srgb, var(--info) 72%, var(--muted-foreground)); }
+.file-name svg.ssh-fi-archive { color: color-mix(in srgb, var(--success) 60%, var(--muted-foreground)); }
+.file-name svg.ssh-fi-pdf { color: var(--destructive); }
+.file-row:hover .file-name svg.ssh-fi-image,
+.file-row:hover .file-name svg.ssh-fi-video,
+.file-row:hover .file-name svg.ssh-fi-code { color: var(--info); }
+.file-row:hover .file-name svg.ssh-fi-audio { color: var(--warning); }
+.file-row:hover .file-name svg.ssh-fi-archive { color: var(--success); }
+.file-row:hover .file-name svg.ssh-fi-pdf { color: var(--destructive); }
 .rename-input { width: 100%; min-width: 60px; height: 22px; border: 1px solid var(--primary); border-radius: var(--radius); padding: 1px 5px; background: var(--background); color: var(--foreground); }
 .file-footer { height: 26px; min-height: 26px; justify-content: space-between; gap: 16px; border-top: 1px solid var(--border); padding: 0 8px; color: var(--muted-foreground); font-size: 11px; }
 /* 窄面板下三段信息（条目数/磁盘余量/当前路径）一律单行：余量与路径可收缩
@@ -708,6 +722,10 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .modal header { min-height: 24px; justify-content: space-between; gap: 12px; padding: 0; }
 .modal header > .icon-button { position: absolute; top: 8px; right: 8px; }
 .modal h2 { min-width: 0; margin: 0; padding-right: 24px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 600; }
+/* 预览标题：文件类型图标 + 可省略标题 + 状态徽标同排。 */
+.preview-title { display: flex; align-items: center; gap: 7px; }
+.preview-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview-file-icon { width: 15px; height: 15px; flex: 0 0 15px; stroke-width: 1.7; }
 .modal > p, .modal > dl, .modal > label, .modal > input { margin-right: 0; margin-left: 0; }
 .modal > p { line-height: 1.55; }
 .modal footer { min-height: 56px; justify-content: flex-end; gap: 8px; margin: 0 -16px -16px; border-top: 1px solid var(--border); border-radius: 0 0 var(--radius-lg, 8px) var(--radius-lg, 8px); padding: 12px 16px; background: color-mix(in srgb, var(--muted) 50%, transparent); }
@@ -733,6 +751,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .destructive-icon { display: grid; width: 32px; height: 32px; flex: 0 0 32px; place-items: center; border-radius: 999px; background: color-mix(in srgb, var(--destructive) 12%, transparent); color: var(--destructive); }
 .destructive-icon svg { width: 16px; height: 16px; }
 .preview-modal { width: min(760px, calc(100vw - 40px)); height: min(680px, calc(100vh - 40px)); }
+/* 预览最大化：铺满宿主视口，保留 16px 边距（与 Dialog 定位器的 p-4 对齐）。 */
+.preview-modal.preview-modal-max { width: calc(100vw - 32px); height: calc(100vh - 32px); }
 .preview-editor { min-height: 0; flex: 1; overflow: hidden; background: var(--ssh-terminal-background); }
 .host-key-modal { width: min(540px, 100%); }
 .host-key-modal dl { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px 12px; padding: 6px 0; }
@@ -1259,6 +1279,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
    头部/编辑条/进度条/正文分区；配色走宿主设计令牌，明暗自动跟随。 */
 .ssh-preview { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 8px; outline: none; }
 .ssh-preview-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-right: 28px; }
+.ssh-preview-fileicon { width: 15px; height: 15px; flex: 0 0 15px; stroke-width: 1.7; color: var(--muted-foreground); }
+.ssh-preview-fileicon.ssh-fi-image,
+.ssh-preview-fileicon.ssh-fi-video,
+.ssh-preview-fileicon.ssh-fi-code { color: var(--info); }
+.ssh-preview-fileicon.ssh-fi-audio { color: var(--warning); }
+.ssh-preview-fileicon.ssh-fi-archive { color: var(--success); }
+.ssh-preview-fileicon.ssh-fi-pdf { color: var(--destructive); }
 .ssh-preview-header strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ssh-preview-meta { color: var(--muted-foreground); font-size: 12px; white-space: nowrap; }
 .ssh-preview-md-toggle { display: inline-flex; gap: 4px; }
@@ -1270,6 +1297,22 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .ssh-preview-action { display: inline-flex; align-items: center; gap: 5px; border: none; background: transparent; color: var(--muted-foreground); font-size: 12px; cursor: pointer; padding: 3px 6px; border-radius: var(--radius); white-space: nowrap; }
 .ssh-preview-action:hover { background: var(--accent); color: var(--foreground); }
 .ssh-preview-action svg { width: 13px; height: 13px; }
+/* 预览头部「打开方式」下拉（内联菜单，锚在按钮右下方；与 files 插件同形）：
+   预览本身是模态 Dialog，内联菜单不受 portal 焦点/外点关闭链干扰。 */
+.ssh-open-with { position: relative; display: inline-flex; }
+.ssh-open-with-trigger .ssh-open-with-caret { width: 11px; height: 11px; opacity: 0.72; }
+.ssh-open-with-menu { position: absolute; z-index: 40; top: calc(100% + 6px); right: 0; display: flex; width: max-content; min-width: 210px; max-width: min(280px, calc(100vw - 24px)); max-height: 60vh; flex-direction: column; gap: 1px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; padding: 4px; background: var(--popover); box-shadow: var(--shadow-popover); transform-origin: top right; }
+/* 大文件提示位于 .ssh-preview-body（overflow:hidden）内部：菜单改为向上展开，
+   避免被正文的裁剪边界切掉。 */
+.ssh-open-with-up .ssh-open-with-menu { top: auto; bottom: calc(100% + 6px); transform-origin: bottom right; }
+.ssh-open-with-item { display: flex; width: 100%; min-width: 0; min-height: 28px; align-items: center; gap: 8px; overflow: hidden; border: 0; border-radius: var(--radius); padding: 4px 8px; background: transparent; color: var(--foreground); font-size: 12px; text-align: left; white-space: nowrap; cursor: pointer; }
+.ssh-open-with-item:hover:not(:disabled) { background: var(--accent); }
+.ssh-open-with-item:disabled { opacity: 0.5; cursor: default; }
+.ssh-open-with-item svg { width: 14px; height: 14px; flex: 0 0 14px; color: var(--muted-foreground); }
+.ssh-open-with-item:hover:not(:disabled) svg { color: inherit; }
+.ssh-open-with-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ssh-open-with-check { margin-left: auto; color: var(--primary) !important; }
+.ssh-open-with-sep { height: 1px; flex: 0 0 1px; margin: 2px -4px; border: 0; background: var(--border); }
 .ssh-preview-close { margin-left: auto; }
 .ssh-preview-header .ssh-preview-close { margin-left: auto; position: static; }
 .ssh-preview-editbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; color: var(--muted-foreground); }

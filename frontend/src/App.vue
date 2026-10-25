@@ -35,7 +35,6 @@ import {
   Download,
   Eraser,
   ExternalLink,
-  File as FileIcon,
   FilePlus,
   FileText,
   FileUp,
@@ -53,6 +52,8 @@ import {
   ListChecks,
   Loader2,
   Lock,
+  Maximize2,
+  Minimize2,
   Network,
   PackageOpen,
   Palette,
@@ -307,6 +308,7 @@ import {
   sftpEntryIconKind,
   type SftpColumn,
 } from "./lib/sftpEntries";
+import { fileIcon, fileIconClass } from "./lib/fileIcons";
 import {
   folderUploadPercent,
 } from "./lib/folderUpload";
@@ -378,6 +380,7 @@ import CompletionMenu from "./components/CompletionMenu.vue";
 import ConnectingCard from "./components/ConnectingCard.vue";
 import GpuNpuMonitor from "./components/GpuNpuMonitor.vue";
 import FolderPickerDialog from "./components/FolderPickerDialog.vue";
+import FileOpenWithMenu from "./components/FileOpenWithMenu.vue";
 import SideNavPanel from "./components/SideNavPanel.vue";
 import DockerPanel from "./components/DockerPanel.vue";
 import { dockerPanelWidthStyle, DOCKER_PANEL_WIDTH_DEFAULT, DOCKER_PANEL_WIDTH_STORE_KEY, dockerPanelWidthAfterDrag, persistDockerPanelWidth, sanitizeDockerPanelWidth } from "./lib/dockerPanelWidth";
@@ -6780,6 +6783,8 @@ const {
   downloadEntry: (entry, forceSudo?: boolean) => downloadEntry(entry, forceSudo),
   pathFromUri,
 });
+// 预览最大化：普通预览与多格式预览共用一个会话级开关（不跨重启持久化）。
+const previewMaximized = ref(false);
 // 多格式预览弹窗的下载/标题辅助：条目对象不在手（路径驱动），构造最小 entry
 // 复用既有 downloadEntry 车道（sudo 模式 + 可写时自动走 sudo 下载）。
 function previewFileLabel(path: string | null): string {
@@ -6817,6 +6822,31 @@ function openWithKnownEntry(entry: SftpEntry, editor: KnownEditor) {
 }
 function openWithCustomEntry(entry: SftpEntry, editor: CustomEditor) {
   void openInExternalEditor(entry, { kind: "custom", editor });
+}
+
+/** 预览弹窗只有远端路径：构造最小 entry 复用右键「打开方式」同一条下载/监听链。 */
+function previewEntryFromPath(path: string): SftpEntry {
+  return { uri: path, name: previewFileLabel(path), kind: "file" };
+}
+function openPreviewInLocalEditor(path: string, editor: ResolvedEditor) {
+  if (!path) return;
+  void openInExternalEditor(previewEntryFromPath(path), editor);
+}
+function beginPreviewCustomCommand(path: string) {
+  if (!path) return;
+  beginCustomEditorCommand(previewEntryFromPath(path));
+}
+function openPreviewWith(editor: ResolvedEditor) {
+  openPreviewInLocalEditor(previewPath.value, editor);
+}
+function openMultiPreviewWith(editor: ResolvedEditor) {
+  openPreviewInLocalEditor(multiPreviewPath.value ?? "", editor);
+}
+function customCommandForPreview() {
+  beginPreviewCustomCommand(previewPath.value);
+}
+function customCommandForMultiPreview() {
+  beginPreviewCustomCommand(multiPreviewPath.value ?? "");
 }
 // 自定义编辑器命令弹窗：命令串由 sidecar argv 化执行（不过 shell），
 // 「记住为默认」写入 {pattern → customId} 关联（pattern 取文件扩展名掩码）。
@@ -10403,9 +10433,15 @@ watch(historyScope, () => {
               >
                 <span class="file-name">
                   <!-- issue #36：图标只认 sftpEntryIconKind —— 仅 directory 出文件夹，
-                       other/未知一律文件图标，symlink 保持链接文档。 -->
+                       other/未知一律文件图标，symlink 保持链接文档。文件类型图标
+                       按扩展名区分（files 插件同款 fileIcons）。 -->
                   <Folder v-if="sftpEntryIconKind(entry.kind) === 'folder'" class="folder-icon" />
-                  <FileIcon v-else-if="sftpEntryIconKind(entry.kind) === 'file'" />
+                  <component
+                    :is="fileIcon(entry.name)"
+                    v-else-if="sftpEntryIconKind(entry.kind) === 'file'"
+                    :class="fileIconClass(entry.name)"
+                    aria-hidden="true"
+                  />
                   <FileText v-else />
                   <input
                     v-if="renamingPath === entry.uri"
@@ -10517,20 +10553,42 @@ watch(historyScope, () => {
          承担；Esc 仍由 onDocumentKeydown 分层链独占（内容上一律 @escape-key-down.prevent），
          外点关闭经 update:open(false) 路由到各弹窗的语义取消函数。 -->
     <Dialog :open="previewOpen" @update:open="(open) => { if (!open) closePreview(); }">
-      <DialogContent class="modal preview-modal" @escape-key-down.prevent>
+      <DialogContent class="modal preview-modal" :class="{ 'preview-modal-max': previewMaximized }" @escape-key-down.prevent>
         <header>
-          <DialogTitle>
-            {{ previewTitle }}
+          <DialogTitle class="preview-title">
+            <component :is="fileIcon(previewTitle)" :class="fileIconClass(previewTitle)" class="preview-file-icon" aria-hidden="true" />
+            <span class="preview-title-text">{{ previewTitle }}</span>
             <span v-if="previewDirty" class="preview-dirty"><span class="preview-dirty-dot" />{{ t("editSave.unsaved") }}</span>
             <span v-else-if="previewTruncated" class="preview-truncated-badge">{{ t("previewDialog.truncated", { limit: formatBytes(MAX_INLINE_PREVIEW_BYTES), size: formatBytes(previewSize) }) }}</span>
           </DialogTitle>
-          <div v-if="previewEditableAllowed" class="preview-actions">
-            <template v-if="!previewEditable">
-              <button :title="t('editSave.edit')" :aria-label="t('editSave.edit')" @click="beginPreviewEdit"><Pencil />{{ t("editSave.edit") }}</button>
-            </template>
-            <template v-else>
-              <button :title="t('cancel')" :aria-label="t('cancel')" @click="cancelPreviewEdit">{{ t("cancel") }}</button>
-              <button :title="t('editSave.save')" :aria-label="t('editSave.save')" :disabled="previewSaving" @click="savePreview"><Loader2 v-if="previewSaving" class="spinning" /><Save v-else />{{ t("editSave.save") }}</button>
+          <!-- 预览内「打开方式」：复用右键子菜单的下载副本 + 外部编辑器链路。 -->
+          <div class="preview-actions">
+            <button
+              type="button"
+              :title="t(previewMaximized ? 'previewDialog.restore' : 'previewDialog.maximize')"
+              :aria-label="t(previewMaximized ? 'previewDialog.restore' : 'previewDialog.maximize')"
+              data-test="preview-maximize"
+              @click="previewMaximized = !previewMaximized"
+            ><Minimize2 v-if="previewMaximized" /><Maximize2 v-else /></button>
+            <FileOpenWithMenu
+              :file-name="previewTitle"
+              :editors="externalEditors"
+              :editor-config="editorConfig"
+              :can-open="localCanSave && canWrite"
+              :disabled-hint="localCanSave ? undefined : t('sftpEdit.desktopOnly')"
+              :t="t"
+              @open="openPreviewWith"
+              @custom-command="customCommandForPreview"
+              @request-editors="ensureExternalEditors"
+            />
+            <template v-if="previewEditableAllowed">
+              <template v-if="!previewEditable">
+                <button :title="t('editSave.edit')" :aria-label="t('editSave.edit')" @click="beginPreviewEdit"><Pencil />{{ t("editSave.edit") }}</button>
+              </template>
+              <template v-else>
+                <button :title="t('cancel')" :aria-label="t('cancel')" @click="cancelPreviewEdit">{{ t("cancel") }}</button>
+                <button :title="t('editSave.save')" :aria-label="t('editSave.save')" :disabled="previewSaving" @click="savePreview"><Loader2 v-if="previewSaving" class="spinning" /><Save v-else />{{ t("editSave.save") }}</button>
+              </template>
             </template>
           </div>
           <button :title="t('close')" :aria-label="t('close')" class="icon-button" @click="closePreview"><X /></button>
@@ -10549,7 +10607,7 @@ watch(historyScope, () => {
     <!-- 多格式预览（files 插件同款）：图片/Office/PDF/媒体/表格/Markdown 等走
          分块流式读取 + 内嵌 file-viewer；sudo 模式整条链路换 sudo 车道。 -->
     <Dialog :open="multiPreviewOpen" @update:open="(open) => { if (!open) closeMultiFormatPreview(); }">
-      <DialogContent class="modal preview-modal" @escape-key-down.prevent>
+      <DialogContent class="modal preview-modal" :class="{ 'preview-modal-max': previewMaximized }" @escape-key-down.prevent>
         <PreviewPane
           :path="multiPreviewPath"
           :session-id="session?.sessionId"
@@ -10557,9 +10615,17 @@ watch(historyScope, () => {
           :can-write="canWrite"
           :appearance="appearance"
           :t="t"
+          :editors="externalEditors"
+          :editor-config="editorConfig"
+          :can-open-local="localCanSave"
+          :maximized="previewMaximized"
           @close="closeMultiFormatPreview"
           @saved="showNotice(t('editSave.saved', { name: previewFileLabel(multiPreviewPath) }))"
           @download="(path) => downloadMultiPreview(path)"
+          @open-with="openMultiPreviewWith"
+          @custom-command="customCommandForMultiPreview"
+          @request-editors="ensureExternalEditors"
+          @toggle-maximize="previewMaximized = !previewMaximized"
         />
       </DialogContent>
     </Dialog>

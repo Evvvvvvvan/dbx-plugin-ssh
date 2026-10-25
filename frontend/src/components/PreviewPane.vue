@@ -13,15 +13,18 @@ let sessionMarkdownView: MarkdownView = "render";
 // 流式拼装（≤1MiB/片，≤256MiB）；sudo 模式走 sudo/readFile（≤4MiB/片）；
 // 文本/可编辑链路仍走既有整读（≤1MiB）。
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
-import { Download, Pencil, RefreshCw, X } from "@lucide/vue";
+import { Download, Maximize2, Minimize2, Pencil, RefreshCw, X } from "@lucide/vue";
 import { formatBytes } from "../lib/format";
-import { canEditBytes, hexDump, PREVIEW_MAX_BYTES, READ_MAX_BYTES, SUDO_READ_MAX_BYTES } from "../lib/preview";
+import { fileIcon, fileIconClass } from "../lib/fileIcons";
+import type { EditorConfig, KnownEditor, ResolvedEditor } from "../lib/editorRules";
+import { canEditBytes, hexDump, PREVIEW_CONFIRM_BYTES, PREVIEW_MAX_BYTES, READ_MAX_BYTES, SUDO_READ_MAX_BYTES } from "../lib/preview";
 import { resolvePreview, type PreviewResolution } from "../lib/previewResolver";
+import FileOpenWithMenu from "./FileOpenWithMenu.vue";
 import FileViewerPreview from "./FileViewerPreview.vue";
 import MarkdownRender from "./MarkdownRender.vue";
 import TextPreview from "./TextPreview.vue";
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   path: string | null;
   sessionId: string | undefined;
   /** sudo 车道：读取走 sudo/readFile、写回走 sudo/writeFile。 */
@@ -30,12 +33,28 @@ const props = defineProps<{
   /** 宿主外观（CodeMirror 主题色板，与 sftp 编辑器同方案）。 */
   appearance: DbxPluginAppearance;
   t: (key: string, values?: Record<string, string | number>) => string;
-}>();
+  /** 预览头部「打开方式」数据源（App 的编辑器目录/映射配置）。 */
+  editors?: KnownEditor[];
+  editorConfig?: EditorConfig;
+  /** 本机落盘能力：web/docker 形态下打开方式入口不可用。 */
+  canOpenLocal?: boolean;
+  /** 预览弹窗是否已最大化（头部按钮在最大化/还原图标间切换）。 */
+  maximized?: boolean;
+}>(), {
+  editors: () => [],
+  editorConfig: () => ({ associations: [], customEditors: [], uploadPolicy: "auto" }),
+  canOpenLocal: false,
+  maximized: false,
+});
 
 const emit = defineEmits<{
   (event: "close"): void;
   (event: "saved", path: string): void;
   (event: "download", path: string): void;
+  (event: "open-with", editor: ResolvedEditor): void;
+  (event: "custom-command"): void;
+  (event: "request-editors"): void;
+  (event: "toggle-maximize"): void;
 }>();
 
 type PreviewMode = "text" | "image" | "hex" | "viewer";
@@ -47,6 +66,10 @@ const editError = ref("");
 const truncated = ref(false);
 // 分块预览超硬上限（>256MiB 不进浏览器内存，保持「下载代替」出口）。
 const overCap = ref(false);
+// 大文件先询问（>32MiB 的 PDF/Office/媒体）：不自动整文件进内存，先给
+// 下载 / 本地打开 / 仍要预览三个出口；用户确认后本文件不再重复询问。
+const largeFile = ref(false);
+const largeFileConfirmed = ref(false);
 const size = ref(0);
 const mode = ref<PreviewMode>("text");
 const editing = ref(false);
@@ -151,6 +174,7 @@ async function load() {
   dataUri.value = "";
   hex.value = "";
   sourceFile.value = null;
+  mode.value = "text";
   resolution.value = resolvePreview(props.path);
   mdView.value = sessionMarkdownView;
   text.value = "";
@@ -158,6 +182,8 @@ async function load() {
   size.value = 0;
   truncated.value = false;
   overCap.value = false;
+  largeFile.value = false;
+  largeFileConfirmed.value = false;
   nonUtf8.value = false;
   // 换文件即失效进行中的分块循环与读取请求（token 检查点见 runChunkLoop）。
   loadToken += 1;
@@ -243,6 +269,11 @@ function revokeObjectUrl() {
 }
 
 onUnmounted(revokeObjectUrl);
+onUnmounted(() => {
+  // 关闭预览（X/Esc/遮罩）也要打断后续分片：大文件不在后台继续下载。
+  chunkCancelRequested.value = true;
+  loadToken += 1;
+});
 
 async function loadChunked(resolution: PreviewResolution) {
   // token 在本函数入口捕获并贯穿整个分块链路：stat 是第一个 await，
@@ -250,34 +281,57 @@ async function loadChunked(resolution: PreviewResolution) {
   const token = loadToken;
   const total = await fetchTotalSize();
   if (token !== loadToken) return;
-  size.value = total;
-  totalBytes.value = total;
-  if (total > PREVIEW_MAX_BYTES) {
+  // null = 大小未知（sudo/stat、sftp/stat 均失败）：
+  // 不能当成 0 字节直接收口，否则 PDF/Office 会拿空 File 渲染（PDF 侧
+  // 报「缺少可读取的数据源」）。未知大小走 truncated 语义逐片读到 EOF。
+  size.value = total ?? 0;
+  totalBytes.value = total ?? 0;
+  if (total !== null && total > PREVIEW_MAX_BYTES) {
     overCap.value = true;
     return;
   }
-  if (total === 0) {
-    finishChunkPreview(resolution);
+  // 大文件先询问：PDF/Office/媒体超过 32MiB 不自动整文件进内存，先给
+  // 「打开方式 / 下载 / 仍要预览」。图片不拦（浏览器解码足够轻）。
+  if (
+    resolution.previewStrategy === "file-viewer"
+    && total !== null
+    && total > PREVIEW_CONFIRM_BYTES
+    && !largeFileConfirmed.value
+  ) {
+    largeFile.value = true;
     return;
   }
+  largeFile.value = false;
   chunkActive.value = true;
   parts = [];
   loadedBytes.value = 0;
   await runChunkLoop(resolution, 0, token);
 }
 
-/** sudo/readFile 无 stat 语义、也不回 totalSize：sudo 车道按单片截断累计，
- * 文件真实大小未知（进度显示已取字节）；普通车道 sftp/stat 取精确 total。 */
-async function fetchTotalSize(): Promise<number> {
-  if (props.sudo) return 0;
+/** 「仍要预览」：用户明确接受整文件进内存后，按同一链路继续加载。 */
+async function previewLargeAnyway() {
+  if (!props.path || !resolution.value || loading.value) return;
+  largeFileConfirmed.value = true;
+  largeFile.value = false;
+  loading.value = true;
   try {
-    const stat = await window.dbxPlugin.invoke<{ size?: number }>("sftp/stat", {
+    await loadChunked(resolution.value);
+  } finally {
+    loading.value = false;
+  }
+}
+
+/** sudo/readFile 无 stat 语义，但 sudo/stat 能拿精确大小（App 属性面板同源）：
+ * 能取到就走确定进度 + 大文件门禁；取不到再退回 unknown 的 truncated 语义。 */
+async function fetchTotalSize(): Promise<number | null> {
+  try {
+    const stat = await window.dbxPlugin.invoke<{ size?: number }>(props.sudo ? "sudo/stat" : "sftp/stat", {
       sessionId: props.sessionId,
       path: props.path,
     });
     return Number(stat.size ?? 0);
   } catch {
-    return 0;
+    return null;
   }
 }
 
@@ -289,13 +343,26 @@ async function runChunkLoop(resolution: PreviewResolution, fromOffset: number, t
     const total = () => totalBytes.value;
     while (!total() || offset < total()) {
       if (token !== loadToken || chunkCancelRequested.value) return;
+      // 未知大小车道没有 stat 上限可依：流式读到 256MiB 即停，保持「下载代替」出口。
+      if (!total() && offset >= PREVIEW_MAX_BYTES) {
+        chunkActive.value = false;
+        parts = [];
+        overCap.value = true;
+        return;
+      }
       const length = total() ? Math.min(perChunkBytes.value, total() - offset) : perChunkBytes.value;
       const result = await readOnce(props.path ?? "", offset, length);
       if (token !== loadToken || chunkCancelRequested.value) return;
       const chunk = window.dbxPlugin.decodeBase64(result.dataBase64);
+      if (!chunk.byteLength) {
+        // 已知大小但还没到 EOF 却读回空片：按协议异常上抛，避免拼出
+        // 空/残缺文件后让 viewer 报无从定位的格式错误。
+        if (!total()) break;
+        if (offset >= total()) break;
+        throw new Error("SFTP read returned no data before EOF");
+      }
       parts.push(chunk);
-      // 0 字节响应按请求长度推进，避免坏实现卡死循环。
-      offset += chunk.byteLength || length;
+      offset += chunk.byteLength;
       loadedBytes.value = offset;
       // 大小未知车道：truncated 表示还有后续，继续下一片；否则收口。
       if (!total() && !result.truncated) break;
@@ -345,7 +412,10 @@ async function resumeChunkLoad() {
   chunkActive.value = true;
   loading.value = true;
   try {
-    await runChunkLoop(resolution.value, Math.min(loadedBytes.value, totalBytes.value), loadToken);
+    // 已知大小按已取 offset 续传；未知大小（sudo/stat 失败）没有 total 可钳，
+    // 直接用已取字节数，避免 Math.min(...) 归零后把 parts 重复拼一遍。
+    const resumeFrom = totalBytes.value ? Math.min(loadedBytes.value, totalBytes.value) : loadedBytes.value;
+    await runChunkLoop(resolution.value, resumeFrom, loadToken);
   } finally {
     loading.value = false;
   }
@@ -418,6 +488,7 @@ const canOpenExternal = computed(() =>
 <template>
   <div v-if="path" ref="previewEl" tabindex="-1" class="ssh-preview" data-test="ssh-preview">
     <div class="ssh-preview-header">
+      <component :is="fileIcon(title)" :class="fileIconClass(title)" class="ssh-preview-fileicon" aria-hidden="true" />
       <strong :title="path">{{ title }}</strong>
       <span class="ssh-preview-meta">{{ loading || mode === "image" || mode === "viewer" ? "" : formatBytes(size) }}</span>
       <!-- Markdown 渲染/源码切换（仅 md 文本态出现；i18n key 缺失用兜底文案）。 -->
@@ -440,7 +511,26 @@ const canOpenExternal = computed(() =>
         >{{ mdLabel("previewDialog.mdSourceView", "源码") }}</button>
       </span>
       <button v-if="canEdit && !saving" type="button" class="ssh-preview-action" data-test="preview-edit" :title="t('editSave.edit')" @click="startEdit"><Pencil />{{ t("editSave.edit") }}</button>
+      <FileOpenWithMenu
+        :file-name="title"
+        :editors="editors"
+        :editor-config="editorConfig"
+        :can-open="canOpenLocal && canWrite"
+        :disabled-hint="canOpenLocal ? undefined : t('sftpEdit.desktopOnly')"
+        :t="t"
+        @open="(editor) => emit('open-with', editor)"
+        @custom-command="emit('custom-command')"
+        @request-editors="emit('request-editors')"
+      />
       <button type="button" class="ssh-preview-action" :title="t('previewDialog.download')" :aria-label="t('previewDialog.download')" @click="emit('download', path)"><Download /></button>
+      <button
+        type="button"
+        class="ssh-preview-action"
+        data-test="preview-maximize"
+        :title="t(maximized ? 'previewDialog.restore' : 'previewDialog.maximize')"
+        :aria-label="t(maximized ? 'previewDialog.restore' : 'previewDialog.maximize')"
+        @click="emit('toggle-maximize')"
+      ><Minimize2 v-if="maximized" /><Maximize2 v-else /></button>
       <button type="button" class="ssh-preview-action ssh-preview-close" :title="t('close')" :aria-label="t('close')" @click="emit('close')"><X /></button>
     </div>
     <div v-if="nonUtf8 && mode === 'text' && !loading && !error" class="ssh-preview-editbar" data-test="nonutf8-hint">{{ t("previewDialog.nonUtf8") }}</div>
@@ -465,6 +555,46 @@ const canOpenExternal = computed(() =>
           <span v-for="row in 8" :key="row" class="ssh-preview-skeleton-row" aria-hidden="true" :style="{ width: `${100 - (row % 3) * 12}%` }" />
         </div>
       </template>
+      <div v-else-if="largeFile" class="ssh-preview-notice" data-test="preview-large">
+        <div>{{ t("previewDialog.largeFileNotice", { size: formatBytes(totalBytes) }) }}</div>
+        <div class="ssh-preview-meta">{{ t("previewDialog.largeFileHint") }}</div>
+        <div class="ssh-preview-actions-row">
+          <FileOpenWithMenu
+            class="ssh-open-with-up"
+            :file-name="title"
+            :editors="editors"
+            :editor-config="editorConfig"
+            :can-open="canOpenLocal && canWrite"
+            :disabled-hint="canOpenLocal ? undefined : t('sftpEdit.desktopOnly')"
+            :t="t"
+            @open="(editor) => emit('open-with', editor)"
+            @custom-command="emit('custom-command')"
+            @request-editors="emit('request-editors')"
+          />
+          <button type="button" class="ssh-preview-chip" data-test="preview-large-download" @click="emit('download', path)"><Download /> {{ t("previewDialog.download") }}</button>
+          <button type="button" class="ssh-preview-chip" data-test="preview-large-anyway" @click="previewLargeAnyway">{{ t("previewDialog.previewAnyway") }}</button>
+        </div>
+      </div>
+      <!-- 超过硬上限：不提供「仍要预览」，只保留下载 / 本地打开。 -->
+      <div v-else-if="overCap" class="ssh-preview-notice" data-test="overcap">
+        <div>{{ t("previewDialog.overCap", { size: formatBytes(PREVIEW_MAX_BYTES) }) }}</div>
+        <div class="ssh-preview-meta">{{ t("previewDialog.largeFileHint") }}</div>
+        <div class="ssh-preview-actions-row">
+          <button type="button" class="ssh-preview-chip" @click="emit('download', path)"><Download /> {{ t("previewDialog.download") }}</button>
+          <FileOpenWithMenu
+            class="ssh-open-with-up"
+            :file-name="title"
+            :editors="editors"
+            :editor-config="editorConfig"
+            :can-open="canOpenLocal && canWrite"
+            :disabled-hint="canOpenLocal ? undefined : t('sftpEdit.desktopOnly')"
+            :t="t"
+            @open="(editor) => emit('open-with', editor)"
+            @custom-command="emit('custom-command')"
+            @request-editors="emit('request-editors')"
+          />
+        </div>
+      </div>
       <div v-else-if="error" class="ssh-preview-notice" data-test="preview-error">
         <div>{{ t("previewDialog.loadError", { error }) }}</div>
         <div v-if="canOpenExternal" class="ssh-preview-meta">{{ t("previewDialog.externalHint") }}</div>
@@ -507,11 +637,6 @@ const canOpenExternal = computed(() =>
     </div>
     <div v-if="truncated" class="ssh-preview-banner" data-test="truncated">
       <span>{{ t("previewDialog.truncatedNotice", { size: formatBytes(perChunkBytes) }) }}</span>
-      <button type="button" class="ssh-preview-chip" @click="emit('download', path)"><Download /> {{ t("previewDialog.download") }}</button>
-    </div>
-    <!-- 分块预览超硬上限（>256MiB）：不进浏览器内存，保持「下载代替」出口。 -->
-    <div v-if="overCap" class="ssh-preview-banner" data-test="overcap">
-      <span>{{ t("previewDialog.overCap", { size: formatBytes(PREVIEW_MAX_BYTES) }) }}</span>
       <button type="button" class="ssh-preview-chip" @click="emit('download', path)"><Download /> {{ t("previewDialog.download") }}</button>
     </div>
   </div>

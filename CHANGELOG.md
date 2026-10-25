@@ -9,6 +9,17 @@ This file records user-facing changes for Terminal. Unless noted otherwise, vers
 - **定时任务支持本地 Shell 目标与脚本文件**。调度任务编辑器新增两处能力：任务连接可选「本地 Shell」（新连接类型 `io.dbx.ssh.local`——表单只有连接名与可选 Shell 绝对路径，无网络端点、无凭据），让定时/常驻命令直接运行在 DBX 所在机器上（进程级应用环境变量与工作目录，流式日志、取消、超时与 SSH 同契约；取消/超时按进程组 TERM→SIGKILL 清理，本地路径忽略 PTY 选项）；两个触发器均新增可选「脚本文件」字段（带本机文件选择器），与「命令」互斥、至少填一个——SSH 连接把脚本上传到远端 `mktemp` 临时文件以 bash（无则 sh）执行、run 结束必删临时文件，本地 Shell 直接执行该文件。本地化覆盖全部既有语言。
   **Scheduled tasks gain a local shell target and script files.** The task editor adds two capabilities: task connections may bind a "Local shell" target (new connection type `io.dbx.ssh.local` — the form carries only a display name and an optional absolute shell path, no network endpoint and no credentials) so scheduled and resident commands run on the machine running DBX itself (environment and working directory apply at the process level; streaming logs, cancel and timeout follow the same contract as SSH, with cancel/timeout tearing down the whole process group TERM→SIGKILL; the PTY field is ignored on local targets); and both triggers gain an optional "Script file" field (with a native file picker), mutually exclusive with "Command" and at least one required — SSH targets upload the script to a remote `mktemp` temp file, run it with bash (falling back to sh) and always remove the temp file afterwards, while local-shell targets execute the file directly. Localizations cover every shipped language.
 
+## [0.7.10-beta.2] — 2026-10-25
+
+> 预发布基线说明同 [0.7.10-beta.1](#0710-beta1--2026-10-25)：调度任务（task-provider）功能声明继续摘除——DBX 上游尚未发布宿主侧 task-provider 能力。
+> **Pre-release baseline note:** same as [0.7.10-beta.1](#0710-beta1--2026-10-25) — the scheduler task-provider declaration stays withheld until the DBX host ships the capability.
+
+- **MCP 尺寸设置可正常保存（#241）**。修复三处叠加造成的「保存后又还原」：读取上限默认 256 KiB，回填时被四舍五入成 0，令整段 MCP 表单持续校验失败；校验失败时该段被静默跳过，主保存仍提示「设置已保存」；越界输入（如读取上限填 1024 MiB，sidecar 上限为 8 MiB）只由 sidecar 拒绝，界面既无上限提示也无错误留存。现在亚 MiB 值按小数回填（默认显示 0.25）、输入接受正数并按 sidecar 上限预校验、面板标注各字段上限；MCP 段未提交时不再谎报保存成功。
+  **MCP size limits now save correctly (#241).** Fixes three combined causes of "save, then it reverts": the 256 KiB default read limit was rounded to 0 on load, leaving the whole MCP form permanently invalid; an invalid form was skipped silently while the main save still reported success; and an over-ceiling value (e.g. 1024 MiB for the read limit, whose sidecar ceiling is 8 MiB) was only rejected by the sidecar, with no ceiling hint and no visible error. Sub-MiB values now keep their decimals (0.25 by default), inputs accept positive numbers and are pre-validated against the sidecar ceilings, each ceiling is shown in the panel, and a skipped MCP section no longer reports a successful save.
+
+- manifest 版本从 `0.7.10-beta.1` 提升为 `0.7.10-beta.2`；rdp client_build 断言保持 700（0.7.x-beta 家族的 minor 段带 `-beta` 后缀按 0 计）。
+  The manifest version moves `0.7.10-beta.1` → `0.7.10-beta.2`; the rdp client_build assertion stays 700 (the `-beta` suffix in the minor segment counts as 0 for the 0.7.x-beta family).
+
 ## [0.7.10-beta.1] — 2026-10-25
 
 > 预发布基线说明（延续 0.7.7 系列）：调度任务（task-provider）功能声明继续摘除——DBX 上游尚未发布宿主侧 task-provider 能力。sidecar `task/*` 实现与本地 Shell 连接类型保留，待上游发布后恢复。

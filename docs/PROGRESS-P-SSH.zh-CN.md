@@ -4490,3 +4490,55 @@ cargo-zigbuild 组合实证可用；两处连锁问题修复：pip ziglang shim 
 主仓侧曾因 choco nasm 与 AWS_LC_SYS_PREBUILT_NASM=1 预编译路径冲突
 而红，已移除 choco 步骤对齐插件 CI 配置（修复见主仓分支），待额度
 窗口恢复后由 run 36801747516 收口。
+
+## SFTP sudo 模式卡死修复：exec 车道 OTP 跨窗口补答（2026-10-25）
+
+**现象**：Quick Sudo 配置为 `sudo_use_pty=true` + `password_then_otp` + TOTP 时，
+SFTP 面板切 sudo 后第二个文件操作起必卡满超时（list 60s / quick 30s / write
+120s），面板一直转圈；审计日志里可见 61s / 120s / 300s 的 sudo 超时簇。
+
+**根因链**：
+1. sudo 时间戳按 tty（无 tty 时按父进程 ppid）记账，**跨 SSH exec 通道不共享**
+   ——每个 `sudo_fs` 操作都是一次全新认证（容器实测：同一 exec 内 `sudo -n`
+   成功，新 exec 通道失败；新 PTY 同样失败）。
+2. TOTP 重放保护在提交后的重放窗口（有效窗 + ±1 步长）内拒绝再次取码
+   （`take_totp_answer`），exec 车道的 `answer_for` 把它变成静默 `None`。
+3. `maybe_answer_prompt` 拿到 `None` 就不写 stdin，远端 sudo 停在 OTP 提示符
+   上直到 exec deadline——这就是“卡死”。
+4. 管道路径还有第二个触发点：密码预灌后无 tty 回显换行，sudo 密码提示与 PAM
+   OTP 提示会拼进同一个 chunk，被 classify 判成 `Combined`；`Combined` +
+   密码已答会被 `can_respond_to_prompt` 整体忽略，同样等满超时。
+5. `list_dir`/`stat` 对**任何**错误都回退到另一种方言，超时后又发起一次 sudo
+   认证，放大停顿并再烧一码。
+
+**修复**（`backend/src/exec.rs`、`backend/src/sudo_fs.rs`、前端导航）：
+- exec 车道接入终端车道已有的 `answer_for_with_retry` 语义：重放受阻时返回
+  下一窗口边界，`run_to_completion` 用定时臂在边界（+1s）补答新码；截止时间
+  最多顺延一次（`OTP_DEFER_GRACE`=70s，且保留命令原有剩余预算），仍超出则
+  立即失败并说明原因。静态码无法轮转时同样快速失败，不再等满超时。
+- `effective_prompt_kind`：密码已答（管道预灌）时把 `Combined` 降级为 `Totp`，
+  让拼接在同一 chunk 里的 OTP 提示仍可应答。
+- `is_unsupported_option_error`：方言回退只在远端明确拒绝选项
+  （unrecognized/invalid/illegal/unknown option、time-style）时触发；超时与
+  认证失败不再二次 sudo。
+- `toggleSudoMode`/`enableSudoModeAndReload` 去掉 `loadingFiles` 守卫：加载中
+  切换立即生效（epoch 让迟到响应失效），sudo 操作卡住时用户能退出 sudo 模式。
+
+**验证**：
+- `cargo test` 1302 全绿（新增 5 例：重放边界、静态码无边界、窗口宽限、单次
+  顺延、拼接 chunk 降级）；`cargo clippy --all-targets -D warnings`、`cargo
+  fmt --check` 全绿。
+- 前端 `vue-tsc` 0 错、vitest 2146 全绿（新增 1 例：加载中切 sudo 立即生效且
+  迟到响应不覆盖列表）。
+- 真机复现（本地 sshd 容器 + 模拟 2FA sudo，分别覆盖 PTY/管道）：修复前第二次
+  操作 30s 超时、listDir 60s 超时；修复后所有操作成功，第二次起耗时 6–30s
+  （等下一 TOTP 窗口），静态码场景 ~2ms 快速失败并给出更新密钥的指引。
+
+**剩余风险 / 后续**：
+- 每次 SFTP sudo 操作仍会重新认证（sudo 时间戳不跨 exec 共享），TOTP 主机上
+  第二个操作起要等窗口滚动，单次 6–30s。根治需为连接维护持久 sudo 会话
+  （同一 shell/PTY 复用时间戳，认证一次管 5 分钟），列为下一轮结构性改造。
+- `sudo -nv` 保活在独立通道上刷新的是它自己的 ppid 票，默认 sudoers 下对后续
+  exec 无帮助（`timestamp_type=global` 的主机除外），随持久会话一并处理。
+- 4 个 worker 的 sidecar 在多个长等待并发时仍可能占满；本轮通过前端可退出
+  sudo 模式缓解，未改请求模型。

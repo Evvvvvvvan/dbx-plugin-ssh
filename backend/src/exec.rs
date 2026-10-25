@@ -853,6 +853,20 @@ pub(crate) fn classify_auth_prompt(prompt: &str, auth: &SudoAuth) -> Option<Prom
     }
 }
 
+/// Reclassifies a chunk that matched both the password and OTP patterns once
+/// the password has already been supplied. The pipe lane pre-pipes the
+/// password, so sudo reads it immediately and the PAM OTP prompt follows in
+/// the same write (no tty means no echo newline to split them); treating that
+/// as a merged prompt would let the "password already answered" guard drop the
+/// whole chunk and leave sudo waiting for a code until the exec deadline.
+fn effective_prompt_kind(kind: PromptKind, password_answered: bool) -> PromptKind {
+    if kind == PromptKind::Combined && password_answered {
+        PromptKind::Totp
+    } else {
+        kind
+    }
+}
+
 pub(crate) fn can_respond_to_prompt(
     mode: AuthFlowMode,
     kind: PromptKind,
@@ -1229,6 +1243,50 @@ const SUDO_WAIT_TIMEOUT_MESSAGE: &str =
      package-manager locks before retrying; for long jobs start them \
      detached (ssh_run_bg + ssh_task_status) instead of extending the wait.";
 
+/// Extra time granted to an exec whose OTP answer has to wait for the next
+/// TOTP window. One full code period (60s in the slowest common setup) plus
+/// margin; a boundary farther away than this cannot plausibly belong to the
+/// configured secret, so the call fails fast instead of stretching the wait.
+const OTP_DEFER_GRACE: Duration = Duration::from_secs(70);
+
+/// Result of inspecting one output chunk for an authentication prompt.
+enum PromptAction {
+    /// Nothing recognized, or a prompt this auth/mode must not answer.
+    Ignore,
+    /// The answer was written to the channel stdin.
+    Answered,
+    /// The only usable TOTP code was already submitted for this target. The
+    /// prompt is still displayed remotely; ask again at the returned unix
+    /// second (next code window) instead of leaving it unanswered until the
+    /// exec deadline.
+    Deferred { kind: PromptKind, at: u64 },
+    /// The prompt can never be answered automatically, or the channel write
+    /// failed; abort the exec with this message.
+    Failure(String),
+}
+
+/// Scheduling outcome for a deferred OTP prompt.
+#[derive(Debug, PartialEq, Eq)]
+enum OtpRetryPlan {
+    /// The next window lands inside the original deadline.
+    Wait,
+    /// The next window lands past the deadline but within [`OTP_DEFER_GRACE`];
+    /// the deadline may be pushed once to cover it.
+    Extend,
+    /// Too far away to be a window of the configured secret.
+    TooLate,
+}
+
+fn plan_otp_retry(wait: Duration, remaining: Duration) -> OtpRetryPlan {
+    if wait <= remaining {
+        OtpRetryPlan::Wait
+    } else if wait <= remaining.saturating_add(OTP_DEFER_GRACE) {
+        OtpRetryPlan::Extend
+    } else {
+        OtpRetryPlan::TooLate
+    }
+}
+
 /// Per-stream output ceiling for `run_to_completion`. A hostile or merely
 /// over-productive remote (`cat /dev/urandom`) would otherwise balloon
 /// sidecar memory until the deadline; past the cap chunks are dropped while
@@ -1250,12 +1308,17 @@ async fn run_to_completion(
     prompt_context: Option<PromptContext<'_>>,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<ExecOutcome, String> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let mut deadline = tokio::time::Instant::now() + timeout;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut exit_code: Option<i32> = None;
     let mut closed = false;
     let mut auth_rounds = 0_u32;
+    // A deferred OTP answer: the prompt stays on screen remotely and becomes
+    // answerable at the next code window. Storing the kind lets the timer arm
+    // retry without re-classifying (the prompt line is already gone).
+    let mut pending_otp: Option<(PromptKind, tokio::time::Instant)> = None;
+    let mut deadline_extended = false;
     // The pipe path pre-pipes the password before any prompt is watched
     // (`password_answered` starts true); on the PTY path nothing is
     // pre-piped — the flushed write never reached sudo — so the rendered
@@ -1268,14 +1331,55 @@ async fn run_to_completion(
         .as_ref()
         .map(|(_, _, otp_piped)| *otp_piped)
         .unwrap_or(false);
+    let prompt_auth = prompt_context.as_ref().map(|(auth, _, _)| *auth);
 
     while !closed {
+        // A deferred prompt comes due: answer it with a code from the new
+        // window, or re-arm when the window edge has not fully passed yet.
+        if let Some((kind, at)) = pending_otp {
+            if tokio::time::Instant::now() >= at {
+                pending_otp = None;
+                let auth = prompt_auth.expect("deferred OTP requires a prompt context");
+                match answer_prompt(
+                    channel,
+                    auth,
+                    kind,
+                    &mut auth_rounds,
+                    &mut password_answered,
+                    &mut otp_answered,
+                )
+                .await
+                {
+                    PromptAction::Answered | PromptAction::Ignore => {}
+                    PromptAction::Deferred { kind, at } => {
+                        schedule_deferred_otp(
+                            &mut pending_otp,
+                            &mut deadline,
+                            &mut deadline_extended,
+                            kind,
+                            at,
+                        )?;
+                    }
+                    PromptAction::Failure(error) => return Err(error),
+                }
+            }
+        }
+        let retry_sleep = async {
+            match pending_otp.as_ref() {
+                Some((_, at)) => tokio::time::sleep_until(*at).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         let message = tokio::select! {
             biased;
             // Cancel lands here even mid-collection: returning Err routes
             // through the caller's abort_exec_channel, which closes the
             // channel so sshd reaps the remote process.
             _ = wait_cancelled(cancel) => return Err(EXEC_CANCELLED_MESSAGE.to_string()),
+            // The retry body runs at the top of the loop, outside the select,
+            // so the `channel.wait()` future's mutable borrow is released
+            // before stdin is written.
+            _ = retry_sleep, if pending_otp.is_some() => continue,
             waited = tokio::time::timeout_at(deadline, channel.wait()) =>
                 waited.map_err(|_| SUDO_WAIT_TIMEOUT_MESSAGE.to_string())?,
         };
@@ -1288,7 +1392,28 @@ async fn run_to_completion(
                 append_capped(&mut stdout, data);
                 if let Some((auth, use_pty, _)) = prompt_context.as_ref() {
                     if *use_pty {
-                        if let Some(error) = maybe_answer_prompt(
+                        apply_prompt_action(
+                            maybe_answer_prompt(
+                                channel,
+                                auth,
+                                &String::from_utf8_lossy(data),
+                                &mut auth_rounds,
+                                &mut password_answered,
+                                &mut otp_answered,
+                            )
+                            .await,
+                            &mut pending_otp,
+                            &mut deadline,
+                            &mut deadline_extended,
+                        )?;
+                    }
+                }
+            }
+            ChannelMsg::ExtendedData { ref data, .. } => {
+                append_capped(&mut stderr, data);
+                if let Some((auth, _, _)) = prompt_context.as_ref() {
+                    apply_prompt_action(
+                        maybe_answer_prompt(
                             channel,
                             auth,
                             &String::from_utf8_lossy(data),
@@ -1296,28 +1421,11 @@ async fn run_to_completion(
                             &mut password_answered,
                             &mut otp_answered,
                         )
-                        .await
-                        {
-                            return Err(error);
-                        }
-                    }
-                }
-            }
-            ChannelMsg::ExtendedData { ref data, .. } => {
-                append_capped(&mut stderr, data);
-                if let Some((auth, _, _)) = prompt_context.as_ref() {
-                    if let Some(error) = maybe_answer_prompt(
-                        channel,
-                        auth,
-                        &String::from_utf8_lossy(data),
-                        &mut auth_rounds,
-                        &mut password_answered,
-                        &mut otp_answered,
-                    )
-                    .await
-                    {
-                        return Err(error);
-                    }
+                        .await,
+                        &mut pending_otp,
+                        &mut deadline,
+                        &mut deadline_extended,
+                    )?;
                 }
             }
             ChannelMsg::ExitStatus { exit_status } => {
@@ -1353,8 +1461,71 @@ async fn run_to_completion(
     })
 }
 
+/// Applies one [`PromptAction`] to the exec loop state, scheduling a deferred
+/// OTP retry or propagating a terminal failure.
+fn apply_prompt_action(
+    action: PromptAction,
+    pending_otp: &mut Option<(PromptKind, tokio::time::Instant)>,
+    deadline: &mut tokio::time::Instant,
+    deadline_extended: &mut bool,
+) -> Result<(), String> {
+    match action {
+        PromptAction::Ignore | PromptAction::Answered => Ok(()),
+        PromptAction::Deferred { kind, at } => {
+            schedule_deferred_otp(pending_otp, deadline, deadline_extended, kind, at)
+        }
+        PromptAction::Failure(error) => Err(error),
+    }
+}
+
+/// Arms the retry timer for a replay-blocked OTP prompt. The deadline is
+/// pushed at most once, by no more than [`OTP_DEFER_GRACE`]; a boundary
+/// farther away than that is a configuration problem (static code, mismatched
+/// secret) and fails immediately with an actionable message instead of
+/// silently burning the whole exec timeout.
+fn schedule_deferred_otp(
+    pending_otp: &mut Option<(PromptKind, tokio::time::Instant)>,
+    deadline: &mut tokio::time::Instant,
+    deadline_extended: &mut bool,
+    kind: PromptKind,
+    at: u64,
+) -> Result<(), String> {
+    let now_unix = unix_now();
+    let wait = Duration::from_secs(at.saturating_sub(now_unix));
+    let now = tokio::time::Instant::now();
+    let retry_at = now + wait;
+    let remaining = deadline.saturating_duration_since(now);
+    match plan_otp_retry(wait, remaining) {
+        OtpRetryPlan::Wait => {
+            *pending_otp = Some((kind, retry_at));
+            Ok(())
+        }
+        OtpRetryPlan::Extend if !*deadline_extended => {
+            // Preserve the command's original budget after the auth wait, plus
+            // a small margin for the window edge itself.
+            *deadline = retry_at + remaining + Duration::from_secs(1);
+            *deadline_extended = true;
+            *pending_otp = Some((kind, retry_at));
+            eprintln!(
+                "[ssh] otp auto-answer deferred: next code window in {}s, extending the command deadline",
+                wait.as_secs()
+            );
+            Ok(())
+        }
+        OtpRetryPlan::Extend | OtpRetryPlan::TooLate => Err(format!(
+            "sudo authentication timed out: the current one-time code was already used for this \
+             target and the next code window is {}s away, past the command deadline. Retry after \
+             {}s (or check the Quick Sudo TOTP configuration).",
+            wait.as_secs(),
+            wait.as_secs()
+        )),
+    }
+}
+
 /// Detects auth prompts in a freshly received chunk and answers them on the
-/// channel stdin. Returns `Err` when sudo reports an authentication failure.
+/// channel stdin. A replay-blocked TOTP prompt is reported as
+/// [`PromptAction::Deferred`] so the caller can wait for the next window
+/// instead of leaving sudo blocked until the exec deadline.
 async fn maybe_answer_prompt(
     channel: &mut russh::Channel<russh::client::Msg>,
     auth: &SudoAuth,
@@ -1362,33 +1533,125 @@ async fn maybe_answer_prompt(
     auth_rounds: &mut u32,
     password_answered: &mut bool,
     otp_answered: &mut bool,
-) -> Option<String> {
+) -> PromptAction {
     let normalized = normalize_auth_prompt_text(chunk).to_lowercase();
     if normalized.is_empty() {
-        return None;
+        return PromptAction::Ignore;
     }
     if AUTH_FAILURE_MARKERS
         .iter()
         .any(|marker| normalized.contains(marker))
     {
-        return Some(format!("sudo authentication failed: {normalized}"));
+        return PromptAction::Failure(format!("sudo authentication failed: {normalized}"));
     }
     let mode = auth.flow_mode();
-    let kind = auth.classify(&normalized)?;
+    let Some(kind) = auth.classify(&normalized) else {
+        return PromptAction::Ignore;
+    };
+    // 管道路径把密码预灌进 stdin（`password_answered` 已为 true），没有 tty
+    // 就没有回显换行，sudo 的密码提示与 PAM 的 OTP 提示会拼在同一个 chunk
+    // 里，被 classify 判成 Combined；而 Combined + 密码已答会被
+    // `can_respond_to_prompt` 整体忽略——远端于是永远等验证码直到 exec 超时
+    // （SFTP sudo 卡死的第二个触发点）。密码半边已付过时，真正待答的是
+    // OTP，按 Totp 处理；mode 不允许 OTP 时下面的 can_respond 仍会拒绝。
+    let kind = effective_prompt_kind(kind, *password_answered);
     if *auth_rounds >= MAX_AUTH_ROUNDS {
-        return None;
+        return PromptAction::Ignore;
     }
     if matches!(kind, PromptKind::Totp | PromptKind::Combined) && *otp_answered {
-        return None;
+        return PromptAction::Ignore;
     }
     if !can_respond_to_prompt(mode, kind, *password_answered) {
-        return None;
+        return PromptAction::Ignore;
     }
-    let answer = auth.answer_for(kind)?;
+    answer_prompt(
+        channel,
+        auth,
+        kind,
+        auth_rounds,
+        password_answered,
+        otp_answered,
+    )
+    .await
+}
+
+/// Writes the answer for an already-classified prompt. Split from detection so
+/// the deferred-retry timer can answer the same prompt again later without the
+/// (now consumed) prompt text.
+async fn answer_prompt(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    auth: &SudoAuth,
+    kind: PromptKind,
+    auth_rounds: &mut u32,
+    password_answered: &mut bool,
+    otp_answered: &mut bool,
+) -> PromptAction {
+    let (answer, retry_at) = auth.answer_for_with_retry(kind);
+    let Some(answer) = answer else {
+        // A window boundary means the only usable code was already spent on
+        // this target: defer rather than park on the prompt. Without one, a
+        // configured rotating secret cannot produce another code (static OTP);
+        // fail fast with the reason. No secret at all is manual 2FA: leave the
+        // prompt to the user, exactly as before.
+        if let Some(at) = retry_at {
+            return PromptAction::Deferred { kind, at };
+        }
+        let otp_bearing = matches!(kind, PromptKind::Totp)
+            || (kind == PromptKind::Combined && auth.flow_mode().answers_merged_prompt_with_otp());
+        if otp_bearing && auth.totp_configured() && auth.flow_mode() != AuthFlowMode::Off {
+            return PromptAction::Failure(
+                "sudo authentication is blocked: the configured one-time code was already used \
+                 and cannot rotate (static code). Update the Quick Sudo TOTP secret or wait for \
+                 the replay window to close, then retry."
+                    .to_string(),
+            );
+        }
+        // Merged prompts may still carry a password-only answer (no TOTP
+        // secret configured) — keep the historical fallback instead of
+        // abandoning a prompt the old code answered.
+        let Some(fallback) = auth.answer_for(kind) else {
+            return PromptAction::Ignore;
+        };
+        return send_auth_answer(
+            channel,
+            fallback,
+            kind,
+            auth.flow_mode(),
+            auth.totp_configured(),
+            auth_rounds,
+            password_answered,
+            otp_answered,
+        )
+        .await;
+    };
+    send_auth_answer(
+        channel,
+        answer,
+        kind,
+        auth.flow_mode(),
+        auth.totp_configured(),
+        auth_rounds,
+        password_answered,
+        otp_answered,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_auth_answer(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    answer: String,
+    kind: PromptKind,
+    mode: AuthFlowMode,
+    totp_configured: bool,
+    auth_rounds: &mut u32,
+    password_answered: &mut bool,
+    otp_answered: &mut bool,
+) -> PromptAction {
     let mut payload = answer.into_bytes();
     payload.push(b'\n');
     if let Err(error) = channel.data(&payload[..]).await {
-        return Some(format!("Failed to write auth answer: {error}"));
+        return PromptAction::Failure(format!("Failed to write auth answer: {error}"));
     }
     match kind {
         PromptKind::Password => *password_answered = true,
@@ -1397,13 +1660,13 @@ async fn maybe_answer_prompt(
             *password_answered = true;
             // OTP 模式下的合并应答携带了验证码：标记已用，避免后续提示
             // 在同一窗口里再烧一码。
-            if mode.answers_merged_prompt_with_otp() && auth.totp_configured() {
+            if mode.answers_merged_prompt_with_otp() && totp_configured {
                 *otp_answered = true;
             }
         }
     }
     *auth_rounds += 1;
-    None
+    PromptAction::Answered
 }
 
 /// Validates a cached sudo timestamp without prompting; used by the
@@ -3353,6 +3616,125 @@ C:/Program Files/Git   100955784  60314920  40640864      60% /
         // answer_for routes through the same guard, so prompts inside the
         // window get no answer instead of a duplicated injection.
         assert_eq!(auth.answer_for(PromptKind::Totp), None);
+    }
+
+    // Exec 车道（SFTP sudo）在重放窗口内必须拿到「下一窗口」边界并推迟补答；
+    // 终端车道的 answer_for_with_retry 已具备该语义，这里钉住 exec 路径复用它
+    // 后不会退化成静默跳过（那会让 sudo 晾在提示符上直到 exec 超时）。
+    #[test]
+    fn replay_blocked_otp_yields_a_retry_boundary_for_the_exec_lane() {
+        let _otp_ledger = otp_ledger_test_guard();
+        let auth = SudoAuth {
+            password: "pw".into(),
+            totp_secrets: parse_totp_secrets("JBSWY3DPEHPK3PXP"),
+            flow_mode: Some(AuthFlowMode::PasswordThenOtp),
+            ..Default::default()
+        };
+        let (answer, boundary) = auth.answer_for_with_retry(PromptKind::Totp);
+        assert!(answer.is_some());
+        assert_eq!(boundary, None);
+
+        let (answer, boundary) = auth.answer_for_with_retry(PromptKind::Totp);
+        assert!(answer.is_none(), "replay must not resubmit the code");
+        assert!(
+            boundary.is_some(),
+            "exec lane needs a retry boundary instead of a silent skip"
+        );
+    }
+
+    // 静态 OTP 码无法轮转：拿不到边界时 exec 车道必须快速失败并给出可操作
+    // 信息，而不是等满超时（answer_for_with_retry 的 (None, None) 形状）。
+    #[test]
+    fn replay_blocked_static_code_has_no_retry_boundary() {
+        let _otp_ledger = otp_ledger_test_guard();
+        let auth = SudoAuth {
+            flow_mode: Some(AuthFlowMode::PasswordThenOtp),
+            totp_secrets: parse_totp_secrets("654321"),
+            ..Default::default()
+        };
+        assert!(auth.answer_for_with_retry(PromptKind::Totp).0.is_some());
+        let (answer, boundary) = auth.answer_for_with_retry(PromptKind::Totp);
+        assert!(answer.is_none());
+        assert_eq!(boundary, None);
+    }
+
+    #[test]
+    fn deferred_otp_retry_plan_respects_the_deadline_and_grace() {
+        assert_eq!(
+            plan_otp_retry(Duration::from_secs(5), Duration::from_secs(10)),
+            OtpRetryPlan::Wait
+        );
+        // Next window past the deadline but inside the one-window grace.
+        assert_eq!(
+            plan_otp_retry(Duration::from_secs(30), Duration::from_secs(10)),
+            OtpRetryPlan::Extend
+        );
+        assert_eq!(
+            plan_otp_retry(Duration::from_secs(80), Duration::from_secs(10)),
+            OtpRetryPlan::Extend
+        );
+        // Beyond the grace (e.g. a static/foreign secret): fail fast.
+        assert_eq!(
+            plan_otp_retry(Duration::from_secs(81), Duration::from_secs(10)),
+            OtpRetryPlan::TooLate
+        );
+    }
+
+    #[test]
+    fn password_already_answered_downgrades_a_coalesced_chunk_to_otp() {
+        // Pipe lane: password prompt + OTP prompt in one chunk after the
+        // pre-piped password. The OTP half must still be actionable.
+        assert_eq!(
+            effective_prompt_kind(PromptKind::Combined, true),
+            PromptKind::Totp
+        );
+        assert_eq!(
+            effective_prompt_kind(PromptKind::Combined, false),
+            PromptKind::Combined
+        );
+        // Everything else keeps its classification.
+        assert_eq!(
+            effective_prompt_kind(PromptKind::Password, true),
+            PromptKind::Password
+        );
+        assert_eq!(
+            effective_prompt_kind(PromptKind::Totp, false),
+            PromptKind::Totp
+        );
+    }
+
+    #[test]
+    fn deferred_otp_deadline_is_extended_at_most_once() {
+        let now = tokio::time::Instant::now();
+        let mut deadline = now + Duration::from_secs(10);
+        let mut extended = false;
+        let mut pending = None;
+
+        // 30s window edge: past the 10s deadline, inside the grace.
+        let at = unix_now() + 30;
+        schedule_deferred_otp(
+            &mut pending,
+            &mut deadline,
+            &mut extended,
+            PromptKind::Totp,
+            at,
+        )
+        .expect("one extension is allowed");
+        assert!(pending.is_some());
+        assert!(extended);
+        assert!(deadline > now + Duration::from_secs(10));
+
+        // A later boundary that still misses the (extended) deadline fails
+        // instead of extending the wait again forever.
+        let error = schedule_deferred_otp(
+            &mut pending,
+            &mut deadline,
+            &mut extended,
+            PromptKind::Totp,
+            unix_now() + 200,
+        )
+        .expect_err("second extension must be refused");
+        assert!(error.contains("one-time code was already used"), "{error}");
     }
 
     #[test]

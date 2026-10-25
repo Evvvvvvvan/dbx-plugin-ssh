@@ -150,7 +150,10 @@ async function loadDirectory(path = currentPath.value, fromTerminal = false, qui
 }
 
 function toggleSudoMode() {
-  if (!connected.value || !canWrite.value || loadingFiles.value) return;
+  if (!connected.value || !canWrite.value) return;
+  // 加载中同样允许切换：新请求的 epoch 会让旧响应失效（迟到结果不覆盖
+  // 列表、也不清 loading）。此前 loading 守卫会直接吞掉开关——sudo 操作
+  // 卡在 sidecar 超时里时用户无法退出 sudo 模式，面板看起来像死了。
   sudoMode.value = !sudoMode.value;
   persistState();
   void loadDirectory();
@@ -158,7 +161,7 @@ function toggleSudoMode() {
 
 // 目录跟随权限引导的动作：切到 sudo 模式并重载目标目录（守卫与手动开关一致）。
 async function enableSudoModeAndReload(path: string) {
-  if (!connected.value || !canWrite.value || loadingFiles.value) return;
+  if (!connected.value || !canWrite.value) return;
   sudoMode.value = true;
   persistState();
   await loadDirectory(path);

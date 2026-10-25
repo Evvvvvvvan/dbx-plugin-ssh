@@ -138,6 +138,26 @@ fn parse_bsd_stat_line(line: &str) -> Option<StatInfo> {
     })
 }
 
+/// True when a failed sudo command looks like the remote tool rejected one of
+/// our options — the only case where trying the other dialect (`ls` GNU vs
+/// BusyBox, `stat` GNU vs BSD) is meaningful. Timeouts and authentication
+/// failures must never trigger a second sudo invocation: every exec channel
+/// authenticates from scratch, so a blind retry doubles the stall and burns
+/// another TOTP window (the exact failure mode behind the SFTP sudo hang).
+fn is_unsupported_option_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    const MARKERS: [&str; 5] = [
+        "unrecognized option",
+        "invalid option",
+        "illegal option",
+        "unknown option",
+        // Some BusyBox builds echo the offending flag without the word
+        // "option", so the GNU-only spelling is itself a dialect signal.
+        "time-style",
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
 /// Returns file metadata via sudo `stat`, trying GNU `stat -c` first and
 /// falling back to `stat -f` on BSD-flavoured systems (tiny-rdm StatSudo).
 pub async fn stat(runtime: &SshRuntime, session_id: &str, path: &str) -> Result<Value, String> {
@@ -145,13 +165,14 @@ pub async fn stat(runtime: &SshRuntime, session_id: &str, path: &str) -> Result<
     let gnu = format!("stat -c '{}' -- {}", GNU_STAT_FORMAT, shell_quote(&path));
     let parsed = match sudo_exec(runtime, session_id, &gnu, TIMEOUT_QUICK_SECS).await {
         Ok(output) => parse_gnu_stat_line(&output),
-        Err(gnu_error) => {
+        Err(gnu_error) if is_unsupported_option_error(&gnu_error) => {
             let bsd = format!("stat -f '{}' -- {}", BSD_STAT_FORMAT, shell_quote(&path));
             match sudo_exec(runtime, session_id, &bsd, TIMEOUT_QUICK_SECS).await {
                 Ok(output) => Some(parse_bsd_stat_line(&output).ok_or(gnu_error)?),
                 Err(_) => return Err(gnu_error),
             }
         }
+        Err(error) => return Err(error),
     };
     let info = parsed.ok_or_else(|| format!("Could not parse stat output for {path}"))?;
     Ok(json!({
@@ -380,12 +401,13 @@ pub async fn list_dir(runtime: &SshRuntime, session_id: &str, path: &str) -> Res
     let gnu = format!("ls -la --time-style=+%s -- {}", shell_quote(&path));
     let output = match sudo_exec(runtime, session_id, &gnu, TIMEOUT_LIST_SECS).await {
         Ok(output) => output,
-        Err(gnu_error) => {
+        Err(gnu_error) if is_unsupported_option_error(&gnu_error) => {
             let fallback = format!("ls -la -- {}", shell_quote(&path));
             sudo_exec(runtime, session_id, &fallback, TIMEOUT_LIST_SECS)
                 .await
                 .map_err(|_| gnu_error)?
         }
+        Err(error) => return Err(error),
     };
     let entries = parse_ls_output(&path, &output);
     Ok(json!({ "entries": entries }))
@@ -622,6 +644,32 @@ pub async fn rename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_is_limited_to_rejected_options() {
+        // BusyBox / BSD `ls` and `stat` reject the GNU-only flags with these
+        // messages; those are the only failures a second sudo call can fix.
+        assert!(is_unsupported_option_error(
+            "sudo command exited 1: ls: unrecognized option: time-style=+%s"
+        ));
+        assert!(is_unsupported_option_error("stat: illegal option -- c"));
+        assert!(is_unsupported_option_error("ls: invalid option -- '-'"));
+        assert!(is_unsupported_option_error(
+            "stat: unknown option -- format"
+        ));
+        // Timeouts and auth failures must not re-run sudo: it would double the
+        // stall and (with TOTP) burn another one-time code, which is exactly
+        // the SFTP sudo hang chain.
+        assert!(!is_unsupported_option_error(
+            "Timed out waiting for the remote command to finish. The command may STILL be running"
+        ));
+        assert!(!is_unsupported_option_error(
+            "sudo command exited 1: sudo: a password is required"
+        ));
+        assert!(!is_unsupported_option_error(
+            "sudo authentication failed: sorry, try again"
+        ));
+    }
 
     #[test]
     fn shell_quotes_embedded_single_quotes() {

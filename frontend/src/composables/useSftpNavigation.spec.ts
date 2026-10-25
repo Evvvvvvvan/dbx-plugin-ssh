@@ -160,4 +160,33 @@ describe("useSftpNavigation quiet failure mode (issue #209)", () => {
     expect(h.sftpSoftError.value).toBeNull();
     expect(h.notices).toEqual([]);
   });
+
+  it("加载中切换 sudo 模式立即生效，迟到的旧响应不再覆盖列表", async () => {
+    const h = setupHarness();
+    // 第一次加载永不完成（模拟 sudo 操作卡到 sidecar 超时）。
+    let releaseFirst: (value: unknown) => void = () => undefined;
+    h.invoke.mockImplementationOnce(
+      () => new Promise((resolve) => { releaseFirst = resolve; }),
+    );
+
+    const first = h.nav.loadDirectory("/home/user");
+    expect(h.loadingFiles.value).toBe(true);
+
+    // 旧请求未返回时切换 sudo：必须立即换 sudo 车道并重载，而不是吞掉开关。
+    h.invoke.mockResolvedValueOnce({ entries: [] });
+    h.nav.toggleSudoMode();
+
+    expect(h.sudoMode.value).toBe(true);
+    expect(h.invoke).toHaveBeenLastCalledWith(
+      "sudo/listDir",
+      expect.objectContaining({ path: "/home/user" }),
+    );
+    await vi.waitFor(() => expect(h.loadingFiles.value).toBe(false));
+    expect(h.entries.value).toEqual([]);
+
+    // 旧请求迟到：epoch 已失效，不得覆盖新列表或把 loading 打回 false。
+    releaseFirst({ entries: [{ uri: "/home/user/stale", name: "stale", kind: "file" }] });
+    await first;
+    expect(h.entries.value).toEqual([]);
+  });
 });

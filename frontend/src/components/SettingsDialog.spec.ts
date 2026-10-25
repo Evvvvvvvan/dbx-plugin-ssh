@@ -46,15 +46,19 @@ function installInvoke(meta: Record<string, unknown> | null) {
       if (meta === null) throw new Error("settings get failed (mock)");
       return meta;
     }
+    // 主保存链会把 ssh/settings/set 的返回值写回 settingsMeta；回同样的 meta，
+    // 避免后续渲染读到空对象（#241 保存用例会真的点主保存按钮）。
+    if (method === "ssh/settings/set") return meta ?? {};
     if (method === "sudo/profiles/list") return { profiles: [] };
     if (method === "ssh/knownHosts/list") return { entries: [] };
     if (method === "keys/discover") return { keys: [] };
     if (method === "local/shells/list") return { shells: [] };
     if (method === "mcp/settings/get") {
-      // 缺数值会让 MCP 面板的行内校验亮错（渲染期计算，无需保存动作）。
+      // 与 sidecar 默认一致：读取上限 256 KiB（亚 MiB）。回填必须显示 0.25
+      // 而不是 0，否则整段 MCP 表单会一直校验失败（#241 回归）。
       return {
-        maxReadBytes: 8 * 1024 * 1024,
-        maxUploadBytes: 64 * 1024 * 1024,
+        maxReadBytes: 256 * 1024,
+        maxUploadBytes: 16 * 1024 * 1024,
         maxDownloadBytes: 256 * 1024 * 1024,
         execPermissionMode: "autonomous",
         connectionScope: [],
@@ -277,6 +281,57 @@ describe("SettingsDialog 字体控件回显（#219）", () => {
     await wrapper.setProps({ terminalFontSize: 16 });
     await flushPromises();
     expect(sizeInput()?.value).toBe("16");
+    wrapper.unmount();
+  });
+});
+
+// #241：MCP 尺寸面板的保存回归。此前读取上限默认 256 KiB 被四舍五入显示成
+// 0，表单因此永远非法，saveMcpSettings 静默跳过但主保存仍提示「已保存」。
+describe("SettingsDialog MCP 尺寸保存（#241）", () => {
+  const mcpInput = (label: string) =>
+    [...document.body.querySelectorAll<HTMLLabelElement>(".settings-field")]
+      .find((el) => (el.querySelector("span")?.textContent ?? "").trim() === label)
+      ?.querySelector<HTMLInputElement>("input");
+
+  const clickMainSave = async () => {
+    const button = [...document.body.querySelectorAll<HTMLButtonElement>("footer button.primary-button")]
+      .find((el) => (el.textContent ?? "").trim() === t("settingsSave"));
+    expect(button, "底部主保存按钮").toBeTruthy();
+    button!.click();
+    await flushPromises();
+  };
+
+  it("读取上限按默认 256 KiB 回填为 0.25，主保存提交原始字节数", async () => {
+    const invoke = installInvoke(SSH_SETTINGS_META);
+    const wrapper = mountSettings("sess-1");
+    await openDialog(wrapper);
+
+    expect(mcpInput(t("mcpLimits.read"))?.value).toBe("0.25");
+    await clickMainSave();
+
+    const setCall = invoke.mock.calls.find(([method]) => method === "mcp/settings/set");
+    expect(setCall?.[1]).toMatchObject({
+      maxReadBytes: 256 * 1024,
+      maxUploadBytes: 16 * 1024 * 1024,
+      maxDownloadBytes: 256 * 1024 * 1024,
+    });
+    expect(wrapper.emitted("error")).toBeUndefined();
+    wrapper.unmount();
+  });
+
+  it("读取上限超过 sidecar 上限时不再假报成功，也不提交", async () => {
+    const invoke = installInvoke(SSH_SETTINGS_META);
+    const wrapper = mountSettings("sess-1");
+    await openDialog(wrapper);
+
+    const read = mcpInput(t("mcpLimits.read"))!;
+    read.value = "1024";
+    read.dispatchEvent(new Event("input"));
+    await flushPromises();
+    await clickMainSave();
+
+    expect(invoke.mock.calls.some(([method]) => method === "mcp/settings/set")).toBe(false);
+    expect(wrapper.emitted("error")?.[0]).toEqual([t("mcpLimits.skipped")]);
     wrapper.unmount();
   });
 });

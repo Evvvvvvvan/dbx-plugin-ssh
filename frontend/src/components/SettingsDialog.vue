@@ -25,7 +25,7 @@ import { connectionEntryEquals, loadConnectionEntry, saveConnectionEntry } from 
 import { clampFontSize, TERMINAL_FONT_MAX, TERMINAL_FONT_MIN } from "../lib/terminalZoom";
 import { confirmDialog } from "../lib/confirmDialog";
 import { loadTerminalFontOverride } from "../lib/terminalFont";
-import { MIB, mibField, persistMcpSettingsMirror, settingsErrorOf, type DiscoveredKey, type KnownHostEntry, type McpSizeSettings, type SshSettings, type SudoProfileView } from "../lib/settingsModel";
+import { MCP_LIMIT_CEILING_MIB, mibField, parseMibInput, persistMcpSettingsMirror, settingsErrorOf, type DiscoveredKey, type KnownHostEntry, type McpSizeSettings, type SshSettings, type SudoProfileView } from "../lib/settingsModel";
 import { DOWNLOAD_CONFLICT_POLICIES, type DownloadConflictPolicy } from "../lib/downloadPrefs";
 import { type EditorAssociation, type EditorConfig, type KnownEditor } from "../lib/editorRules";
 import { TRANSFER_DUPLICATE_POLICIES, type TransferDuplicatePolicy } from "../lib/transferQueue";
@@ -837,8 +837,10 @@ const mcpDraft = reactive({ readMiB: "", uploadMiB: "", downloadMiB: "", permiss
 const mcpLoading = ref(false);
 const mcpError = ref("");
 const mcpSaving = ref(false);
-const mcpInputsValid = computed(() => [mcpDraft.readMiB, mcpDraft.uploadMiB, mcpDraft.downloadMiB]
-  .every((value) => /^\d+$/.test(value.trim()) && Number.parseInt(value.trim(), 10) > 0));
+const mcpInputsValid = computed(() =>
+  parseMibInput(mcpDraft.readMiB, MCP_LIMIT_CEILING_MIB.read) !== null
+  && parseMibInput(mcpDraft.uploadMiB, MCP_LIMIT_CEILING_MIB.upload) !== null
+  && parseMibInput(mcpDraft.downloadMiB, MCP_LIMIT_CEILING_MIB.download) !== null);
 
 // AI 终端同步模式下拉随档位变化的说明文案（off/auto/strict 三键 hint）。
 const agentTerminalModeHint = computed(() => t(
@@ -1531,18 +1533,20 @@ async function loadMcpSettings() {
   }
 }
 
-async function saveMcpSettings() {
-  if (!mcpInputsValid.value || mcpSaving.value) return;
+/** @returns 是否真正提交成功；false 时调用方不得再提示「设置已保存」。 */
+async function saveMcpSettings(): Promise<boolean> {
+  if (!mcpInputsValid.value || mcpSaving.value) return false;
   mcpSaving.value = true;
   mcpError.value = "";
   try {
     // 可同步子集一次成形：RPC（sidecar 即时权威）与 pluginStore 镜像（云同
     // 步载荷）双写同一份；localTransferRoot 不在保存参数里，由 sidecar 部分
-    // 更新语义保留（存储迁移批 1，IMPL_PLAN_STORAGE_SYNC）。
+    // 更新语义保留（存储迁移批 1，IMPL_PLAN_STORAGE_SYNC）。解析已在
+    // mcpInputsValid 门控过，这里取到的必为合法字节数。
     const updates = {
-      maxReadBytes: Number.parseInt(mcpDraft.readMiB.trim(), 10) * MIB,
-      maxUploadBytes: Number.parseInt(mcpDraft.uploadMiB.trim(), 10) * MIB,
-      maxDownloadBytes: Number.parseInt(mcpDraft.downloadMiB.trim(), 10) * MIB,
+      maxReadBytes: parseMibInput(mcpDraft.readMiB, MCP_LIMIT_CEILING_MIB.read)!,
+      maxUploadBytes: parseMibInput(mcpDraft.uploadMiB, MCP_LIMIT_CEILING_MIB.upload)!,
+      maxDownloadBytes: parseMibInput(mcpDraft.downloadMiB, MCP_LIMIT_CEILING_MIB.download)!,
       // §1.3 MCP 权限档 + 连接作用域（每行一条，trim 去空后提交；旧 sidecar
       // 不识别新字段时整体报错，经 mcpError 容错展示）。
       execPermissionMode: mcpDraft.permissionMode === "confirm" ? "confirm" : "autonomous",
@@ -1551,8 +1555,10 @@ async function saveMcpSettings() {
     await window.dbxPlugin.invoke("mcp/settings/set", updates);
     persistMcpSettingsMirror({ ...updates });
     emit("notice", t("mcpLimits.saved"));
+    return true;
   } catch (cause) {
     mcpError.value = settingsErrorOf(cause);
+    return false;
   } finally {
     mcpSaving.value = false;
   }
@@ -1617,8 +1623,13 @@ async function saveSettings() {
     settingsDraft.sudoPassword = "";
     settingsDraft.totpSecret = "";
     }
-    await saveMcpSettings();
-    emit("notice", t("settingsSaved"));
+    // MCP 尺寸校验失败或提交失败时不得谎报「设置已保存」：否则用户看到成功
+    // 提示，重开设置却回滚（issue #241）。
+    if (await saveMcpSettings()) {
+      emit("notice", t("settingsSaved"));
+    } else {
+      emit("error", t("mcpLimits.skipped"));
+    }
   } catch (cause) {
     emit("error", cause);
   } finally {
@@ -2693,17 +2704,18 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
             <div class="mcp-limits">
               <label class="settings-field">
                 <span>{{ t("mcpLimits.read") }}</span>
-                <input v-model="mcpDraft.readMiB" type="number" min="1" step="1" inputmode="numeric" />
+                <input v-model="mcpDraft.readMiB" type="number" min="0.000001" step="any" inputmode="numeric" />
               </label>
               <label class="settings-field">
                 <span>{{ t("mcpLimits.upload") }}</span>
-                <input v-model="mcpDraft.uploadMiB" type="number" min="1" step="1" inputmode="numeric" />
+                <input v-model="mcpDraft.uploadMiB" type="number" min="0.000001" step="any" inputmode="numeric" />
               </label>
               <label class="settings-field">
                 <span>{{ t("mcpLimits.download") }}</span>
-                <input v-model="mcpDraft.downloadMiB" type="number" min="1" step="1" inputmode="numeric" />
+                <input v-model="mcpDraft.downloadMiB" type="number" min="0.000001" step="any" inputmode="numeric" />
               </label>
             </div>
+            <p class="muted settings-note">{{ t("mcpLimits.maxHint") }}</p>
             <label class="settings-field">
               <span>{{ t("mcpSettings.permissionMode") }}</span>
               <Select :model-value="mcpDraft.permissionMode" @update:model-value="(v) => (mcpDraft.permissionMode = String(v))">

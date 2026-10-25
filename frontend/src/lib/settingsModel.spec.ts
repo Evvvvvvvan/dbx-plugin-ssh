@@ -7,7 +7,11 @@ import {
   extractMcpSettingsMirror,
   loadMcpSettingsMirror,
   mcpSettingsMirrorEquals,
+  MCP_LIMIT_CEILING_MIB,
   MCP_SETTINGS_STORE_KEY,
+  MIB,
+  mibField,
+  parseMibInput,
   persistMcpSettingsMirror,
 } from "./settingsModel";
 
@@ -92,5 +96,44 @@ describe("mcpSettingsMirrorEquals", () => {
     expect(mcpSettingsMirrorEquals(base, { ...base, execPermissionMode: "autonomous" })).toBe(false);
     expect(mcpSettingsMirrorEquals(base, { ...base, connectionScope: ["a"] })).toBe(false);
     expect(mcpSettingsMirrorEquals(base, { ...base })).toBe(true);
+  });
+});
+
+// 回归 #241：读取上限默认 256 KiB，回填不能四舍五入成 0（否则整段 MCP 表单
+// 永远非法、保存被静默跳过）；越界值必须在提交前挡住，而不是让 RPC 报错。
+describe("MCP 尺寸输入（issue #241）", () => {
+  it("formats sub-MiB values without rounding them to zero", () => {
+    expect(mibField(256 * 1024)).toBe("0.25");
+    expect(mibField(512 * 1024)).toBe("0.5");
+    expect(mibField(16 * MIB)).toBe("16");
+    expect(mibField(2048 * MIB)).toBe("2048");
+    expect(mibField(0)).toBe("");
+    expect(mibField(undefined)).toBe("");
+  });
+
+  it("round-trips formatted values back to the same byte count", () => {
+    for (const bytes of [256 * 1024, 512 * 1024, MIB, 16 * MIB, 2048 * MIB]) {
+      const field = mibField(bytes);
+      expect(parseMibInput(field, MCP_LIMIT_CEILING_MIB.download)).toBe(bytes);
+    }
+  });
+
+  it("parses decimals and trims whitespace", () => {
+    expect(parseMibInput("0.25", MCP_LIMIT_CEILING_MIB.read)).toBe(256 * 1024);
+    expect(parseMibInput(" 16 ", MCP_LIMIT_CEILING_MIB.upload)).toBe(16 * MIB);
+    expect(parseMibInput("8", MCP_LIMIT_CEILING_MIB.read)).toBe(8 * MIB);
+    // number 输入形状来自 `<input type="number">` 的 v-model（Vue 自动转型）。
+    expect(parseMibInput(0.25, MCP_LIMIT_CEILING_MIB.read)).toBe(256 * 1024);
+  });
+
+  it("rejects non-positive, malformed and over-ceiling values", () => {
+    expect(parseMibInput("0", MCP_LIMIT_CEILING_MIB.read)).toBeNull();
+    expect(parseMibInput("-1", MCP_LIMIT_CEILING_MIB.read)).toBeNull();
+    expect(parseMibInput("abc", MCP_LIMIT_CEILING_MIB.read)).toBeNull();
+    expect(parseMibInput("1e3", MCP_LIMIT_CEILING_MIB.read)).toBeNull();
+    // 用户填 1024 MiB 读取上限（本 issue 的场景）：sidecar 上限 8 MiB，客户端先拦。
+    expect(parseMibInput("1024", MCP_LIMIT_CEILING_MIB.read)).toBeNull();
+    expect(parseMibInput("8.1", MCP_LIMIT_CEILING_MIB.read)).toBeNull();
+    expect(parseMibInput("2049", MCP_LIMIT_CEILING_MIB.download)).toBeNull();
   });
 });

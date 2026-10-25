@@ -7,8 +7,32 @@ import { pluginStore } from "./pluginStore";
 
 export const MIB = 1024 * 1024;
 
+/**
+ * MiB 输入框回填。整数 MiB 原样显示，亚 MiB 值保留小数：读取上限默认 256
+ * KiB（0.25 MiB），若四舍五入成整数会显示为 0 并被表单判为非法，导致整段
+ * MCP 尺寸永远保存不了（issue #241）。
+ */
 export function mibField(bytes?: number) {
-  return typeof bytes === "number" && bytes > 0 ? String(Math.round(bytes / MIB)) : "";
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) return "";
+  return String(Number((bytes / MIB).toFixed(6)));
+}
+
+/** 与 sidecar `McpLimits` 的上限一致（backend/src/mcp.rs 的三个 *_CEILING）。 */
+export const MCP_LIMIT_CEILING_MIB = { read: 8, upload: 2048, download: 2048 } as const;
+
+/**
+ * 解析 MiB 输入框。正数（允许最多 6 位小数）且不超过该字段上限时返回字节数，
+ * 否则返回 null——与 sidecar `validated_limit` 的 1..ceiling 语义对齐，把越界
+ * 值挡在提交前，避免 RPC 报错后表单看起来"保存成功又还原"。
+ */
+export function parseMibInput(value: string | number, ceilingMib: number): number | null {
+  // `<input type="number">` 的 v-model 会把用户输入转成 number，因此这里同时
+  // 接受两种形状；先归一成字符串再走同一套语法校验。
+  const text = String(value).trim();
+  if (!/^\d+(?:\.\d{1,6})?$/.test(text)) return null;
+  const mib = Number.parseFloat(text);
+  if (!Number.isFinite(mib) || mib <= 0 || mib > ceilingMib) return null;
+  return Math.max(1, Math.round(mib * MIB));
 }
 
 export function settingsErrorOf(cause: unknown) {
